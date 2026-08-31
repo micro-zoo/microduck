@@ -39,12 +39,12 @@ use duck_control::io::RobotIo;
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
 use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyPaths};
 use duck_control::safety::{Safety, SafetyConfig};
-use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS};
+use duck_control::{DEFAULT_POSITION, FakeIo, NUM_JOINTS, WbcController};
 use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use control::{Controller, SkillTuning, Tuning};
+use control::{Controller, Error as ControlError, SkillTuning, Tuning, WbcTransition};
 use intents::Intents;
 use params::{Mode, Params};
 
@@ -384,6 +384,12 @@ struct RobotState {
     /// Why the policy is not loaded, if it is not. Set once at startup; the loop keeps
     /// running and holds the pose, so a broken bundle is a rollback rather than a crash.
     policy_error: ArcSwapOption<String>,
+    /// The optional WBC bundle has its own availability and diagnostics. A bad experimental
+    /// bundle must not make the established alpha controller unhealthy or unavailable.
+    wbc_available: AtomicBool,
+    wbc_active: AtomicBool,
+    wbc_switching: AtomicBool,
+    wbc_error: ArcSwapOption<String>,
     /// Which policy files this process is running, as file names. `None` when the policy is
     /// disabled.
     ///
@@ -460,6 +466,10 @@ impl RobotState {
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
+            wbc_available: AtomicBool::new(false),
+            wbc_active: AtomicBool::new(false),
+            wbc_switching: AtomicBool::new(false),
+            wbc_error: ArcSwapOption::empty(),
             policies: ArcSwap::from_pointee(PolicyNames::of(&params.policy.resolved())),
             has_voice: params.audio.enabled && has_any_wav(&params.audio.bank),
             theremin_ready: AtomicBool::new(false),
@@ -564,6 +574,16 @@ impl RobotState {
             ));
         }
 
+        // WBC is opt-in and isolated from the established alpha controller. Its failure must
+        // be visible in `robotctl health` and monitor, but rolling back a working alpha release
+        // would not make an operator-selected external CSV valid. `degraded` is exactly that
+        // boundary: the requested WBC skill failed closed, while ordinary control still runs.
+        if let Some(reason) = self.wbc_error.load_full() {
+            return degraded(format!(
+                "WBC unavailable: {reason}; alpha controller remains available"
+            ));
+        }
+
         describe(true, false, None)
     }
 
@@ -619,6 +639,12 @@ impl RobotState {
             return proto::SafeToRestartResult {
                 safe: false,
                 reason: Some("forced busy by --busy".into()),
+            };
+        }
+        if self.wbc_active.load(Ordering::Relaxed) || self.wbc_switching.load(Ordering::Relaxed) {
+            return proto::SafeToRestartResult {
+                safe: false,
+                reason: Some("the WBC skill is active or switching".into()),
             };
         }
         // Restarting motor control mid-stride is how a robot falls over
@@ -1123,6 +1149,51 @@ fn build_controller(
     }
 }
 
+fn publish_wbc_state(controller: Option<&Controller>, state: &RobotState) {
+    state.wbc_active.store(
+        controller.is_some_and(Controller::wbc_active),
+        Ordering::Relaxed,
+    );
+    state.wbc_switching.store(
+        controller.is_some_and(Controller::wbc_switching),
+        Ordering::Relaxed,
+    );
+}
+
+fn load_wbc_skill(controller: &mut Option<Controller>, params: &Params, state: &RobotState) {
+    state.wbc_available.store(false, Ordering::Relaxed);
+    state.wbc_error.store(None);
+    publish_wbc_state(controller.as_ref(), state);
+    if !params.wbc.enabled {
+        return;
+    }
+    let Some(controller) = controller.as_mut() else {
+        state.wbc_error.store(Some(Arc::new(
+            "WBC skill requires policy.enabled = true and a loadable alpha controller".into(),
+        )));
+        return;
+    };
+    let policies = PathBuf::from(params::RELEASE_DIR).join("policies");
+    let policy = policies.join("wbc_v1.onnx");
+    let reference = policies.join("wbc_happy.csv");
+    match WbcController::load(&policy, &reference, params.policy.gain) {
+        Ok(wbc) => {
+            controller.install_wbc(wbc);
+            state.wbc_available.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                policy = %policy.display(),
+                reference = %reference.display(),
+                "optional WBC skill loaded"
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "optional WBC skill unavailable; alpha is unchanged");
+            state.wbc_error.store(Some(Arc::new(e.to_string())));
+        }
+    }
+    publish_wbc_state(Some(controller), state);
+}
+
 async fn control_loop<T: RobotIo>(
     io: T,
     state: Arc<RobotState>,
@@ -1169,6 +1240,7 @@ async fn control_loop<T: RobotIo>(
 
     // Loaded once here and again on a mode switch — see `build_controller`.
     let mut controller = build_controller(&policy_cfg, params.safety.limp_fall, &state);
+    load_wbc_skill(&mut controller, &params, &state);
 
     tracing::warn!(
         joints = NUM_JOINTS,
@@ -1430,6 +1502,10 @@ async fn control_loop<T: RobotIo>(
             Some(intents::PowerRequest::Relax) => match safety.set_torque(false) {
                 Ok(()) => {
                     tracing::warn!("robot.relax: torque off");
+                    if let Some(controller) = controller.as_mut() {
+                        controller.cancel_wbc();
+                    }
+                    publish_wbc_state(controller.as_ref(), &state);
                     // Back to the start, so the next `init` or Start ramps from wherever the robot
                     // ends up rather than assuming it is still at the home pose.
                     bringup = Bringup::Limp;
@@ -1454,6 +1530,46 @@ async fn control_loop<T: RobotIo>(
                         Ok(()) => tracing::warn!(skill = what, "skill started"),
                         Err(reason) => tracing::warn!(skill = what, reason, "skill refused"),
                     };
+                    if requests.wbc_toggle {
+                        let command_magnitude =
+                            gated.twist.iter().map(|v| v * v).sum::<f64>().sqrt();
+                        let ready = controller.wbc_active()
+                            || (policy_params.mode == Mode::Walk
+                                && limp_fall == LimpFall::Idle
+                                && sensors.is_some()
+                                && !controller.busy()
+                                && command_magnitude <= DEFAULT_STANDING_THRESHOLD);
+                        if ready {
+                            match controller.request_wbc_toggle() {
+                                Ok(transition) => {
+                                    let from = sensors.as_ref().map_or_else(
+                                        || coast.known_positions(hold),
+                                        |s| s.positions,
+                                    );
+                                    let direction = match transition {
+                                        WbcTransition::Activate => "entering",
+                                        WbcTransition::Deactivate => "leaving",
+                                    };
+                                    tracing::warn!(
+                                        ?HOME_RAMP,
+                                        direction,
+                                        "WBC skill switch: ramping home"
+                                    );
+                                    bringup = Bringup::Homing {
+                                        from,
+                                        since: tick_start,
+                                    };
+                                }
+                                Err(reason) => {
+                                    tracing::warn!(skill = "wbc", reason, "skill refused")
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                "WBC skill refused: it requires an idle, homed walking robot"
+                            );
+                        }
+                    }
                     if requests.ground_pick {
                         outcome("ground_pick", controller.start_ground_pick());
                     }
@@ -1483,6 +1599,7 @@ async fn control_loop<T: RobotIo>(
                 }
                 _ => tracing::info!("skill request ignored: the policy is not driving"),
             }
+            publish_wbc_state(controller.as_ref(), &state);
         }
 
         // Sounds: the wheee hold as a level, then the one-shot tags queued by clients. In
@@ -1542,6 +1659,14 @@ async fn control_loop<T: RobotIo>(
                     mode = target.as_str(),
                     "already in that mode; nothing to switch"
                 );
+            } else if controller
+                .as_ref()
+                .is_some_and(|c| c.wbc_active() || c.wbc_switching())
+            {
+                tracing::warn!(
+                    mode = target.as_str(),
+                    "mode switch refused while WBC is active or switching"
+                );
             } else if mode_change.is_some() {
                 tracing::warn!(mode = target.as_str(), "a mode switch is already in flight");
             } else {
@@ -1578,6 +1703,17 @@ async fn control_loop<T: RobotIo>(
             && battery_v > 0.0
             && battery_v <= duck_control::model::BATTERY_EMPTY_V;
         if !powered_off && shutdown_sit.is_none() && (intents.take_shutdown() || battery_empty) {
+            if controller
+                .as_ref()
+                .is_some_and(|c| c.wbc_active() || c.wbc_switching())
+            {
+                tracing::warn!("shutdown: handing WBC directly to the sit/stand controller");
+                if let Some(controller) = controller.as_mut() {
+                    controller.cancel_wbc();
+                }
+                publish_wbc_state(controller.as_ref(), &state);
+                bringup = Bringup::Ready;
+            }
             let can_sit = snapshot.enabled
                 && bringup == Bringup::Ready
                 && !safety.fallen()
@@ -1743,6 +1879,46 @@ async fn control_loop<T: RobotIo>(
         }
         let in_limp_fall = limp_fall != LimpFall::Idle;
 
+        // The reference clip has no stick command input. A lost client therefore cannot be
+        // interpreted as permission to keep replaying it: deadman returns through HOME to alpha.
+        // Start-off keeps the established immediate HOME behaviour and simply cancels WBC.
+        let wbc_driving_or_entering = controller
+            .as_ref()
+            .is_some_and(|c| c.wbc_active() || c.wbc_transition() == Some(WbcTransition::Activate));
+        if wbc_driving_or_entering && !snapshot.enabled {
+            tracing::warn!("policy disabled — cancelling WBC and returning to home");
+            controller
+                .as_mut()
+                .expect("WBC state belongs to the skill controller")
+                .cancel_wbc();
+            publish_wbc_state(controller.as_ref(), &state);
+        } else if wbc_driving_or_entering && deadman.is_some() {
+            tracing::warn!(?HOME_RAMP, "deadman — leaving WBC through the home pose");
+            controller
+                .as_mut()
+                .expect("WBC state belongs to the skill controller")
+                .leave_wbc();
+            publish_wbc_state(controller.as_ref(), &state);
+            bringup = Bringup::Homing {
+                from: coast.known_positions(hold),
+                since: tick_start,
+            };
+        } else if wbc_driving_or_entering && (sensors.is_none() || !safety.imu_ready()) {
+            tracing::error!(
+                ?HOME_RAMP,
+                "WBC state input became unavailable; leaving through the home pose"
+            );
+            controller
+                .as_mut()
+                .expect("WBC state belongs to the skill controller")
+                .leave_wbc();
+            publish_wbc_state(controller.as_ref(), &state);
+            bringup = Bringup::Homing {
+                from: coast.known_positions(hold),
+                since: tick_start,
+            };
+        }
+
         // Smooth the command. The limp-fall sequence holds the twist at zero outright, so
         // the robot is not handed back mid-command; and leaving body-pose mode snaps the
         // body back to nominal rather than gliding, which is its B-button exit.
@@ -1842,6 +2018,7 @@ async fn control_loop<T: RobotIo>(
                 let cfg = policy_params.resolved();
                 state.policy_error.store(None);
                 controller = build_controller(&cfg, params.safety.limp_fall, &state);
+                load_wbc_skill(&mut controller, &params, &state);
                 // Published together with the mode, and only after the load: a client that reads
                 // `robot.mode` and gets the new one must not then be told the old mode's networks.
                 state.policies.store(Arc::new(PolicyNames::of(&cfg)));
@@ -1853,7 +2030,28 @@ async fn control_loop<T: RobotIo>(
                     "mode switch complete"
                 );
             }
-            tracing::warn!("at the home pose; the policy has the robot");
+            if let Some(transition) = controller.as_ref().and_then(Controller::wbc_transition) {
+                let allow_activation =
+                    snapshot.enabled && deadman.is_none() && policy_params.mode == Mode::Walk;
+                let controller = controller
+                    .as_mut()
+                    .expect("a WBC transition belongs to the skill controller");
+                controller.complete_wbc_transition(allow_activation);
+                match (transition, controller.wbc_active()) {
+                    (WbcTransition::Activate, true) => {
+                        tracing::warn!("at the home pose; WBC skill has the robot")
+                    }
+                    (WbcTransition::Activate, false) => {
+                        tracing::warn!("WBC skill activation cancelled at the home pose")
+                    }
+                    (WbcTransition::Deactivate, _) => {
+                        tracing::warn!("at the home pose; alpha has the robot")
+                    }
+                }
+                publish_wbc_state(Some(controller), &state);
+            } else {
+                tracing::warn!("at the home pose; the policy has the robot");
+            }
             bringup = Bringup::Ready;
             hold = DEFAULT_POSITION;
         }
@@ -1969,13 +2167,38 @@ async fn control_loop<T: RobotIo>(
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
-                    Ok(step) => (
-                        step.targets,
-                        step.gain,
-                        // A scripted move is motion whatever the twist says; so is walking.
-                        step.busy || command.twist_magnitude() > 0.0,
-                        step.label,
-                    ),
+                    Ok(step) => {
+                        if step.return_home {
+                            tracing::warn!(
+                                ?HOME_RAMP,
+                                "WBC skill finished; returning home before alpha resumes"
+                            );
+                            bringup = Bringup::Homing {
+                                from: sensors.positions,
+                                since: tick_start,
+                            };
+                            publish_wbc_state(Some(controller), &state);
+                        }
+                        (
+                            step.targets,
+                            step.gain,
+                            // A scripted move is motion whatever the twist says; so is walking.
+                            step.busy || command.twist_magnitude() > 0.0,
+                            step.label,
+                        )
+                    }
+                    Err(ControlError::Wbc(e)) => {
+                        tracing::error!(error = %e, "WBC skill inference failed; returning home");
+                        state.wbc_error.store(Some(Arc::new(e.to_string())));
+                        state.wbc_available.store(false, Ordering::Relaxed);
+                        controller.fail_wbc();
+                        publish_wbc_state(Some(controller), &state);
+                        bringup = Bringup::Homing {
+                            from: sensors.positions,
+                            since: tick_start,
+                        };
+                        (sensors.positions, policy_cfg.gain, true, "wbc_fault")
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "inference failed; holding");
                         (hold, policy_cfg.gain, false, "held")
@@ -2721,6 +2944,7 @@ fn dispatch(
             let configured = match p.skill {
                 // One load for the whole decision: these are the *current* mode's networks, and
                 // reading them field by field could straddle a mode switch.
+                proto::Skill::WbcToggle => state.wbc_available.load(Ordering::Relaxed),
                 proto::Skill::GroundPick => policies.ground_pick.is_some(),
                 proto::Skill::KickLeft => policies.kick_left.is_some(),
                 proto::Skill::KickRight => policies.kick_right.is_some(),
@@ -2730,7 +2954,32 @@ fn dispatch(
             // Not refused for being down. A skill on a fallen robot is the human's call,
             // and refusing it is how a robot ends up unable to do the thing that would
             // have righted it.
-            let result = if !configured {
+            let wbc_active = state.wbc_active.load(Ordering::Relaxed);
+            let wbc_switching = state.wbc_switching.load(Ordering::Relaxed);
+            let result = if p.skill == proto::Skill::WbcToggle && wbc_switching {
+                proto::IntentResult::refused("a WBC skill switch is already in flight")
+            } else if p.skill == proto::Skill::WbcToggle && !configured {
+                let reason = state.wbc_error.load_full().map_or_else(
+                    || "WBC is disabled in robotd.toml".to_owned(),
+                    |e| format!("WBC assets unavailable: {e}"),
+                );
+                proto::IntentResult::refused(reason)
+            } else if p.skill == proto::Skill::WbcToggle && wbc_active {
+                intents.request_skill(p.skill);
+                proto::IntentResult::accepted()
+            } else if p.skill == proto::Skill::WbcToggle
+                && mode_of(state.mode.load(Ordering::Relaxed)) != Mode::Walk
+            {
+                proto::IntentResult::refused("WBC is available only in walking mode")
+            } else if p.skill == proto::Skill::WbcToggle && !intents.enabled() {
+                proto::IntentResult::refused("enable the policy before switching to WBC")
+            } else if p.skill == proto::Skill::WbcToggle && !state.homed.load(Ordering::Relaxed) {
+                proto::IntentResult::refused("wait until the robot is homed")
+            } else if p.skill == proto::Skill::WbcToggle && state.moving.load(Ordering::Relaxed) {
+                proto::IntentResult::refused("stop the robot before switching to WBC")
+            } else if p.skill != proto::Skill::WbcToggle && (wbc_active || wbc_switching) {
+                proto::IntentResult::refused("leave WBC before starting another skill")
+            } else if !configured {
                 proto::IntentResult::refused("no policy configured for that skill")
             } else {
                 intents.request_skill(p.skill);
@@ -2816,6 +3065,12 @@ fn dispatch(
             };
             let result = match target {
                 None => proto::IntentResult::refused("mode must be \"walk\" or \"roller\""),
+                Some(_) if state.wbc_active.load(Ordering::Relaxed) => {
+                    proto::IntentResult::refused("leave WBC before switching drive mode")
+                }
+                Some(_) if state.wbc_switching.load(Ordering::Relaxed) => {
+                    proto::IntentResult::refused("wait for the WBC switch to finish")
+                }
                 Some(_) if state.policies.load().walk.is_none() => proto::IntentResult::refused(
                     "no policy on this robot, so there is nothing to switch between",
                 ),
@@ -3397,6 +3652,26 @@ mod tests {
         assert!(s.health().healthy);
     }
 
+    #[test]
+    fn an_unavailable_optional_wbc_is_degraded_with_the_exact_loader_error() {
+        let s = state();
+        ticked(&s, 5);
+        s.wbc_error.store(Some(Arc::new(
+            "reference row 7 has 23 columns, expected 24".to_owned(),
+        )));
+
+        let health = s.health();
+        assert!(!health.healthy);
+        assert!(health.degraded, "alpha remains available");
+        let reason = health.reason.unwrap();
+        assert!(reason.contains("WBC unavailable"), "{reason}");
+        assert!(reason.contains("row 7 has 23 columns"), "{reason}");
+        assert!(
+            reason.contains("alpha controller remains available"),
+            "{reason}"
+        );
+    }
+
     /// One dropped transaction is ordinary; a sustained run of them means the bus is gone,
     /// and a robot that cannot read its own joints is not healthy whatever the loop rate.
     #[test]
@@ -3430,6 +3705,12 @@ mod tests {
         let busy = RobotState::new(&Params::default(), false, true).safe_to_restart();
         assert!(!busy.safe);
         assert!(busy.reason.unwrap().contains("--busy"));
+
+        let wbc = state();
+        wbc.wbc_active.store(true, Ordering::Relaxed);
+        let active = wbc.safe_to_restart();
+        assert!(!active.safe);
+        assert!(active.reason.unwrap().contains("WBC"));
     }
 
     /// Every method must come back off `dispatch` in the shape the updater parses.
@@ -3620,6 +3901,50 @@ mod tests {
         .unwrap();
         assert!(down.accepted, "fallen must not refuse a skill");
         assert!(intents.take_skills().sit_toggle);
+    }
+
+    #[test]
+    fn wbc_toggle_is_opt_in_idle_only_and_the_daemon_owns_its_state() {
+        let s = state();
+        let intents = Intents::new();
+        let call = proto::Call::RobotDo(proto::DoParams {
+            skill: proto::Skill::WbcToggle,
+        });
+        let ask = || -> proto::IntentResult {
+            dispatch(&s, &intents, proto::Id::Number(1), &call)
+                .result_as()
+                .unwrap()
+        };
+
+        let disabled = ask();
+        assert!(!disabled.accepted);
+        assert!(disabled.reason.unwrap().contains("disabled"));
+
+        s.wbc_available.store(true, Ordering::Relaxed);
+        assert!(!ask().accepted, "Start-off cannot activate WBC");
+        intents.set_enabled(true);
+        s.homed.store(true, Ordering::Relaxed);
+        assert!(ask().accepted);
+        assert!(intents.take_skills().wbc_toggle);
+
+        // Active WBC may always be asked to leave, even though active reference tracking is
+        // intentionally published as moving/busy. An ordinary skill cannot race that owner.
+        s.wbc_active.store(true, Ordering::Relaxed);
+        s.moving.store(true, Ordering::Relaxed);
+        assert!(ask().accepted);
+        assert!(intents.take_skills().wbc_toggle);
+        let skill: proto::IntentResult = dispatch(
+            &s,
+            &intents,
+            proto::Id::Number(2),
+            &proto::Call::RobotDo(proto::DoParams {
+                skill: proto::Skill::GroundPick,
+            }),
+        )
+        .result_as()
+        .unwrap();
+        assert!(!skill.accepted);
+        assert!(!intents.take_skills().ground_pick);
     }
 
     /// The pose and mouth intents land in their slots like move and head do — including via

@@ -245,6 +245,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **LB / RB** | left / right kick |
 | **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
+| **DPad-Right**, held 2 s | start / stop the optional WBC skill |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
 | **Select**, held 2 s | sit down, then power off |
 
@@ -259,6 +260,16 @@ loads that mode's policies there and drives again — a few seconds, torque on t
 restart. `robotd.toml` is not touched, so a reboot comes back in the configured mode; make it
 stick with `robotctl configure` (or `[policy] mode`). It is a hold rather than a press because
 D-pad up is easy to lean on while driving.
+
+The WBC switch is opt-in (`[wbc] enabled = true`) and walking-mode only. Stop the robot first,
+then hold DPad-Right for two seconds; entry, exit, deadman and the final CSV row all return through
+HOME. The shipped `wbc_happy.csv` advances one row per 20 ms tick and runs for 19.78 s.
+
+For the first run, use a support frame with feet clear and an operator at the power switch. Set
+`wbc.enabled` in `sudo robotctl configure`, restart, and check `robotctl health`. Press Start,
+wait for HOME and IMU readiness, centre the sticks, then hold DPad-Right while watching
+`robotctl monitor`. This is not floor qualification. To roll back, leave WBC with DPad-Right or
+Start, then set `wbc.enabled` back to `false`.
 
 `pad status` answers two questions separately, because a connected pad and a dead driver look
 identical from the outside:
@@ -790,4 +801,3 @@ eval "$(robotctl completions bash)"
 ```
 
 `zsh`, `fish`, `elvish` and `powershell` work in place of `bash`.
-

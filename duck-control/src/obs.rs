@@ -97,7 +97,7 @@ pub struct BodyPose {
 /// Returns an array rather than an iterator so its width is part of its type. A filtered
 /// iterator is not `ExactSizeIterator` — `Filter` cannot know how many elements pass — and
 /// that is what would force [`fill`] to count at runtime instead of being checked here.
-fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
+pub(crate) fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
     // Skipping one valid index leaves exactly one fewer. Stated as a compile-time check so
     // the reasoning is enforced rather than merely believed.
     const { assert!(OBS_JOINTS == NUM_JOINTS - 1) };
@@ -111,7 +111,7 @@ fn policy_joints(values: &[f64; NUM_JOINTS]) -> [f64; OBS_JOINTS] {
 /// [`Observation::scatter_action`] writes through it — so the two cannot disagree about
 /// where the policy's n-th value belongs.
 #[inline]
-const fn joint_of(slot: usize) -> usize {
+pub(crate) const fn joint_of(slot: usize) -> usize {
     if slot < MOUTH_INDEX { slot } else { slot + 1 }
 }
 

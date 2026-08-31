@@ -73,6 +73,7 @@ impl Default for PoseIntent {
 /// single last-writer slot would lose.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SkillRequests {
+    pub wbc_toggle: bool,
     pub ground_pick: bool,
     pub kick_left: bool,
     pub kick_right: bool,
@@ -84,7 +85,12 @@ pub struct SkillRequests {
 
 impl SkillRequests {
     pub fn any(&self) -> bool {
-        self.ground_pick || self.kick_left || self.kick_right || self.sit_toggle || self.roulade
+        self.wbc_toggle
+            || self.ground_pick
+            || self.kick_left
+            || self.kick_right
+            || self.sit_toggle
+            || self.roulade
     }
 }
 
@@ -94,6 +100,7 @@ const SKILL_KICK_LEFT: u32 = 1 << 1;
 const SKILL_KICK_RIGHT: u32 = 1 << 2;
 const SKILL_SIT_TOGGLE: u32 = 1 << 3;
 const SKILL_ROULADE: u32 = 1 << 4;
+const SKILL_WBC_TOGGLE: u32 = 1 << 5;
 
 /// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
 /// (20 ms) while the trigger is down, so anything much older means the client stopped
@@ -270,6 +277,7 @@ impl Intents {
     /// Queue a one-shot skill for the loop's next tick.
     pub fn request_skill(&self, skill: duck_ipc_proto::Skill) {
         let bit = match skill {
+            duck_ipc_proto::Skill::WbcToggle => SKILL_WBC_TOGGLE,
             duck_ipc_proto::Skill::GroundPick => SKILL_GROUND_PICK,
             duck_ipc_proto::Skill::KickLeft => SKILL_KICK_LEFT,
             duck_ipc_proto::Skill::KickRight => SKILL_KICK_RIGHT,
@@ -284,6 +292,7 @@ impl Intents {
     pub fn take_skills(&self) -> SkillRequests {
         let bits = self.skills.swap(0, std::sync::atomic::Ordering::Relaxed);
         SkillRequests {
+            wbc_toggle: bits & SKILL_WBC_TOGGLE != 0,
             ground_pick: bits & SKILL_GROUND_PICK != 0,
             kick_left: bits & SKILL_KICK_LEFT != 0,
             kick_right: bits & SKILL_KICK_RIGHT != 0,
@@ -489,6 +498,14 @@ impl Intents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wbc_counts_as_a_skill_request() {
+        let mut requests = SkillRequests::default();
+        assert!(!requests.any());
+        requests.wbc_toggle = true;
+        assert!(requests.any());
+    }
 
     /// The hold's three states, which the ride's two different exits depend on. A `false`
     /// from a live client and a `true` that went stale must not read the same: one cuts the

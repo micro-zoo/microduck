@@ -405,6 +405,8 @@ cargo run -p xtask -- package \
     --include "policies/roller.onnx=policies/roller.onnx" \
     --include "policies/roller_crouch.onnx=policies/roller_crouch.onnx" \
     --include "policies/roulade.onnx=policies/roulade.onnx" \
+    --include "policies/wbc_v1.onnx=policies/wbc_v1.onnx" \
+    --include "policies/wbc_happy.csv=policies/wbc_happy.csv" \
     --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx"
 
 

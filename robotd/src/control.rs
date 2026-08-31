@@ -35,6 +35,7 @@
 use duck_control::model::{DEFAULT_POSITION, NUM_JOINTS};
 use duck_control::obs::{ACTION_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError};
+use duck_control::{WbcController, WbcError};
 
 /// Joint indices the head low-pass covers: neck_pitch, head_pitch, head_yaw, head_roll.
 const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
@@ -127,6 +128,22 @@ pub struct Step {
     /// A scripted move is mid-flight — the robot is moving regardless of the twist, so
     /// restarting the daemon now would put it on the floor.
     pub busy: bool,
+    /// This skill tick finished at a point that must hand back through HOME.
+    pub return_home: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+    #[error(transparent)]
+    Wbc(#[from] WbcError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WbcTransition {
+    Activate,
+    Deactivate,
 }
 
 /// Where the robot is in the sit↔stand cycle.
@@ -144,6 +161,9 @@ enum Sit {
 
 pub struct Controller {
     policy: Policy,
+    wbc: Option<WbcController>,
+    wbc_active: bool,
+    wbc_transition: Option<WbcTransition>,
     tuning: Tuning,
     skills: SkillTuning,
     /// Raw previous policy output, which the observation feeds back. Raw, not scaled: the
@@ -170,6 +190,9 @@ impl Controller {
     pub fn new(policy: Policy, tuning: Tuning, skills: SkillTuning) -> Self {
         Self {
             policy,
+            wbc: None,
+            wbc_active: false,
+            wbc_transition: None,
             tuning,
             skills,
             last_action: [0.0; ACTION_LEN],
@@ -190,6 +213,87 @@ impl Controller {
     pub fn reset(&mut self) {
         self.last_action = [0.0; ACTION_LEN];
         self.previous = None;
+        if let Some(wbc) = self.wbc.as_mut() {
+            wbc.reset();
+        }
+    }
+
+    pub fn install_wbc(&mut self, wbc: WbcController) {
+        self.wbc = Some(wbc);
+        self.wbc_active = false;
+        self.wbc_transition = None;
+    }
+
+    pub fn wbc_active(&self) -> bool {
+        self.wbc_active
+    }
+
+    pub fn wbc_transition(&self) -> Option<WbcTransition> {
+        self.wbc_transition
+    }
+
+    pub fn wbc_switching(&self) -> bool {
+        self.wbc_transition.is_some()
+    }
+
+    /// Toggle the WBC skill. The caller owns the physical HOME ramp and calls
+    /// [`Self::complete_wbc_transition`] when that ramp finishes.
+    pub fn request_wbc_toggle(&mut self) -> Result<WbcTransition, &'static str> {
+        if self.wbc_transition.is_some() {
+            return Err("a WBC switch is already in flight");
+        }
+        if self.wbc_active {
+            self.reset();
+            self.wbc_active = false;
+            self.wbc_transition = Some(WbcTransition::Deactivate);
+            return Ok(WbcTransition::Deactivate);
+        }
+        if self.wbc.is_none() {
+            return Err("no WBC policy loaded");
+        }
+        if self.scripted_busy() {
+            return Err("another skill is already running");
+        }
+        self.wbc_transition = Some(WbcTransition::Activate);
+        Ok(WbcTransition::Activate)
+    }
+
+    /// Leave an active or activating WBC skill through HOME.
+    pub fn leave_wbc(&mut self) {
+        if !self.wbc_active && self.wbc_transition != Some(WbcTransition::Activate) {
+            return;
+        }
+        self.reset();
+        self.wbc_active = false;
+        self.wbc_transition = Some(WbcTransition::Deactivate);
+    }
+
+    /// Cancel WBC immediately because another safety owner has taken the robot.
+    pub fn cancel_wbc(&mut self) {
+        self.reset();
+        self.wbc_active = false;
+        self.wbc_transition = None;
+    }
+
+    /// Permanently remove a WBC executor that failed inference and return through HOME.
+    pub fn fail_wbc(&mut self) {
+        self.wbc = None;
+        self.wbc_active = false;
+        self.wbc_transition = Some(WbcTransition::Deactivate);
+        self.reset();
+    }
+
+    pub fn complete_wbc_transition(&mut self, allow_activation: bool) {
+        let Some(transition) = self.wbc_transition.take() else {
+            return;
+        };
+        if transition == WbcTransition::Activate && allow_activation && self.wbc.is_some() {
+            self.reset();
+            self.wbc_active = true;
+        } else {
+            self.wbc_active = false;
+            self.reset();
+        }
     }
 
     pub fn has_sitstand(&self) -> bool {
@@ -203,16 +307,29 @@ impl Controller {
     /// A scripted move is mid-flight. Sitting itself is not busy — a seated robot is
     /// parked, not travelling.
     pub fn busy(&self) -> bool {
+        self.scripted_busy() || self.wbc_active || self.wbc_transition.is_some()
+    }
+
+    fn scripted_busy(&self) -> bool {
         self.ground_pick.is_some()
             || self.kick.is_some()
             || self.roulade.is_some()
             || matches!(self.sit, Sit::Rising { .. })
     }
 
+    fn ensure_wbc_idle(&self) -> Result<(), &'static str> {
+        if self.wbc_active || self.wbc_transition.is_some() {
+            Err("WBC is active or switching")
+        } else {
+            Ok(())
+        }
+    }
+
     /// Start a one-shot ground pick. The prototype gates the trigger on nothing but the
     /// network existing and the move not already running — a pick can even preempt a kick's
     /// tail, and that stays as it was.
     pub fn start_ground_pick(&mut self) -> Result<(), &'static str> {
+        self.ensure_wbc_idle()?;
         if !self.policy.has_ground_pick() {
             return Err("no ground-pick policy loaded");
         }
@@ -225,6 +342,7 @@ impl Controller {
 
     /// Start a kick window. Blocked while any scripted move runs, as the prototype blocks it.
     pub fn start_kick(&mut self, left: bool) -> Result<(), &'static str> {
+        self.ensure_wbc_idle()?;
         if !self.policy.has_kick(left) {
             return Err("no kick policy loaded for that leg");
         }
@@ -242,6 +360,7 @@ impl Controller {
     /// X press on nothing but the ground pick — a roulade can preempt a kick's tail or roll
     /// out of the seat, and both stay as they were.
     pub fn request_roulade(&mut self) -> Result<bool, &'static str> {
+        self.ensure_wbc_idle()?;
         if self.roulade.is_some() {
             self.roulade_chain = ROULADE_CHAIN_WINDOW;
             return Ok(false);
@@ -260,6 +379,7 @@ impl Controller {
     /// Sit if standing, stand if sitting. Refused mid-rise, as the prototype refuses it
     /// while a stand transition is in flight.
     pub fn sit_toggle(&mut self) -> Result<&'static str, &'static str> {
+        self.ensure_wbc_idle()?;
         match self.sit {
             Sit::Up => {
                 if !self.policy.has_sitstand() {
@@ -307,7 +427,27 @@ impl Controller {
         body_active: bool,
         dt: f64,
         scale_mult: f64,
-    ) -> Result<Step, PolicyError> {
+    ) -> Result<Step, Error> {
+        if self.wbc_active {
+            let step = self
+                .wbc
+                .as_mut()
+                .expect("active WBC skill has an executor")
+                .step(sensors)?;
+            if step.finished {
+                self.wbc.as_mut().expect("checked above").reset();
+                self.wbc_active = false;
+                self.wbc_transition = Some(WbcTransition::Deactivate);
+            }
+            return Ok(Step {
+                targets: step.targets,
+                label: if step.finished { "wbc_final" } else { "wbc" },
+                gain: step.gain,
+                busy: true,
+                return_home: step.finished,
+            });
+        }
+
         // Expire windows first, so a tick after the deadline runs the next thing rather
         // than one more frame of a finished move — the prototype checks its timers at the
         // same point relative to inference.
@@ -476,6 +616,7 @@ impl Controller {
             label,
             gain,
             busy: self.busy(),
+            return_home: false,
         })
     }
 }
@@ -483,6 +624,66 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23 via ORT_DYLIB_PATH"]
+    fn wbc_runs_through_the_existing_skill_controller() {
+        let policies = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../policies");
+        let policy = Policy::load(
+            &duck_control::policy::PolicyPaths {
+                walk: policies.join("alpha_walking.onnx"),
+                ..Default::default()
+            },
+            duck_control::policy::DEFAULT_STANDING_THRESHOLD,
+        )
+        .expect("alpha policy");
+        let wbc = WbcController::load(
+            &policies.join("wbc_v1.onnx"),
+            &policies.join("wbc_happy.csv"),
+            Tuning::default().gain,
+        )
+        .expect("WBC skill executor");
+        let mut controller = Controller::new(policy, Tuning::default(), SkillTuning::default());
+        controller.install_wbc(wbc);
+
+        assert_eq!(controller.request_wbc_toggle(), Ok(WbcTransition::Activate));
+        assert!(controller.busy());
+        controller.complete_wbc_transition(true);
+        let step = controller
+            .step(
+                &duck_control::Sensors::default(),
+                &Command::default(),
+                false,
+                0.02,
+                1.0,
+            )
+            .expect("WBC skill tick");
+        assert_eq!(step.label, "wbc");
+        assert!(step.busy);
+
+        assert_eq!(
+            controller.request_wbc_toggle(),
+            Ok(WbcTransition::Deactivate)
+        );
+        controller.complete_wbc_transition(true);
+        assert!(!controller.busy());
+
+        assert_eq!(controller.request_wbc_toggle(), Ok(WbcTransition::Activate));
+        controller.complete_wbc_transition(true);
+        for frame in 0..989 {
+            let step = controller
+                .step(
+                    &duck_control::Sensors::default(),
+                    &Command::default(),
+                    false,
+                    0.02,
+                    1.0,
+                )
+                .expect("WBC skill tick");
+            assert_eq!(step.return_home, frame == 988);
+        }
+        assert_eq!(controller.wbc_transition(), Some(WbcTransition::Deactivate));
+    }
 
     /// The prototype's **current alpha configuration** — its built-in defaults, which the
     /// installer deliberately passes no flags to override. The filters are ON at the values

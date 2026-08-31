@@ -1,7 +1,9 @@
 # Policies
 
-The ONNX policies `robotd` runs. All of them are `obs[1,61] -> actions[1,14]`; `robotd`
-checks that at load rather than discovering it mid-stride.
+The ONNX policies `robotd` runs. The established alpha family is
+`obs[1,61] -> actions[1,14]`; `robotd` checks that at load rather than discovering it
+mid-stride. The optional WBC skill uses a separate executor because it is `72 -> 14`, has a
+reference stream, and gives actions different semantics.
 
 ## This is a temporary home
 
@@ -45,7 +47,20 @@ The names here are the *roles* — what `deploy/robotd.toml` asks for — not th
 That indirection is deliberate and worth keeping: swapping which run is "the walking policy"
 should not mean editing config on every robot.
 
-## Why the 61-D family only
+### Optional WBC skill assets
+
+`wbc_v1.onnx` is the shipped 72-input controller; `wbc_happy.csv` is its headerless 989×24
+reference at 50 Hz. Paths resolve like the established policy slots.
+
+The CSV already contains the training-side linear/angular velocities and is parsed once before
+the realtime loop. Observation order is reference (24), gyro (3), projected gravity (3),
+`q - HOME` (14), joint velocity (14), previous action (14). Output is a residual added to the
+reference joint pose; the mouth is excluded. The final row returns through HOME to alpha.
+
+WBC is disabled by default. Invalid ONNX shape or CSV contents disable only this mode and surface
+the reason through `robotctl health` and `robotctl monitor`.
+
+## Why the alpha runtime uses the 61-D family
 
 The prototype also ships a 51-D family (`3 gyro + 3 gravity + 42 joints + 3 command`, the
 legacy `[vx, vy, vtheta]` command). 61 is the same sensors with the unified 13-value command

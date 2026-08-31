@@ -20,6 +20,7 @@
 //! A (South)    ground pick
 //! LB / RB      left / right kick
 //! DPad-Down    sit ↔ stand
+//! DPad-Right, 2 s  start / stop the optional WBC skill
 //! RT / LT      mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
 //! Select, 2 s  sit down, then power off
 //! ```
@@ -163,6 +164,9 @@ const SHUTDOWN_HOLD: Duration = Duration::from_secs(2);
 /// home and reloads its policies, so it has to be a hold nobody performs by accident.
 const MODE_HOLD: Duration = Duration::from_secs(3);
 
+/// D-pad right held this long asks `robotd` to toggle the optional WBC skill.
+const WBC_HOLD: Duration = Duration::from_secs(2);
+
 /// Body-pose stick ranges, from the training env via the prototype: z is asymmetric
 /// (little headroom up at the standing height, more crouch down), angles capped at ~15°.
 const BODY_MAX_Z_UP: f64 = 0.010;
@@ -248,7 +252,7 @@ fn main() -> std::process::ExitCode {
         roller,
         "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
          LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
-         Select (2s) shutdown"
+         DPad-Right (2s) WBC, Select (2s) shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -257,7 +261,9 @@ fn main() -> std::process::ExitCode {
     let mut driving = false;
     let mut select_held_since: Option<Instant> = None;
     let mut dpad_up_held_since: Option<Instant> = None;
+    let mut dpad_right_held_since: Option<Instant> = None;
     let mut mode_switch_sent = false;
+    let mut wbc_switch_sent = false;
     let mut shutdown_sent = false;
     // Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
     // starts the wheee ride. The prototype's threshold.
@@ -309,6 +315,8 @@ fn main() -> std::process::ExitCode {
                 tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
                 driving = false;
             }
+            dpad_right_held_since = None;
+            wbc_switch_sent = false;
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
             }
@@ -383,9 +391,25 @@ fn main() -> std::process::ExitCode {
             }
         }
 
+        let wbc_toggle = if pad.is_pressed(Button::DPadRight) {
+            let held = dpad_right_held_since.get_or_insert(tick);
+            if tick.duration_since(*held) >= WBC_HOLD && !wbc_switch_sent {
+                wbc_switch_sent = true;
+                tracing::warn!("DPad-Right held — asking the robot to toggle WBC");
+                true
+            } else {
+                false
+            }
+        } else {
+            dpad_right_held_since = None;
+            wbc_switch_sent = false;
+            false
+        };
+
         // One-shot skills. Answered, because "refused, and here is why" is a real outcome —
         // there may be no kick policy on this robot, or another move mid-flight.
         for (fired, skill) in [
+            (wbc_toggle, proto::Skill::WbcToggle),
             (ground_pick, proto::Skill::GroundPick),
             (kick_left, proto::Skill::KickLeft),
             (kick_right, proto::Skill::KickRight),

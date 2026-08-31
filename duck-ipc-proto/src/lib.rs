@@ -1673,6 +1673,9 @@ pub struct ThereminState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Skill {
+    /// Toggle the optional whole-body reference-tracking skill. The daemon owns the current state
+    /// and performs a home-pose ramp on both entry and exit; clients must not keep a local toggle.
+    WbcToggle,
     /// Phase-scripted pick from the ground. One shot, ~3 s.
     GroundPick,
     /// Left-leg kick. One shot, half a second, blind to any ball.
@@ -3920,6 +3923,17 @@ mod tests {
             !line.contains("from_dir"),
             "an apply that names no directory must not mention one: {line}"
         );
+    }
+
+    #[test]
+    fn the_wbc_toggle_has_a_stable_wire_name() {
+        let call = Call::RobotDo(DoParams {
+            skill: Skill::WbcToggle,
+        });
+        let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
+        assert!(line.contains(r#""skill":"wbc_toggle""#), "{line}");
+        let request: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(request.as_call().unwrap(), call);
     }
 
     /// `from_dir` survives the wire, and only appears when it was asked for.

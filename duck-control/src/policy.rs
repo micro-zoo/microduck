@@ -30,7 +30,7 @@ pub const DEFAULT_STANDING_THRESHOLD: f64 = 0.05;
 /// thread blocks on a pool it does not own — and for a network this small the pool costs
 /// more in synchronisation than it recovers in parallelism. Worth re-measuring on the board
 /// rather than trusting either number.
-const INTRA_THREADS: usize = 1;
+pub(crate) const INTRA_THREADS: usize = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
@@ -97,7 +97,7 @@ fn dylib_name() -> String {
 /// the probe passed, and `ort` panicked in `setup_api` on its own version check
 /// (`expected version >= '1.23.x', but got '1.20.1'`). The probe proves the file loads;
 /// nothing more. [`catching_ort_panics`] covers the rest, including panics we have not seen.
-fn ensure_runtime() -> Result<(), PolicyError> {
+pub(crate) fn ensure_runtime() -> Result<(), PolicyError> {
     static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
     let outcome = PROBE.get_or_init(|| {
         let name = dylib_name();
@@ -147,7 +147,9 @@ fn ensure_runtime() -> Result<(), PolicyError> {
 /// **`panic = "abort"` would defeat this.** The root `Cargo.toml` has no `[profile.release]`,
 /// so the default unwind strategy applies; adding one would silently turn this back into a
 /// dead control thread.
-fn catching_ort_panics<T>(work: impl FnOnce() -> Result<T, PolicyError>) -> Result<T, PolicyError> {
+pub(crate) fn catching_ort_panics<T>(
+    work: impl FnOnce() -> Result<T, PolicyError>,
+) -> Result<T, PolicyError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_else(|payload| {
         Err(PolicyError::RuntimePanic {
             detail: panic_message(payload),
@@ -348,7 +350,7 @@ fn open(path: &Path) -> Result<Session, PolicyError> {
 ///
 /// The leading dimension is the batch and is usually dynamic (`-1`), so only the last one
 /// is checked. That is the one that encodes the contract.
-fn check_width(
+pub(crate) fn check_width(
     path: &Path,
     what: &'static str,
     outlets: &[ort::value::Outlet],

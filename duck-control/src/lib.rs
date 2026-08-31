@@ -15,6 +15,7 @@ pub mod model;
 pub mod obs;
 pub mod policy;
 pub mod safety;
+mod wbc;
 
 pub use imu::ImuData;
 pub use io::{FakeIo, IoError, JointTargets, RobotIo, Sensors, SlowSensors};
@@ -23,3 +24,4 @@ pub use model::{
     battery_percent,
 };
 pub use obs::{ACTION_LEN, Command, OBS_LEN, Observation};
+pub use wbc::{WbcController, WbcError, WbcStep};

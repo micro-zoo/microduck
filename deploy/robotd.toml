@@ -161,6 +161,10 @@ mode = "walk"
 # voltage_adapt = false
 # nominal_voltage = 7.4
 
+[wbc]
+# Optional 72 -> 14 reference tracker. Off preserves existing controller and pad behaviour.
+enabled = false
+
 [safety]
 # The fall verdict: is the robot down? On projected gravity in the trunk frame — upright
 # reads about -1.0 on z, a robot on its side reads near 0. Debounced, because the impulse

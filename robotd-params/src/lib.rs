@@ -36,6 +36,7 @@ pub struct Params {
     pub control: Control,
     pub update_gate: UpdateGate,
     pub policy: PolicyParams,
+    pub wbc: WbcParams,
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
@@ -564,6 +565,18 @@ pub struct PolicyParams {
     pub nominal_voltage: f64,
 }
 
+/// Optional whole-body reference-tracking skill.
+///
+/// Kept outside [`PolicyParams`] because it has a different observation ABI and action
+/// interpretation. Disabled by default: adding these assets to a release must not change how an
+/// existing robot moves until an operator explicitly enables it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WbcParams {
+    /// Load the WBC skill assets and expose the remote toggle.
+    pub enabled: bool,
+}
+
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
 fn is_none_sentinel(path: &std::path::Path) -> bool {
     path.as_os_str().eq_ignore_ascii_case("none")
@@ -891,6 +904,8 @@ pub enum ParamsError {
     },
     #[error("{path}: control.hz must be between 1 and 1000, got {got}")]
     Rate { path: String, got: u32 },
+    #[error("{path}: wbc.enabled requires control.hz = 50, got {got}")]
+    WbcRate { path: String, got: u32 },
     #[error(
         "{path}: media.bitrate must be between {min} and {max} bits per second, got {got} — \
          the unit is bits, so 2 Mb/s is 2000000"
@@ -973,6 +988,12 @@ impl Params {
     fn validate(&self, path: &Path) -> Result<(), ParamsError> {
         if self.control.hz == 0 || self.control.hz > 1000 {
             return Err(ParamsError::Rate {
+                path: path.display().to_string(),
+                got: self.control.hz,
+            });
+        }
+        if self.wbc.enabled && self.control.hz != 50 {
+            return Err(ParamsError::WbcRate {
                 path: path.display().to_string(),
                 got: self.control.hz,
             });
@@ -1208,6 +1229,7 @@ mod tests {
         assert_eq!(from_file.control.cmd_alpha, built_in.control.cmd_alpha);
         assert_eq!(from_file.control.head_alpha, built_in.control.head_alpha);
         assert_eq!(from_file.policy.resolved(), built_in.policy.resolved());
+        assert_eq!(from_file.wbc, built_in.wbc);
         assert_eq!(from_file.safety.limp_fall, built_in.safety.limp_fall);
         assert_eq!(
             from_file.safety.battery_empty_shutdown,
@@ -1478,5 +1500,16 @@ mod tests {
             let path = write(dir.path(), &format!("[control]\nhz = {hz}\n"));
             assert!(Params::load(&path, true).is_err(), "hz = {hz} was accepted");
         }
+    }
+
+    #[test]
+    fn enabled_wbc_requires_the_training_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[control]\nhz = 100\n[wbc]\nenabled = true\n");
+        let error = Params::load(&path, true).unwrap_err().to_string();
+        assert!(
+            error.contains("wbc.enabled requires control.hz = 50"),
+            "{error}"
+        );
     }
 }

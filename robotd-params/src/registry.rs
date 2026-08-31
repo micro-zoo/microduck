@@ -212,6 +212,12 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Reference voltage the gains were identified at",
     ),
+    // ── [wbc] ────────────────────────────────────────────────────────────────
+    feature(
+        "wbc.enabled",
+        Kind::Bool,
+        "Load the 72-input WBC skill; DPad-Right (2s) starts or stops it",
+    ),
     // ── [safety] ─────────────────────────────────────────────────────────────
     entry(
         "safety.fall_gravity_z",
@@ -571,6 +577,7 @@ mod tests {
                 "policy.enabled",
                 "policy.mode",
                 "policy.voltage_adapt",
+                "wbc.enabled",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
                 "detect.enabled",

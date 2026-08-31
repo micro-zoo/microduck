@@ -1320,6 +1320,7 @@ mod tests {
                 "control",
                 "update_gate",
                 "policy",
+                "wbc",
                 "safety",
                 "detect",
                 "chorale",
