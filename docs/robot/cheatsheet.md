@@ -264,6 +264,10 @@ D-pad up is easy to lean on while driving.
 The WBC switch is opt-in (`[wbc] enabled = true`) and walking-mode only. Stop the robot first,
 then hold DPad-Right for two seconds; entry, exit, deadman and the final CSV row all return through
 HOME. The shipped `wbc_happy.csv` advances one row per 20 ms tick and runs for 19.78 s.
+Choose another shipped motion with `[wbc] reference = "wbc_curious.csv"` (also available:
+`wbc_happy_bob.csv` and `wbc_wiggle.csv`) and restart `robotd`. All four filenames are the same
+CSV assets used by the browser simulator. Only `wbc_happy.csv` is the current deployed default;
+qualify the other references under a support frame before floor use.
 
 For the first run, use a support frame with feet clear and an operator at the power switch. Set
 `wbc.enabled` in `sudo robotctl configure`, restart, and check `robotctl health`. Press Start,

@@ -570,11 +570,35 @@ pub struct PolicyParams {
 /// Kept outside [`PolicyParams`] because it has a different observation ABI and action
 /// interpretation. Disabled by default: adding these assets to a release must not change how an
 /// existing robot moves until an operator explicitly enables it.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WbcParams {
     /// Load the WBC skill assets and expose the remote toggle.
     pub enabled: bool,
+    /// Headerless 24-column reference CSV. A relative path resolves inside the current
+    /// release's `policies/` directory; an absolute path is a development override.
+    pub reference: PathBuf,
+}
+
+impl Default for WbcParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reference: PathBuf::from("wbc_happy.csv"),
+        }
+    }
+}
+
+impl WbcParams {
+    pub fn resolved_reference(&self) -> PathBuf {
+        if self.reference.is_absolute() {
+            self.reference.clone()
+        } else {
+            PathBuf::from(RELEASE_DIR)
+                .join("policies")
+                .join(&self.reference)
+        }
+    }
 }
 
 /// The literal that disables an optional policy slot, per the prototype's `--x-policy None`.
@@ -1510,6 +1534,23 @@ mod tests {
         assert!(
             error.contains("wbc.enabled requires control.hz = 50"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn wbc_reference_names_resolve_inside_the_release_but_absolute_paths_are_preserved() {
+        let default = WbcParams::default();
+        assert_eq!(
+            default.resolved_reference(),
+            PathBuf::from(RELEASE_DIR).join("policies/wbc_happy.csv")
+        );
+        let absolute = WbcParams {
+            reference: PathBuf::from("/tmp/wbc-debug.csv"),
+            ..WbcParams::default()
+        };
+        assert_eq!(
+            absolute.resolved_reference(),
+            PathBuf::from("/tmp/wbc-debug.csv")
         );
     }
 }

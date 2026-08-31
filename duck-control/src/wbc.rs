@@ -346,13 +346,22 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_reference_is_the_expected_complete_clip() {
-        let reference = Path::new(env!("CARGO_MANIFEST_DIR")).join("../policies/wbc_happy.csv");
-        let frames = load_reference_csv(&reference).expect("reference stream");
-        assert_eq!(frames.len(), 989);
+    fn every_shipped_reference_is_a_complete_deployment_csv() {
+        let policies = Path::new(env!("CARGO_MANIFEST_DIR")).join("../policies");
+        for (name, expected_frames) in [
+            ("wbc_happy.csv", 989),
+            ("wbc_curious.csv", 399),
+            ("wbc_happy_bob.csv", 399),
+            ("wbc_wiggle.csv", 449),
+        ] {
+            let frames = load_reference_csv(&policies.join(name)).expect("reference stream");
+            assert_eq!(frames.len(), expected_frames, "{name}");
+        }
+
+        let frames = load_reference_csv(&policies.join("wbc_happy.csv")).unwrap();
         assert_eq!(
             frames[0], frames[988],
-            "the deploy clip starts and ends at HOME"
+            "the default deployed clip starts and ends at HOME"
         );
     }
 

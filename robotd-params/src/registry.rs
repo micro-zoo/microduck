@@ -218,6 +218,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Load the 72-input WBC skill; DPad-Right (2s) starts or stops it",
     ),
+    entry(
+        "wbc.reference",
+        Kind::Text,
+        "Headerless 24-column CSV in release policies, or an absolute path",
+    ),
     // ── [safety] ─────────────────────────────────────────────────────────────
     entry(
         "safety.fall_gravity_z",

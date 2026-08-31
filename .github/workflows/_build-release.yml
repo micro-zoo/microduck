@@ -203,6 +203,9 @@ jobs:
             --include "policies/roulade.onnx=policies/roulade.onnx" \
             --include "policies/wbc_v1.onnx=policies/wbc_v1.onnx" \
             --include "policies/wbc_happy.csv=policies/wbc_happy.csv" \
+            --include "policies/wbc_curious.csv=policies/wbc_curious.csv" \
+            --include "policies/wbc_happy_bob.csv=policies/wbc_happy_bob.csv" \
+            --include "policies/wbc_wiggle.csv=policies/wbc_wiggle.csv" \
             --include "pet-detect/models/pet_detect.onnx=models/pet_detect.onnx"
 
 

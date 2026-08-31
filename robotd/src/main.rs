@@ -1175,7 +1175,7 @@ fn load_wbc_skill(controller: &mut Option<Controller>, params: &Params, state: &
     };
     let policies = PathBuf::from(params::RELEASE_DIR).join("policies");
     let policy = policies.join("wbc_v1.onnx");
-    let reference = policies.join("wbc_happy.csv");
+    let reference = params.wbc.resolved_reference();
     match WbcController::load(&policy, &reference, params.policy.gain) {
         Ok(wbc) => {
             controller.install_wbc(wbc);

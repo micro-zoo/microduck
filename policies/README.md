@@ -49,8 +49,10 @@ should not mean editing config on every robot.
 
 ### Optional WBC skill assets
 
-`wbc_v1.onnx` is the shipped 72-input controller; `wbc_happy.csv` is its headerless 989×24
-reference at 50 Hz. Paths resolve like the established policy slots.
+`wbc_v1.onnx` is the shipped 72-input controller. Four headerless 24-column references run at
+50 Hz: `wbc_happy.csv` (the default deployed 989-frame motion), `wbc_curious.csv`,
+`wbc_happy_bob.csv`, and `wbc_wiggle.csv`. Set `[wbc] reference` to one of these filenames;
+a relative path resolves inside the current release's `policies/` directory.
 
 The CSV already contains the training-side linear/angular velocities and is parsed once before
 the realtime loop. Observation order is reference (24), gyro (3), projected gravity (3),
@@ -59,6 +61,10 @@ reference joint pose; the mouth is excluded. The final row returns through HOME 
 
 WBC is disabled by default. Invalid ONNX shape or CSV contents disable only this mode and surface
 the reason through `robotctl health` and `robotctl monitor`.
+
+The additional CSVs are exported from `wbc-mjlab` holdout motions and share the deployed ABI,
+but are not claimed as hardware-qualified. Exercise a new reference in simulation and then under
+a support frame before floor use.
 
 ## Why the alpha runtime uses the 61-D family
 

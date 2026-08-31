@@ -164,6 +164,10 @@ mode = "walk"
 [wbc]
 # Optional 72 -> 14 reference tracker. Off preserves existing controller and pad behaviour.
 enabled = false
+# Headerless 24-column CSV at 50 Hz. A bare filename resolves inside the release's
+# policies directory. Shipped choices: wbc_happy.csv, wbc_curious.csv,
+# wbc_happy_bob.csv, wbc_wiggle.csv.
+reference = "wbc_happy.csv"
 
 [safety]
 # The fall verdict: is the robot down? On projected gravity in the trunk frame — upright
