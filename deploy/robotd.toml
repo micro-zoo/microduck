@@ -20,6 +20,10 @@
 # Zero 3W's wiring; a board wired differently can also be overridden per-invocation with
 # `robotd --port`, which is the dev escape hatch rather than the thing to edit here.
 port = "/dev/ttyS2"
+# Optional per-robot motor zeroes. Missing/invalid named files prevent startup.
+# Apply through robotctl configure; changing this file also requires a robotd restart.
+# See docs/robot/joint-calibration.md. Unset (or "none") preserves encoder-2048 zeroes.
+# calibration = "/etc/robot/joint-zero.json"
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to

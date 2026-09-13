@@ -1821,6 +1821,8 @@ pub struct Bus {
     /// Serial port the servos and the IMU board share. The Radxa Zero 3W wires them to
     /// `/dev/ttyS2`.
     pub port: String,
+    /// Per-robot motor zeroes, loaded once before hardware I/O.
+    pub calibration: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1876,7 +1878,16 @@ impl Default for Bus {
     fn default() -> Self {
         Self {
             port: "/dev/ttyS2".into(),
+            calibration: None,
         }
+    }
+}
+
+impl Bus {
+    pub fn calibration_path(&self) -> Option<&Path> {
+        self.calibration
+            .as_deref()
+            .filter(|path| !is_none_sentinel(path))
     }
 }
 
@@ -2111,6 +2122,19 @@ mod tests {
     ///
     /// The registry is the right thing to check against rather than `PolicyParams`'s fields,
     /// because it is itself pinned complete against serde's own field list.
+    #[test]
+    fn joint_calibration_is_optional_and_explicit_none_disables_it() {
+        let params: Params =
+            toml::from_str("[bus]\ncalibration = '/etc/robot/joint-zero.json'\n").unwrap();
+        assert_eq!(
+            params.bus.calibration_path(),
+            Some(Path::new("/etc/robot/joint-zero.json"))
+        );
+        let params: Params = toml::from_str("[bus]\ncalibration = 'None'\n").unwrap();
+        assert!(params.bus.calibration_path().is_none());
+        assert!(Params::default().bus.calibration_path().is_none());
+    }
+
     #[test]
     fn every_slot_is_a_registry_key() {
         for slot in super::Slot::ALL {

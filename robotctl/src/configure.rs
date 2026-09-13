@@ -955,6 +955,25 @@ mod tests {
     /// behind, which is what the command exists for: `cmd_alpha` at pass-through, a slot pointed
     /// at somebody's file, another switched off, and a fall gate widened.
     #[test]
+    fn joint_calibration_applies_by_restart_not_policy_reload() {
+        assert_eq!(apply_for("bus.calibration"), Some(Apply::Restart("robotd")));
+        let mut m = model("# keep\n[bus]\nport = '/dev/serial0'\n");
+        let entry = robotd_params::registry::REGISTRY
+            .iter()
+            .find(|e| e.key == "bus.calibration")
+            .unwrap();
+        m.edit(entry, "/etc/robot/joint-zero.json").unwrap();
+        let out = m.rendered();
+        assert!(out.contains("# keep"));
+        let p: robotd_params::Params = toml::from_str(&out).unwrap();
+        assert_eq!(
+            p.bus.calibration_path(),
+            Some(std::path::Path::new("/etc/robot/joint-zero.json"))
+        );
+        assert_eq!(p.bus.port, "/dev/serial0");
+    }
+
+    #[test]
     fn a_touched_config_names_every_key_that_differs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("robotd.toml");

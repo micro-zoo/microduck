@@ -102,6 +102,11 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 pub const REGISTRY: &[Entry] = &[
     // ── [bus] ────────────────────────────────────────────────────────────────
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
+    entry(
+        "bus.calibration",
+        Kind::OptionalPath,
+        "Joint zero JSON; restart robotd after changes; absent uses encoder 2048",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(

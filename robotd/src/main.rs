@@ -44,6 +44,8 @@ use duck_ipc_proto as proto;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use duck_control::calibration::JointCalibration;
+
 use control::{Controller, Driving, Error as ControlError, SkillTuning, Tuning, WbcTransition};
 use intents::Intents;
 use params::{Mode, Params, Slot};
@@ -959,6 +961,21 @@ async fn main() -> ExitCode {
         params.policy.enabled = false;
     }
 
+    let calibration = match params.bus.calibration_path() {
+        Some(path) => match JointCalibration::load(path) {
+            Ok(calibration) => {
+                tracing::info!(path = %path.display(), joints = ?calibration.configured_names(),
+                    "loaded joint zeroes; unlisted joints use encoder 2048");
+                calibration
+            }
+            Err(error) => {
+                tracing::error!(path = %path.display(), %error, "bad joint calibration; bus not opened");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => JointCalibration::default(),
+    };
+
     if let Some(Command::Init { duration }) = args.command {
         // init opens the motor bus itself. Keep ownership until the whole ramp returns,
         // so neither a daemon nor another init can join it partway through.
@@ -970,7 +987,7 @@ async fn main() -> ExitCode {
             }
         };
         duck_ipc_proto::log_startup_identity!("robotd");
-        return run_init(&params, duration);
+        return run_init(&params, &calibration, duration);
     }
 
     // Own the endpoint before publishing an identity or starting a thread that can touch
@@ -1014,6 +1031,7 @@ async fn main() -> ExitCode {
     let control = match spawn_control_thread(
         &args,
         &params,
+        &calibration,
         Arc::clone(&state),
         Arc::clone(&intents),
         poweroff,
@@ -1052,11 +1070,11 @@ async fn main() -> ExitCode {
 
 /// Enable torque and ramp to the home pose.
 #[cfg(target_os = "linux")]
-fn run_init(params: &Params, duration: Duration) -> ExitCode {
+fn run_init(params: &Params, calibration: &JointCalibration, duration: Duration) -> ExitCode {
     // The same open as the daemon's, replacement adoption included: `init` is what someone
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
-    let Some(mut io) = open_bus(&params.bus.port, 0) else {
+    let Some(mut io) = open_bus(&params.bus.port, 0, calibration) else {
         return ExitCode::FAILURE;
     };
     if let Err(e) = io.set_torque(true) {
@@ -1085,7 +1103,7 @@ fn run_init(params: &Params, duration: Duration) -> ExitCode {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_init(_params: &Params, _duration: Duration) -> ExitCode {
+fn run_init(_params: &Params, _calibration: &JointCalibration, _duration: Duration) -> ExitCode {
     tracing::error!("init needs a real bus; this build is not on the robot");
     ExitCode::FAILURE
 }
@@ -1099,11 +1117,13 @@ fn run_init(_params: &Params, _duration: Duration) -> ExitCode {
 fn spawn_control_thread(
     args: &Args,
     params: &Params,
+    calibration: &JointCalibration,
     state: Arc<RobotState>,
     intents: Arc<Intents>,
     poweroff: PowerOff,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let period = params.period();
+    let calibration = *calibration;
     let fake = args.fake;
     let sim = args.sim.clone();
     let port = params.bus.port.clone();
@@ -1168,7 +1188,7 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
-                if let Some(io) = open_bus_waiting(&port, &state).await {
+                if let Some(io) = open_bus_waiting(&port, &state, &calibration).await {
                     control_loop(io, state, intents, params, params_path, period, poweroff).await;
                 }
             });
@@ -1188,13 +1208,17 @@ type BusIo = FakeIo;
 /// one to abandon the control loop over.
 ///
 /// Returns `None` only if shutdown is requested while waiting.
-async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
+async fn open_bus_waiting(
+    port: &str,
+    state: &RobotState,
+    calibration: &JointCalibration,
+) -> Option<BusIo> {
     let mut attempt = 0u32;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
-        if let Some(io) = open_bus(port, attempt) {
+        if let Some(io) = open_bus(port, attempt, calibration) {
             state.startup_bus_failures.store(0, Ordering::Relaxed);
             return Some(io);
         }
@@ -1214,12 +1238,12 @@ async fn open_bus_waiting(port: &str, state: &RobotState) -> Option<BusIo> {
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(port: &str, attempt: u32) -> Option<BusIo> {
+fn open_bus(port: &str, attempt: u32, calibration: &JointCalibration) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
 
     let mut io = match duck_control::bus::DynamixelIo::open(port) {
-        Ok(io) => io,
+        Ok(io) => io.with_calibration(*calibration),
         Err(e) => {
             if loud {
                 tracing::error!(error = %e, port, attempt, "cannot open the bus; waiting");
@@ -1309,7 +1333,7 @@ fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_port: &str, _attempt: u32) -> Option<BusIo> {
+fn open_bus(_port: &str, _attempt: u32, _calibration: &JointCalibration) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -7134,9 +7158,13 @@ mod tests {
         ));
         let waiter_state = Arc::clone(&s);
         let handle = tokio::spawn(async move {
-            open_bus_waiting("/dev/definitely-not-a-bus", &waiter_state)
-                .await
-                .is_none()
+            open_bus_waiting(
+                "/dev/definitely-not-a-bus",
+                &waiter_state,
+                &JointCalibration::default(),
+            )
+            .await
+            .is_none()
         });
 
         // Bounded, so a regression fails rather than hanging CI.
