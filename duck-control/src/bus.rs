@@ -13,7 +13,7 @@
 //! at against real hardware. See [`crate::model`].
 
 use std::f64::consts::PI;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
 
@@ -103,6 +103,7 @@ impl StaleImuTracker {
 pub struct DynamixelIo {
     controller: Xl330Controller,
     calibration: JointCalibration,
+    origin_after: [Option<Instant>; NUM_JOINTS],
     /// Kept so the port can be reopened at the factory baud rate: `rustypot` owns the serial
     /// handle outright and offers no way to change its speed in place.
     port: String,
@@ -126,6 +127,7 @@ impl DynamixelIo {
         Ok(Self {
             controller,
             calibration: JointCalibration::default(),
+            origin_after: [None; NUM_JOINTS],
             port: port.to_owned(),
             ids,
             imu: SflpDecoder::default(),
@@ -133,8 +135,25 @@ impl DynamixelIo {
         })
     }
 
+    fn check_origin_settle(&self) -> Result<()> {
+        if self
+            .origin_after
+            .iter()
+            .flatten()
+            .any(|&deadline| Instant::now() < deadline)
+        {
+            return Err(IoError::Bus(
+                "motor reboot is settling; position origin unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn with_calibration(mut self, calibration: JointCalibration) -> Self {
         self.calibration = calibration;
+        for id in JOINT_IDS {
+            self.calibration.invalidate_origin(id);
+        }
         self
     }
 
@@ -175,14 +194,16 @@ impl DynamixelIo {
                 .read_max_position_limit(id)
                 .map_err(|e| IoError::Bus(format!("read max position on {id}: {e}")))?;
             if model.as_slice() != [1200]
-                || mode.as_slice() != [3]
+                || mode.as_slice() != [self.calibration.operating_mode()]
                 || drive.as_slice() != [0]
                 || offset.as_slice() != [0]
-                || !matches!(min.as_slice(), [value] if (*value + PI).abs() < 1e-9)
-                || !matches!(max.as_slice(), [value] if (*value - (PI - crate::calibration::RADIANS_PER_TICK)).abs() < 1e-9)
+                || (self.calibration.operating_mode() == 3
+                    && (!matches!(min.as_slice(), [value] if (*value + PI).abs() < 1e-9)
+                        || !matches!(max.as_slice(), [value] if (*value - (PI - crate::calibration::RADIANS_PER_TICK)).abs() < 1e-9)))
             {
                 return Err(IoError::Bus(format!(
-                    "calibrated ID {id} requires XL330-M288, drive mode 0, mode 3, homing offset 0 and position limits 0..4095"
+                    "calibrated ID {id} requires XL330-M288, drive mode 0, homing offset 0 and configured position mode {}; single-turn mode also requires limits 0..4095",
+                    self.calibration.operating_mode()
                 )));
             }
         }
@@ -376,6 +397,7 @@ impl DynamixelIo {
     /// Present positions only — a lighter read than [`RobotIo::read`], used once at startup
     /// to adopt the pose the robot is already in.
     pub fn present_positions(&mut self) -> Result<[f64; NUM_JOINTS]> {
+        self.check_origin_settle()?;
         let values = self
             .controller
             .sync_read_present_position(&JOINT_IDS)
@@ -407,6 +429,12 @@ impl DynamixelIo {
     /// Writing the rest costs the same as it would have, and the error names every joint that
     /// did not answer so the caller can decide whether to ask again.
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
+        if on && self.calibration.has_extended_joints() {
+            // Mode 4 retains its goal and turn count when torque is enabled. Anchor every
+            // joint and preload the measured pose before any servo can chase an old goal.
+            let positions = self.present_positions()?;
+            self.write(&JointTargets::new(positions))?;
+        }
         let mut failed = Vec::new();
         for &id in &JOINT_IDS {
             if let Err(e) = self.controller.write_torque_enable(id, on) {
@@ -476,6 +504,7 @@ pub fn replacement_target(missing: &[u8]) -> Option<u8> {
 
 impl RobotIo for DynamixelIo {
     fn read(&mut self) -> Result<Sensors> {
+        self.check_origin_settle()?;
         let blocks = self
             .controller
             .sync_read_raw_data(&self.ids, READ_ADDR, READ_LEN)
@@ -538,6 +567,7 @@ impl RobotIo for DynamixelIo {
     }
 
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
+        self.check_origin_settle()?;
         let servo_positions = self.calibration.servo_targets(&targets.positions)?;
         self.controller
             .sync_write_goal_position(&JOINT_IDS, &servo_positions)
@@ -550,6 +580,12 @@ impl RobotIo for DynamixelIo {
     }
 
     fn reboot(&mut self, id: u8) -> Result<()> {
+        if self.calibration.has_extended_joints() {
+            self.calibration.invalidate_origin(id);
+            if let Some(index) = JOINT_IDS.iter().position(|&candidate| candidate == id) {
+                self.origin_after[index] = Some(Instant::now() + REBOOT_SETTLE);
+            }
+        }
         // The status packet is a courtesy the servo may not manage before it resets, so only a
         // failure to send is an error here.
         self.controller

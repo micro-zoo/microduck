@@ -4,7 +4,7 @@
 //! zero shift changes measured and commanded positions in opposite directions; it does
 //! not change velocity, gains, action scales or the policy's default pose.
 
-use std::f64::consts::PI;
+use std::f64::consts::{PI, TAU};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -13,10 +13,22 @@ use crate::io::{IoError, Result};
 use crate::model::{JOINT_IDS, JOINT_NAMES, NUM_JOINTS, joint_index};
 
 pub const RADIANS_PER_TICK: f64 = 2.0 * PI / 4096.0;
+const POSITION_TOLERANCE: f64 = RADIANS_PER_TICK;
+const EXTENDED_MAX_TICK: i32 = 1_048_575;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PositionMode {
+    #[default]
+    SingleTurn,
+    ExtendedPosition,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    #[serde(default)]
+    position_mode: PositionMode,
     joints: Vec<JointZero>,
 }
 
@@ -28,6 +40,8 @@ struct JointZero {
     /// Effective encoder count corresponding to zero model radians. Fractional counts
     /// allow calibration at a nonzero reference angle without throwing precision away.
     zero_tick: f64,
+    #[serde(default)]
+    limits_rad: Option<[f64; 2]>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +62,10 @@ pub enum CalibrationError {
 pub struct JointCalibration {
     offsets: [f64; NUM_JOINTS],
     configured: [bool; NUM_JOINTS],
+    mode: PositionMode,
+    limits: [Option<[f64; 2]>; NUM_JOINTS],
+    // Per-open hardware coordinates. Rebuilt from the first valid reading after boot/reboot.
+    session_offsets: [Option<f64>; NUM_JOINTS],
 }
 
 impl JointCalibration {
@@ -61,7 +79,10 @@ impl JointCalibration {
 
     pub fn from_json(text: &str) -> std::result::Result<Self, CalibrationError> {
         let file: File = serde_json::from_str(text)?;
-        let mut calibration = Self::default();
+        let mut calibration = Self {
+            mode: file.position_mode,
+            ..Self::default()
+        };
         for joint in file.joints {
             let index = joint_index(&joint.name).ok_or_else(|| {
                 CalibrationError::Invalid(format!("unknown joint {}", joint.name))
@@ -78,12 +99,33 @@ impl JointCalibration {
                     joint.name, JOINT_IDS[index], joint.id
                 )));
             }
-            if !joint.zero_tick.is_finite() || !(0.0..=4095.0).contains(&joint.zero_tick) {
+            let valid_zero = match file.position_mode {
+                PositionMode::SingleTurn => (0.0..=4095.0).contains(&joint.zero_tick),
+                PositionMode::ExtendedPosition => (0.0..4096.0).contains(&joint.zero_tick),
+            };
+            if !joint.zero_tick.is_finite() || !valid_zero {
                 return Err(CalibrationError::Invalid(format!(
                     "{} zero_tick must be finite and in 0..=4095",
                     joint.name
                 )));
             }
+            match joint.limits_rad {
+                Some([min, max])
+                    if min.is_finite()
+                        && max.is_finite()
+                        && min >= -PI
+                        && max <= PI
+                        && min < max
+                        && max - min < TAU - 2.0 * POSITION_TOLERANCE => {}
+                None if file.position_mode == PositionMode::SingleTurn => {}
+                _ => {
+                    return Err(CalibrationError::Invalid(format!(
+                        "{} requires finite limits_rad inside -pi..pi spanning less than one revolution",
+                        joint.name
+                    )));
+                }
+            }
+            calibration.limits[index] = joint.limits_rad;
             calibration.offsets[index] = (joint.zero_tick - 2048.0) * RADIANS_PER_TICK;
             calibration.configured[index] = true;
         }
@@ -102,6 +144,28 @@ impl JointCalibration {
         self.configured[joint]
     }
 
+    pub fn operating_mode(&self) -> u8 {
+        match self.mode {
+            PositionMode::SingleTurn => 3,
+            PositionMode::ExtendedPosition => 4,
+        }
+    }
+
+    pub fn has_extended_joints(&self) -> bool {
+        self.mode == PositionMode::ExtendedPosition && self.configured.iter().any(|&v| v)
+    }
+
+    pub fn invalidate_origin(&mut self, id: u8) {
+        if let Some(index) = JOINT_IDS.iter().position(|&candidate| candidate == id) {
+            self.session_offsets[index] = None;
+        }
+    }
+
+    fn inside_limits(&self, joint: usize, value: f64) -> bool {
+        let [min, max] = self.limits[joint].unwrap_or([-PI, PI]);
+        value.is_finite() && value >= min - POSITION_TOLERANCE && value <= max + POSITION_TOLERANCE
+    }
+
     /// A replacement has a different installation zero even if its model and ID match.
     /// Refuse automatic adoption before any write; the new motor must be calibrated first.
     pub fn check_replacement(&self, id: u8) -> Result<()> {
@@ -116,14 +180,37 @@ impl JointCalibration {
     }
 
     /// `servo_radians` follows rustypot: encoder 2048 means 0 radians.
-    pub fn model_position(&self, joint: usize, servo_radians: f64) -> Result<f64> {
-        let model = servo_radians - self.offsets[joint];
-        // Safety clamps logical targets to +/-pi. Reject a corrected reading outside
-        // that range before it can become a hold target and be clamped to a different
-        // physical pose. Crossing the encoder seam needs a mounting/range check.
-        if self.configured[joint] && (!model.is_finite() || !(-PI..=PI).contains(&model)) {
+    pub fn model_position(&mut self, joint: usize, servo_radians: f64) -> Result<f64> {
+        if !self.configured[joint] {
+            return Ok(servo_radians);
+        }
+        if self.mode == PositionMode::ExtendedPosition && self.session_offsets[joint].is_none() {
+            let [min, max] = self.limits[joint].expect("extended limits validated at load");
+            let delta = servo_radians - self.offsets[joint];
+            // The mechanical interval is narrower than one revolution. At power-on the
+            // servo reports a single-turn phase, so at most one integer turn fits it.
+            let turns = ((delta - (min + max) * 0.5) / TAU).round();
+            let offset = self.offsets[joint] + turns * TAU;
+            let position = servo_radians - offset;
+            if !self.inside_limits(joint, position) {
+                return Err(IoError::Bus(format!(
+                    "{} position cannot be located inside calibrated model limits; check pose/zero",
+                    JOINT_NAMES[joint]
+                )));
+            }
+            self.session_offsets[joint] = Some(offset);
+        }
+        let offset = if self.mode == PositionMode::ExtendedPosition {
+            self.session_offsets[joint].expect("origin established above")
+        } else {
+            self.offsets[joint]
+        };
+        let model = servo_radians - offset;
+        // Never silently rebase an active origin after a discontinuity. A reset that changes
+        // the encoder's turn must be handled while stopped, via reboot or a new bus open.
+        if !self.inside_limits(joint, model) {
             return Err(IoError::Bus(format!(
-                "calibrated reading for {} is outside model travel; check mounting/reference pose",
+                "calibrated reading for {} is outside model travel; stop and check encoder reset/pose",
                 JOINT_NAMES[joint]
             )));
         }
@@ -133,7 +220,23 @@ impl JointCalibration {
     pub fn servo_targets(&self, model: &[f64; NUM_JOINTS]) -> Result<[f64; NUM_JOINTS]> {
         let mut servo = [0.0; NUM_JOINTS];
         for (joint, target) in model.iter().enumerate() {
-            servo[joint] = target + self.offsets[joint];
+            let offset = if self.configured[joint] && self.mode == PositionMode::ExtendedPosition {
+                if !self.inside_limits(joint, *target) {
+                    return Err(IoError::Bus(format!(
+                        "target for {} is outside model limits",
+                        JOINT_NAMES[joint]
+                    )));
+                }
+                self.session_offsets[joint].ok_or_else(|| {
+                    IoError::Bus(format!(
+                        "{} needs a valid position read before any target/torque enable",
+                        JOINT_NAMES[joint]
+                    ))
+                })?
+            } else {
+                self.offsets[joint]
+            };
+            servo[joint] = target + offset;
             if !servo[joint].is_finite() {
                 return Err(IoError::Bus(format!(
                     "non-finite target for {}",
@@ -141,25 +244,27 @@ impl JointCalibration {
                 )));
             }
             // rustypot truncates the inverse conversion. Floating cancellation can make
-            // an exact calibrated count (e.g. 1022) become 1021.9999999999999 and send
-            // the preceding tick. Correct only roundoff next to an integer count;
+            // an exact calibrated count become the adjacent integer after truncation,
+            // on either side of zero. Correct only roundoff next to an integer count;
             // preserve the existing truncation for genuinely fractional targets.
             if self.configured[joint] {
                 let raw = 4096.0 * (PI + servo[joint]) / (2.0 * PI);
                 let nearest = raw.round();
-                if raw < nearest && nearest - raw < 1e-9 {
-                    servo[joint] += RADIANS_PER_TICK * 1e-10;
+                if (nearest - raw).abs() < 1e-9 {
+                    servo[joint] += nearest.signum() * RADIANS_PER_TICK * 1e-10;
                 }
             }
-            // Never wrap a shifted target through the single-turn encoder boundary:
-            // the servo could travel almost a full revolution to a nearby logical angle.
-            // Unconfigured joints retain the runtime's existing target range behavior.
-            // Check the actual integer conversion rustypot sends. Checking a float
-            // against 4095 would reject a valid endpoint at 4095 + roundoff.
+            // Never wrap a shifted target: Mode 4 uses its continuous signed origin,
+            // while legacy Mode 3 must still reject the single-turn seam. Check the
+            // actual integer conversion rustypot sends, including endpoint roundoff.
             let tick = (4096.0 * (PI + servo[joint]) / (2.0 * PI)) as i32;
-            if self.configured[joint] && !(0..=4095).contains(&tick) {
+            let range = match self.mode {
+                PositionMode::SingleTurn => 0..=4095,
+                PositionMode::ExtendedPosition => -EXTENDED_MAX_TICK..=EXTENDED_MAX_TICK,
+            };
+            if self.configured[joint] && !range.contains(&tick) {
                 return Err(IoError::Bus(format!(
-                    "calibrated target for {} is outside single-turn travel ({tick} ticks)",
+                    "calibrated target for {} is outside configured encoder travel ({tick} ticks)",
                     JOINT_NAMES[joint]
                 )));
             }
@@ -181,7 +286,7 @@ mod tests {
 
     #[test]
     fn hand_placed_reference_is_zero_and_inverse_command_returns_to_it() {
-        let c = calibration();
+        let mut c = calibration();
         let servo = (2176.0 - 2048.0) * RADIANS_PER_TICK;
         assert!(c.model_position(0, servo).unwrap().abs() < 1e-12);
         assert!((c.servo_targets(&[0.0; NUM_JOINTS]).unwrap()[0] - servo).abs() < 1e-12);
@@ -200,7 +305,7 @@ mod tests {
 
     #[test]
     fn partial_files_leave_other_joints_unchanged() {
-        let c = calibration();
+        let mut c = calibration();
         assert_eq!(c.configured_names(), ["left_hip_yaw"]);
         assert_eq!(c.model_position(1, 0.3).unwrap(), 0.3);
         assert_eq!(c.servo_targets(&[0.3; NUM_JOINTS]).unwrap()[1], 0.3);
@@ -210,7 +315,7 @@ mod tests {
     fn nonzero_reference_angle_produces_the_same_model_coordinates() {
         // Measured 2304 at model angle pi/8 => zero at 2048, not 2304.
         let zero = 2304.0 - (PI / 8.0) / RADIANS_PER_TICK;
-        let c = JointCalibration::from_json(&format!(
+        let mut c = JointCalibration::from_json(&format!(
             r#"{{"joints":[{{"name":"head_yaw","id":32,"zero_tick":{zero}}}]}}"#
         ))
         .unwrap();
@@ -283,7 +388,7 @@ mod tests {
     #[test]
     fn holding_a_measured_endpoint_stays_inside_the_encoder_range() {
         for zero in [0.0, 100.5, 2176.0, 4095.0] {
-            let c = JointCalibration::from_json(&format!(
+            let mut c = JointCalibration::from_json(&format!(
                 r#"{{"joints":[{{"name":"head_yaw","id":32,"zero_tick":{zero}}}]}}"#
             ))
             .unwrap();
@@ -305,7 +410,7 @@ mod tests {
         // UI uses closed=0; runtime retains its existing closed=-5 degree API.
         // Export an effective runtime zero instead of driving 5 degrees past closed.
         let mouth_zero = 2054.0 - crate::model::MOUTH_CLOSED / RADIANS_PER_TICK;
-        let c = JointCalibration::from_json(&format!(
+        let mut c = JointCalibration::from_json(&format!(
             r#"{{"joints":[{{"name":"head_yaw","id":32,"zero_tick":3069}},{{"name":"head_roll","id":33,"zero_tick":2051}},{{"name":"mouth","id":34,"zero_tick":{mouth_zero}}}]}}"#
         )).unwrap();
         let mut pose = [0.0; NUM_JOINTS];
@@ -317,5 +422,96 @@ mod tests {
         }
         pose[7] = 170.0f64.to_radians();
         assert!(c.servo_targets(&pose).is_err());
+    }
+    fn extended(zero: f64, limits: [f64; 2]) -> JointCalibration {
+        JointCalibration::from_json(&format!(
+            r#"{{"position_mode":"extended_position","joints":[{{"name":"left_hip_yaw","id":20,"zero_tick":{zero},"limits_rad":[{},{}]}}]}}"#,limits[0],limits[1]
+        )).unwrap()
+    }
+    fn servo_angle(raw: i32) -> f64 {
+        (raw as f64 - 2048.0) * RADIANS_PER_TICK
+    }
+    fn raw_target(servo: f64) -> i32 {
+        (4096.0 * (PI + servo) / TAU) as i32
+    }
+
+    #[test]
+    fn extended_crosses_the_encoder_seam_without_wrapping_commands() {
+        let mut c = extended(4071.0, [-0.4363323129985824, 0.5235987755982988]);
+        assert!(c.servo_targets(&[0.0; NUM_JOINTS]).is_err());
+        c.model_position(0, servo_angle(4071)).unwrap();
+        let mut last = f64::NEG_INFINITY;
+        for raw in 4071..=4200 {
+            let q = c.model_position(0, servo_angle(raw)).unwrap();
+            assert!(q > last);
+            last = q;
+            let mut targets = [0.0; NUM_JOINTS];
+            targets[0] = q;
+            assert_eq!(raw_target(c.servo_targets(&targets).unwrap()[0]), raw);
+        }
+        // An unexpected reboot resets 4200 to 104; never silently rebase this live session.
+        assert!(c.model_position(0, servo_angle(104)).is_err());
+        c.invalidate_origin(20);
+        assert!(c.servo_targets(&[0.0; NUM_JOINTS]).is_err());
+        let q = c.model_position(0, servo_angle(104)).unwrap();
+        assert!((q - 129.0 * RADIANS_PER_TICK).abs() < 1e-12);
+        let mut targets = [0.0; NUM_JOINTS];
+        targets[0] = 0.0;
+        assert_eq!(raw_target(c.servo_targets(&targets).unwrap()[0]), -25);
+    }
+
+    #[test]
+    fn every_installation_zero_maps_to_the_same_bounded_model_coordinates() {
+        let limits = [-170f64.to_radians(), 170f64.to_radians()];
+        for zero in 0..4096 {
+            for pose in [-2.0, 0.0, 2.0] {
+                let unwrapped = (zero as f64 + pose / RADIANS_PER_TICK).round() as i32;
+                let boot = unwrapped.rem_euclid(4096);
+                let mut c = extended(zero as f64, limits);
+                let q = c.model_position(0, servo_angle(boot)).unwrap();
+                assert!((q - pose).abs() <= RADIANS_PER_TICK / 2.0 + 1e-10);
+                for goal in [-2.9, 0.0, 2.9] {
+                    let mut targets = [0.0; NUM_JOINTS];
+                    targets[0] = goal;
+                    let raw = raw_target(c.servo_targets(&targets).unwrap()[0]);
+                    // Continuous motor displacement equals model displacement for every zero.
+                    let actual = (raw - boot) as f64 * RADIANS_PER_TICK;
+                    assert!((actual - (goal - q)).abs() < RADIANS_PER_TICK + 1e-10);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bus_reopen_recovers_origins_from_continuous_counts_too() {
+        for turns in [-10, 0, 15] {
+            let mut c = extended(4071.0, [-0.5, 0.5]);
+            let raw = 4071 + turns * 4096;
+            assert!(c.model_position(0, servo_angle(raw)).unwrap().abs() < 1e-10);
+            assert_eq!(
+                raw_target(c.servo_targets(&[0.0; NUM_JOINTS]).unwrap()[0]),
+                raw
+            );
+        }
+    }
+
+    #[test]
+    fn extended_requires_unambiguous_limits_and_rejects_outside_targets() {
+        for extra in [
+            "",
+            r#", "limits_rad":[-3.141592653589793,3.141592653589793]"#,
+            r#", "limits_rad":[1,-1]"#,
+        ] {
+            let json = format!(
+                r#"{{"position_mode":"extended_position","joints":[{{"name":"left_hip_yaw","id":20,"zero_tick":4071{extra}}}]}}"#
+            );
+            assert!(JointCalibration::from_json(&json).is_err());
+        }
+        let mut c = extended(4071.0, [-0.5, 0.5]);
+        assert!(c.model_position(0, servo_angle(2048)).is_err());
+        c.model_position(0, servo_angle(4071)).unwrap();
+        let mut targets = [0.0; NUM_JOINTS];
+        targets[0] = 0.6;
+        assert!(c.servo_targets(&targets).is_err());
     }
 }
