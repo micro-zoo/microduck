@@ -139,7 +139,9 @@ pub fn spawn_first(
         }
     }
     anyhow::bail!(
-        "no model would load ({}). For the NPU: sudo /usr/local/sbin/robot-setup-npu",
+        "no model would load ({}). A missing file means the set was never installed — \
+         `sudo robotctl duck-detector update` fetches it from the Hub; for the NPU: \
+         sudo /usr/local/sbin/robot-setup-npu",
         refused.join("; ")
     )
 }
@@ -223,7 +225,11 @@ pub fn spawn(
                     starved = 0;
                 }
 
-                let Some(frame) = frames.latest() else {
+                // Asked for rather than taken: the tee only copies a frame somebody wants, and this
+                // is the want — see [`crate::pipeline::Frames`]. `starved` now counts a tee that
+                // did not answer within the timeout, which is the same fault it always meant and a
+                // narrower one than "there was nothing there when I looked".
+                let Some(frame) = frames.next_frame() else {
                     starved += 1;
                     continue;
                 };

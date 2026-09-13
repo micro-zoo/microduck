@@ -1269,6 +1269,98 @@ impl Engine {
 
     // ── explicit transitions ─────────────────────────────────────────────────
 
+    /// Install a policy set from the Hub and tell `robotd` to pick it up.
+    ///
+    /// Not an update in the component sense — no manifest, no signature, no health gate, no
+    /// rollback — and [`crate::policy`] says why. It is here because it needs this process's two
+    /// privileges, a network stack and root, and because `robotd` must be told afterwards: the
+    /// swap moves a symlink underneath unchanged paths, so nothing about the slots looks
+    /// different from the loop's side until something says otherwise.
+    ///
+    /// A robot that does not pick it up is reported rather than treated as a failure. The files
+    /// are installed and correct; the running loop is one restart behind, which is a true thing
+    /// to say and not a reason to undo a download.
+    pub async fn install_policies(
+        &self,
+        version: Option<&str>,
+    ) -> Result<crate::proto::PolicyInstallResult, Error> {
+        let root = std::path::Path::new(crate::policy::POLICY_ROOT);
+        let (installed, previous) = crate::policy::install(root, version).await?;
+        let reloaded = match &previous {
+            // Nothing moved, so there is nothing for the robot to re-read and asking would only
+            // make it go home and rebuild for no reason.
+            None => true,
+            Some(_) => self.robot.reload_policies(ROBOT_QUERY_TIMEOUT).await,
+        };
+        Ok(crate::proto::PolicyInstallResult {
+            installed,
+            previous,
+            reloaded,
+        })
+    }
+
+    /// Install a duck detector from the Hub, and restart `mediad` onto it.
+    ///
+    /// `mediad` loads the model once, at startup, so a swapped set is invisible to it until it
+    /// restarts — and unlike `robotd`'s policies there is no live reload to ask for, because the
+    /// detector is a thread holding an NPU context and the honest way to replace it is to start
+    /// again. The restart drops every video session, which is why `detector.install` is gated
+    /// like `policy.install`. `reloaded` is whether the restart took; a `mediad` this board does
+    /// not have (a bench) counts as taken, since there is nothing running the old one.
+    pub async fn install_detector(
+        &self,
+        version: Option<&str>,
+    ) -> Result<crate::proto::PolicyInstallResult, Error> {
+        let root = std::path::Path::new(crate::policy::DETECTOR_ROOT);
+        let (installed, previous) = crate::policy::install_set(
+            root,
+            version,
+            crate::policy::Contents::Fixed(&crate::policy::DETECTOR_FILES),
+        )
+        .await?;
+        let reloaded = match &previous {
+            None => true,
+            Some(_) => match restart_one(SYSTEMCTL, MEDIAD_UNIT).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "mediad did not restart onto the new detector");
+                    false
+                }
+            },
+        };
+        Ok(crate::proto::PolicyInstallResult {
+            installed,
+            previous,
+            reloaded,
+        })
+    }
+
+    /// Fetch one policy from any Hub repo into this robot's library.
+    ///
+    /// The model API comes from the running `robotd` rather than from a constant here, because it
+    /// is the daemon that implements the contract and this process only carries it. An
+    /// unreachable robot is not a refusal — see [`crate::policy::Expectations::here`].
+    pub async fn fetch_policy(
+        &self,
+        repo: &str,
+        revision: Option<&str>,
+        file: Option<&str>,
+    ) -> Result<crate::proto::PolicyFetchResult, Error> {
+        let model_api = self.robot.model_api(ROBOT_QUERY_TIMEOUT).await;
+        // What the robot is pointed at, so the prune that follows the fetch cannot take a gait
+        // out from under it. `None` — a robot that did not answer — prunes nothing at all.
+        let in_use = self.robot.policy_paths(ROBOT_QUERY_TIMEOUT).await;
+        crate::policy::fetch(
+            std::path::Path::new(crate::policy::LIBRARY_ROOT),
+            repo,
+            revision,
+            file,
+            crate::policy::Expectations::here(model_api),
+            in_use.as_deref(),
+        )
+        .await
+    }
+
     /// Revert to the previously installed release.
     ///
     /// Reachable when `robotd` is dead — that is the case it exists for
@@ -2370,6 +2462,9 @@ const SYSTEMCTL: &str = "systemctl";
 
 /// Where `hooks/postinstall` installs unit files, and so where the orphan check reads them.
 const UNIT_DIR: &str = "/etc/systemd/system";
+
+/// The daemon that loads the duck detector, restarted by [`Engine::install_detector`].
+const MEDIAD_UNIT: &str = "mediad";
 
 /// This process's own unit, which the reconciliation must recognise and never restart.
 ///

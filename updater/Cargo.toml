@@ -20,6 +20,11 @@ path = "src/main.rs"
 
 [dependencies]
 duck-ipc-proto = { path = "../duck-ipc-proto" }
+# The Hugging Face device-code login. Extracted from this crate, because a robot signing in to an
+# account has nothing to do with updating one and every other robot wants the same thing.
+# `src/account.rs` is what is left here: where the credential lives on *this* robot, and how the
+# crate's answers become `proto`'s.
+hf-robot-account = "0.1"
 # For `ETXTBSY` by name in the hook-spawn retry. Already in the tree via tokio, and an errno
 # spelled 26 in our own source is the kind of thing that is fine until it is not.
 libc = "0.2.189"

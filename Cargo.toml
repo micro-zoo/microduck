@@ -4,7 +4,7 @@
 # docs/design/architecture.md §1. `robotd`, `btd` and `mediad` are all siblings now.
 [workspace]
 resolver = "3"
-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
+members = ["btd", "configd", "duck-control", "duck-detect", "duck-ether", "duck-ipc-proto", "duckctl", "kinematics", "mediad", "odometry", "pad-imu", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
 
 # Everything except `duckctl`, and that exception is the whole reason this key exists.
 #
@@ -18,7 +18,7 @@ members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "d
 # writing down. One list here, and a new daemon is picked up by both without anybody remembering.
 #
 # `--workspace` is unaffected, so CI still lints and tests `duckctl` exactly as before.
-default-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "mediad", "odometry", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
+default-members = ["btd", "configd", "duck-control", "duck-detect", "duck-ipc-proto", "kinematics", "mediad", "odometry", "pad-imu", "padd", "pet-detect", "sounds", "tof", "updater", "robotctl", "robotd", "robotd-params", "test-support", "xtask"]
 
 # ONNX Runtime, which robotd dlopens to run a policy. One source of truth: `xtask package`
 # bakes these into the release's preinstall hook, and a test asserts scripts/setup-board.sh
@@ -41,6 +41,30 @@ target = "1.28.0"
 [workspace.metadata.rknpu]
 runtime = "v2.3.2"
 
+# The official policy set, which `robotd` runs and which lives on the Hugging Face Hub rather
+# than in this repository — a gait retrain should not need a daemon release, and a daemon fix
+# should not re-ship six megabytes of unchanged weights.
+#
+# Same shape as the three pins above and for the same reason: `scripts/seed-policies.sh` runs from
+# inside a release and cannot read this file, so it carries the literals and a test asserts the
+# two agree.
+#
+# `version` is a tag in the Hub repo, and it is a *floor*: it decides what a freshly provisioned
+# board installs, not what every board runs. Moving past it is `robotctl policy update`, which
+# needs no daemon release — bumping this does, since it ships inside one.
+[workspace.metadata.policies]
+repo    = "pollen-robotics/microduck-policies"
+version = "v1"
+
+# The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
+# and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with
+# `robotctl duck-detector update`. The model repo shares its name with the *dataset* repo; the robot only
+# ever addresses the model (`huggingface.co/<repo>/resolve/…`, `api/models/<repo>`), and the
+# dataset lives under `datasets/`, so the shared name cannot be confused on the wire.
+[workspace.metadata.detector]
+repo    = "pollen-robotics/microduck-duck-detector"
+version = "duck-v1"
+
 # The prebuilt GStreamer plugins `mediad` needs, built in CI from pinned upstream sources at
 # https://github.com/pollen-robotics/microduck-gst-plugins — `mpph264enc` (hardware H.264 through
 # Rockchip MPP) and `webrtcsink`/`webrtcsrc`, neither of which exists in any Debian suite.
@@ -54,7 +78,7 @@ repo    = "pollen-robotics/microduck-gst-plugins"
 version = "v3"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.12.0"
 edition = "2024"
 # 1.89 for `std::fs::File::try_lock`, which is how the single-flight update lock works
 # without a dependency (updater/src/journal.rs). Edition 2024 needs 1.85, so this covers

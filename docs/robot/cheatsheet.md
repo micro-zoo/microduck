@@ -90,7 +90,11 @@ this is relative motion and it drifts; it answers "did it walk in a circle" and 
 angles between degrees and radians; `t` opens the [ToF matrix](#the-tof-sensor-tofd); `d` toggles
 the robot view and `[` / `]` orbit it; `p` opens the pad's raw input stream — every evdev report
 from the gamepad, with the gaps between them, which is the only place a stalled radio is visible
-([pair a gamepad](pair-a-gamepad.md#when-it-drops-while-you-are-driving)). Angles are degrees on screen — joints, head and the yaw rate.
+([pair a gamepad](pair-a-gamepad.md#when-it-drops-while-you-are-driving)). A pad with an inertial
+unit — the Pro Controller clones have one, the Xbox does not — grows that block by a panel: a
+wireframe pad that tilts and turns with the one in your hands, its pitch, roll and drifting yaw,
+the raw acceleration and rates, and whether the gyro's rest bias has been learned yet (hold it
+still half a second). The yellow bar is the pad's front edge. Angles are degrees on screen — joints, head and the yaw rate.
 Redirected or piped it prints one line per tick instead, so `> run.log` and `| grep FALLEN`
 behave, and those numbers stay radians whatever the screen is set to. The joint vectors are in
 `--json`, which carries the whole state, one object per line:
@@ -105,10 +109,21 @@ robotctl monitor --json --hz 50 > run.jsonl
 sudo robotctl configure
 ```
 
+What has been changed on this robot, and nothing else:
+
+```
+robotctl configure --list
+```
+
+A robot nobody has touched prints nothing — that is the answer. Add `--json` for a support
+bundle. It needs no root and no terminal, which is the point: it is the first question to ask
+about a robot behaving oddly, and until now answering it meant a full-screen editor over ssh.
+
 An interactive editor over `/etc/robot/robotd.toml`: every key the daemons know, the feature
 switches first (policy on/off, walk/roller, limp-fall, audio, pet detection, battery
 shutdown, camera and video quality…), current value against default, one line of doc. SPACE toggles, ENTER types a
-value, `u` reverts a key to its default. Values in yellow (marked `•`) are the keys where
+value, `u` reverts a key to its default, `ctrl+f` opens a fuzzy search over everything on
+screen (the selection follows as you type; ENTER or ESC keeps it there). Values in yellow (marked `•`) are the keys where
 this robot diverges from the defaults; everything else is the built-in default, and `unset`
 optionals show what they resolve to `(auto)`.
 
@@ -124,8 +139,10 @@ Three properties worth trusting:
 - **It cannot write a file robotd refuses to start on.** Every save is validated through the
   daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
 
-The daemons read the file once at startup, so saving offers a restart — of the ones that read
-what you changed: `[media]` is `mediad`, everything else is `robotd`. `sudo`, because the file
+Saving offers what the change actually needs, from the daemon that actually reads it: a restart
+for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
+*reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]` and
+`[pad_imu_head_control]`, which `padd` picks up within a second. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
@@ -137,9 +154,12 @@ sudo robotctl configure
 ```
 
 Set `media.quality` — `1080p30`, `720p30`, `720p15` or `360p30` — and take the restart it
-offers. `media.camera` off streams a test pattern instead, which is what a board with no camera
+offers. `media.source` set to `test` streams a test pattern instead, which is what a board with
+no camera
 wants: the WebRTC *control* channel rides on the video track, so a pipeline that cannot start
-costs both. `media.bitrate` follows the quality unless you set it; the unit is bits per second.
+costs both. The pattern ignores `media.quality` and runs at 256x144@5 — it is there to make the
+session exist, and drawing a 720p one costs five times the CPU a real camera does.
+`media.bitrate` follows the quality unless you set it; the unit is bits per second.
 
 `media.congestion_control` is the other knob in that section, and it is the one that moves CPU:
 `disabled` drops the bandwidth estimator, which is the largest single consumer in `mediad` (7.6% of
@@ -154,27 +174,261 @@ than failing. `robotctl monitor` reports the achieved rate on the bottom border,
 journalctl -u mediad -b | grep streaming
 ```
 
-#### Your own policy
+### Policies and skills
 
-You do not need to cut a release to try a network. Point `robotd` at your own `.onnx` on the
-board, in `/etc/robot/robotd.toml`:
+A **slot** is what the robot runs by default — the walking gait, the standing network. A
+**skill** is what it runs when asked: a kick, the roulade, a bow. Both are files on the Hub, both
+change without a daemon release, and nothing below needs a restart.
+
+What this robot is running right now:
+
+```
+robotctl policy list
+```
+
+Two tables: the seven slots, then the skills — what runs by default, and what runs when asked.
+
+```text
+   SKILL        RUNS FOR  POLICY
+   kick_left       0.5 s  ball_kick_left.onnx
+   roulade           1 s  roulade.onnx
+ * polite-bow        4 s  fffiloni/microduck-polite-bow-b1d864/main/policy.onnx
+   ground_pick         —  driven by the robot itself
+   sit_toggle          —  driven by the robot itself
+```
+
+A `*` marks every row config has an opinion about, with a count at the bottom. A slot you switched
+off says `switched off` rather than looking like one the robot never had. The directory comes off
+the path because the `ORIGIN` column already says which one it was.
+
+`ground_pick` and `sit_toggle` have no length because the robot drives them itself — they answer
+to `robot do` like the rest, but they are not entries you can change.
+
+#### A newer official set
+
+The set the robot walks with lives on the Hub and versions on its own line:
+
+```
+robotctl policy check
+```
+
+```
+sudo robotctl policy update
+```
+
+`check` prints what is installed, what is newest, and what else the repo offers; it changes
+nothing and says so plainly when the Hub cannot be reached. `update` takes the newest unless you
+name one — `--version v1` is how to go back. The robot returns to its home pose, re-reads every
+slot and drives again, and **a slot you loaded yourself is left alone**, because it points
+somewhere else entirely.
+
+#### A newer duck detector
+
+The model `mediad` finds other ducks with lives on the Hub the same way
+(`pollen-robotics/microduck-duck-detector`) and versions on its own line:
+
+```
+robotctl duck-detector check
+```
+
+```
+sudo robotctl duck-detector update
+```
+
+Same shape as the policy pair — `--version <tag>` names one, and `check` changes nothing. `update`
+restarts `mediad`, which drops the console's video for a moment; whether the detector then runs at
+all is `[duck_detector] enabled` in `robotctl configure`.
+
+#### Trying your own file
+
+No release, no file to edit, no restart:
+
+```
+sudo robotctl policy load walk /home/radxa/my_walking.onnx
+```
+
+If the robot is walking, it goes to its home pose, loads it, and drives again. If it is doing
+something else — sitting, standing still — nothing moves: the network being replaced is not the
+one running, and the swap happens underneath. `sudo robotctl policy reset walk` puts that slot
+back; with no slot, it puts all seven back.
+
+#### Trying somebody else's
+
+Other people publish policies for this robot:
+
+```
+robotctl policy search microduck
+```
+
+```
+sudo robotctl policy load walk RemiFabre/microduck-flamingo-cycle
+```
+
+The repo name is enough — it is fetched and loaded in one step. Add `@v2` for a revision and
+`:policy.onnx` for a repo carrying more than one. `policy list` marks it `community`.
+
+**Nothing a stranger publishes is verified by anybody.** What makes it safe to try is the joint
+clamps, the fall reflex and the shape gate — not the description. Have the robot on its stand the
+first time.
+
+A policy whose manifest says it will not run here — wrong observation width, a newer daemon, a
+different robot — is refused before it downloads. One with no manifest is accepted and checked
+the usual way, at load.
+
+#### Adding a skill
+
+A policy in the walk slot replaces the gait. A policy added as a *skill* sits alongside it and
+runs when asked, which is what most published one-shots want:
+
+```
+sudo robotctl policy add polite-bow fffiloni/microduck-polite-bow-b1d864
+```
+
+```
+robotctl robot do polite-bow
+```
+
+The length comes from the repo's manifest. A policy that holds until told otherwise — a
+one-footed stand, say — has no length of its own, so give it one, and the twist it reads:
+
+```
+sudo robotctl policy add flamingo RemiFabre/microduck-flamingo-cycle --hold 5 --command 1,1,0
+```
+
+`--command` is what the network is fed while it runs. Most skills need none: they are trained on
+an all-zero command and being selected *is* the trigger. A policy that reads its twist as
+something else — flamingo's is `[flag, side, 0]` — needs it spelled out, and its README says
+what the slots mean.
+
+`sudo robotctl policy remove <name>` takes one out. A skill this robot's release ships comes back
+when you do, since removing the entry only removes the override.
+
+The robot must be driving for a skill to run — press **Start** on the pad first, or the request
+is refused saying so.
+
+#### Putting a skill on a button
+
+```
+robotctl pad bindings
+```
+```text
+a           ground_pick
+x           roulade
+lb          kick_left
+rb          kick_right
+dpad_down   sit_toggle
+
+`robotctl pad bind <button> <skill>` changes one; padd picks it up within a second.
+```
+
+```
+sudo robotctl pad bind x polite-bow
+```
+```text
+a           ground_pick
+x           polite-bow
+lb          kick_left
+rb          kick_right
+dpad_down   sit_toggle
+```
+
+That writes one line, and only the button you named:
 
 ```toml
-[policy]
-walk = "/home/radxa/my_walking.onnx"
-stand = "/home/radxa/my_stand.onnx"
+[pad]
+x = "polite-bow"
 ```
 
+Put it back:
+
 ```
-sudo systemctl restart robotd
+sudo robotctl pad reset
 ```
 
-Your paths survive updates — a release replaces the binaries and the policies it ships, not the
-file that points elsewhere. Delete the lines to go back to the ones the release carries.
+**Nothing restarts** — `padd` notices within a second.
 
-A policy that could not be loaded reports **unhealthy**, and `robotctl health` and the bottom
-border of `monitor` both name the reason. The shape a policy has to have, and what else is
-checked at load, are in [`../design/robotd-design.md`](../design/robotd-design.md) §2.3.
+A binding naming a skill this robot does not have is marked in the listing rather than
+silently doing nothing when you press it.
+
+Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. **`lb`/`rb` are the bumpers**, not
+the analog triggers, which are the mouth and the quack. An empty name switches a button off, and
+`pad reset <button>` puts one back. The defaults are the mapping the prototype had, so a robot
+with no `[pad]` section behaves exactly as it always has.
+
+The rest of the pad is not bindable: Start toggles the policy, Y and B change what the sticks
+mean, and held Select powers the robot off — the button that stops a robot is the one worth not
+being able to lose to a config edit. A name is checked against what the robot actually has, so a
+typo is refused with the list rather than becoming a dead button.
+
+#### Putting it all back
+
+```
+sudo robotctl policy reset
+```
+```
+sudo robotctl pad reset
+```
+```
+robotctl configure --list
+```
+
+The last one prints what this robot changes from the defaults and nothing else — a robot nobody
+has touched prints one line saying so. It is the first thing to run when a robot is behaving
+oddly and you are not sure what was left set.
+
+#### The slots, and four things worth knowing
+
+The slots are `walk`, `stand`, `sitstand`, `ground_pick`, `kick_left`, `kick_right` and
+`roulade`. `load` writes the choice into `/etc/robot/robotd.toml`, so it survives a reboot and
+survives updates — a release replaces the binaries and the policies it ships, not the line that
+points elsewhere.
+
+- **Resetting something already reset does nothing, and says so.** No homing, no reload, and no
+  `sudo` needed when there is also nothing to write.
+- **A policy that is not `obs[1,61] -> actions[1,14]` is refused before anything changes.** The
+  file is opened and checked while the robot is still running the old one.
+- **A load that fails anyway keeps the policy that was running.** Trying a gait cannot cost you
+  the one you had.
+- **A file that has gone missing by the next boot costs its slot, not the robot.** The slot falls
+  back to this robot's own policy, `robotctl health` reports *degraded* and names the file, and
+  `policy reset <slot>` clears it. An official policy that will not load is still **unhealthy** —
+  that is a broken release, and the updater rolls it back.
+
+`none` switches a slot off — every slot except `walk`, which is what the others fall back to and
+cannot be empty. Some policies need that: one that does its own standing wants the standing
+network out of the way, or the robot hands itself to that whenever the command is zero.
+
+#### Publishing a policy for every robot
+
+A policy in the official set reaches every robot, and adding one is four steps with no daemon
+release:
+
+1. Upload the `.onnx` to `pollen-robotics/microduck-policies`.
+2. Add an entry to its `manifest.json`:
+   ```json
+   { "file": "polite-bow.onnx", "kind": "episodic", "duration_s": 4.0 }
+   ```
+   The set's manifest is `schema_version: 2`; a plain one-shot needs no more than those three.
+3. Tag it — `hf repos tag create pollen-robotics/microduck-policies v4`.
+4. On a robot: `sudo robotctl policy update`.
+
+That entry is what a one-shot needs and nothing more: **`episodic` with a `duration_s`, on the
+all-zero command it was trained against, becomes a skill the robot answers to by name** — ready
+for `robot do` and a button, with nothing else edited. A **`perpetual`** one is a gait and needs
+a slot pointed at it instead.
+
+A policy the daemon has to *drive* — writing a phase over time, or flipping a posture flag —
+declares that under `command.encoding`, and its numbers become that arm's timing rather than a
+new skill. The ground pick and the sit↔stand are the two, and getting one of those entries wrong
+is the one mistake here worth being careful about.
+
+The manifest in full, every field, and what each one changes on the robot:
+[`../policy-manifest.md`](../policy-manifest.md).
+
+The shape a policy has to have and what else is checked at load are in
+[`../design/robotd-design.md`](../design/robotd-design.md) §2.3; where policies come from, what
+`official` means, and how a skill declares itself are in
+[`../design/policy-channel-design.md`](../design/policy-channel-design.md).
 
 ### Power to the joints (`robotd`)
 
@@ -184,6 +438,7 @@ sudo robotctl robot init
 
 ```
 sudo robotctl robot relax --yes
+sudo robotctl robot reboot-motors           # every servo; or `reboot-motors 3 11` for just those. Torque off, then init / Start
 ```
 
 `init` powers the joints and ramps to the home pose over about two seconds — **it moves every joint**,
@@ -202,12 +457,22 @@ corrupt each other's replies:
 sudo systemctl stop robotd && sudo /opt/robot/daemon/current/bin/robotd init && sudo systemctl start robotd
 ```
 
+**Replacing a motor** needs no configuration tool. Fit the new servo straight from the box (ID 1,
+57 600 baud), power the servos, and `robotd` — or `robotd init` — finds the one joint that no longer
+answers, flashes the new servo as that joint, sets its registers and reboots it. The journal says
+`factory-fresh servo on the bus; flashing it as the missing joint` and then `replacement servo
+adopted`. One at a time: with two joints missing it cannot tell which the new servo is for, waits,
+and says so.
+
 `init` works whether or not the robot has fallen — by default a fall is a *report* (visible in
 `robotctl monitor`), not a gate, matching the prototype. A board that sets `[safety] fall_limp`
 or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp and refuses
 `init`/`enable`/skills until it is stood up.
 
 ### Gamepad (`configd`)
+
+What each button *does* — and how to change it — is under **Policies and skills** above
+(`robotctl pad bindings`). This section is about getting a pad connected at all.
 
 ```
 robotctl pad status
@@ -237,8 +502,8 @@ mapping is the prototype's, so muscle memory carries over:
 | --- | --- |
 | left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
 | right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
-| **Start** | toggle the policy — nothing moves until it is on |
-| **Y** / triangle | head mode: sticks pose the head (body holds still) |
+| **Start** | first press: torque on and a 2 s ramp to the home pose, then hold. Second press: the policy drives. After that it toggles the policy |
+| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[pad_imu_head_control] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
 | **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
 | **A** / cross | ground pick |
 | **X** / square | roulade — one forward roll; hold to chain rolls |
@@ -247,7 +512,23 @@ mapping is the prototype's, so muscle memory carries over:
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
 | **DPad-Right**, held 2 s | start / stop the optional WBC skill |
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
-| **Select**, held 2 s | sit down, then power off |
+| **DPad-Right**, short press and release | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
+| **Select**, short press | torque off (`robot.relax`) **on release**: the emergency stop. The robot drops, so hold it. Then Start stands it up again |
+| **Select**, held 2 s | sit down, torque off, power off — the release afterwards does nothing more |
+
+**Drive the head with the pad itself.** A Pro Controller carries an IMU, and with
+
+```bash
+sudo robotctl configure      # Controller-IMU head control → enabled
+```
+
+Y changes meaning on such a pad: the first press hands the head to the pad — tilt it and the head
+tilts, turn it and the head turns — while the sticks go on driving the body. Press Y again and the
+head holds where it is, sticks still driving. Press it a third time and the pad drives the head again
+**from wherever the pad is now**: its yaw is a gyro's word alone and drifts, and re-centring on every
+re-entry is how you beat the drift without a magnetometer. `gain` in the same section is head
+radians per pad radian, 1 by default. On an Xbox pad, or with the switch off, Y is the stick head
+mode above. `padd` picks the change up within a second; no restart.
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
 if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
@@ -441,6 +722,11 @@ closer is higher — and the mouth opens with the note, wide at the top of the r
 until Ctrl-C and puts the instrument down on the way out. `--off` puts down one a client left
 up.
 
+**Off by default** — `[theremin] enabled` in `robotd.toml`, per duck, like the chorale above.
+`robotctl configure` is the way to set it, and it offers the `robotd` restart that picks it up;
+until then `robotctl theremin` refuses and names the key. Nothing else turns off with it: `tofd`
+runs regardless, so the depth grid below works on a duck that has never played a note.
+
 An explicit mode with nothing clever inside it: while it is up, the nearest return inside the
 playable band is the hand. Point the duck at open space and it is silent; point it at a wall
 40 cm away and it plays a steady note. It plays sitting, standing or walking — the mouth is
@@ -510,6 +796,19 @@ provisions the bus itself; the ToF step only adds the stable `/dev/i2c-pihat`
 name. Both sensor generations are supported — a VL53L5CX and a VL53L8CX are
 interchangeable on the board, and the daemon picks the driver from an ID read.
 
+#### The head IMU (`head_imu.stream`)
+
+`tofd` also serves the head module's BMI088 — gyro, acceleration and a Madgwick
+orientation — and it is **off by default**: `[head_imu] enabled` in `robotd.toml`,
+set with `robotctl configure`, which offers the `tofd` restart. Reading it costs
+~4% of a core at 100 Hz and nothing subscribes yet, so a duck that is not mapping
+was paying that from boot. A subscriber while it is off gets a reason naming the
+key, not the silence an unfitted sensor gives. `tofd --imu` reads it for one
+session without touching the file, and `--imu-hz` trades rate for cost linearly.
+
+None of this touches depth: the ToF ranges either way, so the grid above works on
+a duck whose IMU has never been switched on.
+
 ### Wifi (`configd`)
 
 ```
@@ -538,6 +837,50 @@ box for the lifetime of the command. Prefer it on anything shared.
 Joining a network **disconnects the robot from the one it is on**, so an ssh session over wifi will
 drop. That is the operation working. A scan takes a few seconds — it waits for the radio to sweep
 rather than returning the previous scan's results.
+
+### The Hugging Face account (`updaterd`)
+
+Signing the robot in is what will let you reach it from outside its own network. Nothing else
+needs it yet.
+
+```
+sudo robotctl account login
+```
+
+That prints a code. Open <https://hf.co/oauth/device> on any device, type the code, and the
+command finishes:
+
+```
+Open https://hf.co/oauth/device and enter this code:
+
+    A6MY-0314
+
+Waiting for approval…
+Signed in as PierreRouanet.
+```
+
+```
+robotctl account status
+```
+
+```
+sudo robotctl account logout
+```
+
+Ctrl-C while it is waiting costs nothing — the robot keeps polling, and `account status` says
+whether it was approved. The code is good for five minutes; after that, run `login` again.
+
+A robot that is already signed in refuses, and names the account:
+
+```
+sudo robotctl account login --force
+```
+
+The same flag abandons a code that is still waiting for approval — the case where somebody started
+a login and walked away. The old code stops working; approving it after that does nothing.
+
+The token lasts thirty days and the robot renews it on its own. A robot switched off for longer
+than that comes back needing `login` again, which `account status` says in as many words.
 
 ### Identity and power (`configd`)
 

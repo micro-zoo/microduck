@@ -36,11 +36,35 @@ pub enum Kind {
     Choice(&'static [&'static str]),
     /// Free text (an ALSA device, a socket path...).
     Text,
-    /// A filesystem path, or absent meaning the release's own copy; the literal `"none"`
+    /// A filesystem path, or absent meaning this robot's own copy; the literal `"none"`
     /// disables the slot outright.
     OptionalPath,
     /// A list of whole numbers, edited as comma-separated text ("4, 5, 9").
     IntegerList,
+    /// A **repeating table** — `[[policy.skill]]` — rather than a single value.
+    ///
+    /// Listed here and not editable in place. Not an oversight and not laziness: every other
+    /// kind is one value with one cursor position, and a repeating table is a list a person adds
+    /// to, removes from and reorders. Rendering that inside a key/value editor would be a worse
+    /// tool than the commands that already do it — `robotctl policy` — which the doc line points
+    /// at.
+    ///
+    /// It is *in* the registry so the completeness test keeps meaning what it says: a section
+    /// this editor cannot edit is still a section it must know exists, or the next repeating
+    /// table added to `Params` goes unnoticed.
+    Table,
+    /// A **nested table of related values** — `[media.intrinsics]` — written by a tool rather
+    /// than typed.
+    ///
+    /// Distinct from [`Kind::Table`], which is a repeating one, and distinct from every scalar
+    /// kind for the same reason as that: it has no single cursor position. It is also not a thing
+    /// anybody should type — six numbers from a calibration, where a typo produces a plausible
+    /// wrong answer rather than an error — so the editor lists it and says what writes it.
+    ///
+    /// The string is a TOML body for the table, and it earns its place in the type rather than in
+    /// a comment: the completeness test uses it to prove the key parses, so a record whose fields
+    /// are renamed under it fails here instead of at a robot's next boot.
+    Record(&'static str),
 }
 
 /// One key of `robotd.toml`.
@@ -119,14 +143,19 @@ pub const REGISTRY: &[Entry] = &[
          the mode a reboot comes back in",
     ),
     entry(
+        "policy.skill",
+        Kind::Table,
+        "One-shot skills, in priority order — add and remove with `robotctl policy`",
+    ),
+    entry(
         "policy.walk",
         Kind::OptionalPath,
-        "Walking policy; unset = the release's",
+        "Walking policy; unset = this robot's own",
     ),
     entry(
         "policy.stand",
         Kind::OptionalPath,
-        "Standing policy; unset = the release's",
+        "Standing policy; unset = this robot's own",
     ),
     entry(
         "policy.sitstand",
@@ -185,22 +214,6 @@ pub const REGISTRY: &[Entry] = &[
         "policy.ground_pick_gain_ratio",
         Kind::Float,
         "Gain multiplier during the ground pick",
-    ),
-    entry("policy.kick_duration", Kind::Float, "Kick window, seconds"),
-    entry(
-        "policy.roulade_duration",
-        Kind::Float,
-        "One forward roll, seconds",
-    ),
-    entry(
-        "policy.roulade_action_scale",
-        Kind::Float,
-        "Action scale during a roulade",
-    ),
-    entry(
-        "policy.roulade_gain_ratio",
-        Kind::Float,
-        "Gain multiplier during a roulade",
     ),
     feature(
         "policy.voltage_adapt",
@@ -299,24 +312,24 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Integer,
         "Gain for that ramp — softened standing, not limp",
     ),
-    // ── [detect] ─────────────────────────────────────────────────────────────
+    // ── [duck_detector] ──────────────────────────────────────────────────────
     feature(
-        "detect.enabled",
+        "duck_detector.enabled",
         Kind::Bool,
         "Look for other ducks in the camera (mediad runs it; needs a restart)",
     ),
     entry(
-        "detect.model",
+        "duck_detector.model",
         Kind::OptionalPath,
         "Model to run; unset = the release's, .rknn on the NPU before .onnx on the CPU",
     ),
     entry(
-        "detect.hz",
+        "duck_detector.hz",
         Kind::Float,
         "Looks per second. 2 is a thermal limit, not a preference — flat out cooks the board",
     ),
     entry(
-        "detect.threshold",
+        "duck_detector.threshold",
         Kind::Float,
         "Confidence a detection needs, on this model's own scale (int8 scores are not 0..1)",
     ),
@@ -330,7 +343,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "theremin.enabled",
         Kind::Bool,
-        "The ToF theremin may be picked up at all (robot.theremin still starts it)",
+        "The ToF theremin may be picked up at all — off by default (robot.theremin starts it)",
     ),
     entry("theremin.socket", Kind::Text, "tofd's depth stream"),
     entry(
@@ -357,6 +370,12 @@ pub const REGISTRY: &[Entry] = &[
         "theremin.hold_ms",
         Kind::Integer,
         "How long a note rides over a sensor dropout, milliseconds",
+    ),
+    // ── [head_imu] ───────────────────────────────────────────────────────────
+    feature(
+        "head_imu.enabled",
+        Kind::Bool,
+        "Read the head IMU (BMI088) at all — off by default; ~4% of a core when on",
     ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
@@ -393,9 +412,9 @@ pub const REGISTRY: &[Entry] = &[
     ),
     // ── [media] ──────────────────────────────────────────────────────────────
     feature(
-        "media.camera",
-        Kind::Bool,
-        "Stream the head camera — off is a test pattern, for a board with no camera",
+        "media.source",
+        Kind::Choice(crate::MEDIA_SOURCE_LABELS),
+        "Where video comes from: the head camera, or a cheap test pattern for a board without one",
     ),
     feature(
         "media.quality",
@@ -408,10 +427,60 @@ pub const REGISTRY: &[Entry] = &[
         "Starting video bitrate, bits/s — unset follows the quality",
     ),
     entry(
+        "media.intrinsics",
+        Kind::Record(
+            "width = 1280\nheight = 720\nfx = 1809.5\nfy = 1809.5\ncx = 640.0\ncy = 360.0",
+        ),
+        "This robot's own camera calibration — a per-robot solve writes it; absent, mediad publishes the family's",
+    ),
+    entry(
         "media.congestion_control",
         Kind::Choice(crate::CONGESTION_LABELS),
         "Adapt the send rate to the link — disabled costs adaptivity and saves a core's worth",
     ),
+    // ── [pad] ────────────────────────────────────────────────────────────────
+    //
+    // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
+    // file so `robotctl configure` stays the one editor a person has to know, and so a robot's
+    // whole configuration is one thing to back up and one thing to diff.
+    feature(
+        "pad.a",
+        Kind::Text,
+        "Skill on the A button — `robotctl policy list` names what this robot has",
+    ),
+    feature("pad.x", Kind::Text, "Skill on the X button"),
+    feature("pad.lb", Kind::Text, "Skill on the left bumper"),
+    feature("pad.rb", Kind::Text, "Skill on the right bumper"),
+    feature("pad.dpad_down", Kind::Text, "Skill on D-pad down"),
+    // ── [pad_imu_head_control] ───────────────────────────────────────────────
+    //
+    // Controller-IMU head control. Read by `padd`, like `[pad]`. Not `[head_imu]`, which is
+    // the IMU in the robot's head.
+    feature(
+        "pad_imu_head_control.enabled",
+        Kind::Bool,
+        "Y poses the head from the pad's own IMU (Pro Controller) — sticks keep driving; Y again holds, again re-centres",
+    ),
+    entry(
+        "pad_imu_head_control.gain",
+        Kind::Float,
+        "Head radians per pad radian — 1 follows the pad exactly, more amplifies the wrist",
+    ),
+];
+
+/// Sections that changed name: `(old, new)`.
+///
+/// The loader takes the old name through a `#[serde(alias)]` on the field, so a file written
+/// before the rename keeps loading; the editor (`edit.rs`) carries the section to its new name so
+/// its next save cannot leave both in one file, which the loader refuses as a duplicate. Listed
+/// here, beside the registry, because the coverage test below has to know an alias is not a
+/// section of its own — serde names aliases in its "unknown field" message like any other field.
+pub const RENAMED_SECTIONS: &[(&str, &str)] = &[
+    // The pad's IMU steering the head, a letter-swap away from `head_imu` — the IMU *in* the
+    // head. Renamed 2026-09 for that reason alone.
+    ("imu_head", "pad_imu_head_control"),
+    // "detect" read as "detect what?" in the editor. Renamed 2026-09 for the thing it detects.
+    ("detect", "duck_detector"),
 ];
 
 /// The registry entry for a key, if it is one.
@@ -476,6 +545,8 @@ mod tests {
             .skip(1)
             .step_by(2)
             .filter(|name| *name != "__no_such_section__")
+            // An old name is an alias for a section already in this list, not a section.
+            .filter(|name| !RENAMED_SECTIONS.iter().any(|(old, _)| old == name))
             .map(str::to_owned)
             .collect();
         // A sanity anchor so a serde message change cannot pass vacuously: the sections this
@@ -525,6 +596,14 @@ mod tests {
                     format!("[{section}]\n{key} = \"probe\"\n")
                 }
                 Kind::IntegerList => format!("[{section}]\n{key} = [1, 2]\n"),
+                // A repeating table's probe is one empty entry — enough to prove the key parses
+                // as a table array, which is the thing being asserted.
+                Kind::Table => {
+                    format!("[[{section}.{key}]]\nname = \"probe\"\nduration = 1.0\n")
+                }
+                // A record carries its own body, so this proves the *fields* still parse and not
+                // merely that something table-shaped is accepted.
+                Kind::Record(body) => format!("[{section}.{key}]\n{body}\n"),
             };
             let parsed: Result<Params, _> = toml::from_str(&probe);
             assert!(
@@ -585,14 +664,23 @@ mod tests {
                 "wbc.enabled",
                 "safety.battery_empty_shutdown",
                 "safety.limp_fall",
-                "detect.enabled",
+                "duck_detector.enabled",
                 "chorale.accept",
                 "theremin.enabled",
+                "head_imu.enabled",
                 "audio.enabled",
                 "audio.greet",
                 "audio.pet_detect",
-                "media.camera",
+                "media.source",
                 "media.quality",
+                // The five one-shot buttons. Front-page keys because "what does this button do"
+                // is a question somebody asks holding the pad, not while reading tuning docs.
+                "pad.a",
+                "pad.x",
+                "pad.lb",
+                "pad.rb",
+                "pad.dpad_down",
+                "pad_imu_head_control.enabled",
             ]
         );
     }

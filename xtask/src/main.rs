@@ -1121,48 +1121,610 @@ mod tests {
         }
     }
 
-    /// Every policy file in `policies/` must be packaged, at every packaging site.
+    /// The policy set, as `robotd-params` resolves it across both drive modes.
     ///
-    /// The `--include` list exists in three copies (the two workflows and `dev-push.sh`), and
-    /// the copies drift: the skills branch added six policies to `_build-release.yml` and
-    /// `dev-push.sh` and missed `dev.yml` — whose builds are exactly what `--ref <branch>`
-    /// installs. The release carried two of eight networks, `robotd` failed its health gate on
-    /// the first missing one, and the board rolled back. The repo directory is the one list
-    /// everything else must follow: a vendored `.onnx` nobody ships is dead weight, and a
-    /// shipped one nobody vendored is this test's compile-time cousin, the missing file.
-    #[test]
-    fn every_policy_in_the_repo_is_packaged() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    /// The one list everything else must agree with: these are the files a slot can default to,
+    /// so they are exactly the files that have to exist on a board.
+    fn policies_robotd_expects() -> Vec<String> {
+        let mut names = Vec::new();
+        for mode in [robotd_params::Mode::Walk, robotd_params::Mode::Roller] {
+            let params = robotd_params::PolicyParams {
+                mode,
+                ..Default::default()
+            };
+            let resolved = params.resolved();
+            for slot in robotd_params::Slot::ALL {
+                if let Some(path) = resolved.slot(slot) {
+                    names.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Run `scripts/seed-policies.sh` against a throwaway tree, with the Hub faked by a directory.
+    ///
+    /// `base_url` of `None` is an unreachable Hub, which is the case the fallback is for.
+    /// Returns what `current` points at, and what the walking policy contains through it.
+    fn seed(
+        root: &std::path::Path,
+        version: &str,
+        base_url: Option<&std::path::Path>,
+    ) -> (Option<String>, Option<String>) {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("xtask/ has a parent");
-        let mut policies: Vec<String> = std::fs::read_dir(root.join("policies"))
-            .expect("policies/ must exist")
+        let url = match base_url {
+            Some(dir) => format!("file://{}", dir.display()),
+            None => "file:///nonexistent-hub".to_owned(),
+        };
+        let status = std::process::Command::new("sh")
+            .arg(repo_root.join("scripts/seed-policies.sh"))
+            .arg(root)
+            .env("POLICY_VERSION", version)
+            .env("POLICY_BASE_URL", url)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("sh");
+        assert!(status.success(), "the seeder must never fail an update");
+
+        let link = std::fs::read_link(root.join("current"))
+            .ok()
+            .map(|p| p.display().to_string());
+        let content = std::fs::read_to_string(root.join("current/alpha_walking.onnx")).ok();
+        (link, content)
+    }
+
+    /// A directory standing in for the Hub repo at some revision.
+    fn fake_hub(dir: &std::path::Path, marker: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        for name in policies_robotd_expects() {
+            std::fs::write(dir.join(&name), format!("{marker}-{name}")).expect("policy");
+        }
+    }
+
+    /// **The pin is in two places and they must agree.** `seed-policies.sh` runs from inside a
+    /// release and cannot read Cargo.toml, so it carries the repo and the version as literals —
+    /// the same trap `setup-gstreamer.sh` and `setup-board.sh` already carry, where a drift is a
+    /// board running weights nobody can name.
+    #[test]
+    fn seed_policies_pins_the_same_policy_set() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let meta = &manifest["workspace"]["metadata"]["policies"];
+        let version = meta["version"].as_str().unwrap();
+        let repo = meta["repo"].as_str().unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/seed-policies.sh")).unwrap();
+        for expected in [
+            format!("POLICY_VERSION=\"${{POLICY_VERSION:-{version}}}\""),
+            format!("POLICY_REPO=\"${{POLICY_REPO:-{repo}}}\""),
+        ] {
+            assert!(
+                script.contains(&expected),
+                "seed-policies.sh must carry the line {expected:?}"
+            );
+        }
+    }
+
+    /// **The detector's pin is in two places too**, for the same reason: `seed-detector.sh` runs
+    /// from inside a release and cannot read Cargo.toml.
+    #[test]
+    fn seed_detector_pins_the_same_detector() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        let meta = &manifest["workspace"]["metadata"]["detector"];
+        let version = meta["version"].as_str().unwrap();
+        let repo = meta["repo"].as_str().unwrap();
+
+        let script = std::fs::read_to_string(root.join("scripts/seed-detector.sh")).unwrap();
+        for expected in [
+            format!("DETECTOR_VERSION=\"${{DETECTOR_VERSION:-{version}}}\""),
+            format!("DETECTOR_REPO=\"${{DETECTOR_REPO:-{repo}}}\""),
+        ] {
+            assert!(
+                script.contains(&expected),
+                "seed-detector.sh must carry the line {expected:?}"
+            );
+        }
+    }
+
+    /// **The detector's file list lives in three places and they must agree**: what the seeder
+    /// downloads, what `robotctl duck-detector update` downloads, and what `mediad` looks for. A name
+    /// missing from either downloader is a detector that is installed and cannot be found; a
+    /// name only the downloaders know is dead weight on the eMMC.
+    #[test]
+    fn the_detector_file_list_is_the_same_everywhere() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let expected: Vec<String> = robotd_params::DETECTOR_FILES
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+
+        let script = std::fs::read_to_string(root.join("scripts/seed-detector.sh")).unwrap();
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("DETECTOR_FILES="))
+            .expect("seed-detector.sh must declare DETECTOR_FILES");
+        let listed: Vec<String> = line
+            .trim_start_matches("DETECTOR_FILES=")
+            .trim_matches('"')
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            listed, expected,
+            "seed-detector.sh and robotd_params have drifted"
+        );
+
+        // `updater` cannot depend on `robotd-params`, so its copy is checked as text.
+        let updater = std::fs::read_to_string(root.join("updater/src/policy.rs")).unwrap();
+        let rendered = format!(
+            "pub const DETECTOR_FILES: [&str; {}] = [{}];",
+            expected.len(),
+            expected
+                .iter()
+                .map(|f| format!("{f:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(
+            updater.contains(&rendered),
+            "updater/src/policy.rs must carry {rendered}"
+        );
+    }
+
+    /// Run `scripts/seed-detector.sh` against a throwaway tree, with the Hub faked by a directory.
+    fn seed_detector(
+        root: &std::path::Path,
+        version: &str,
+        base_url: Option<&std::path::Path>,
+    ) -> (Option<String>, Option<String>) {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        let url = match base_url {
+            Some(dir) => format!("file://{}", dir.display()),
+            None => "file:///nonexistent-hub".to_owned(),
+        };
+        let status = std::process::Command::new("sh")
+            .arg(repo_root.join("scripts/seed-detector.sh"))
+            .arg(root)
+            .env("DETECTOR_VERSION", version)
+            .env("DETECTOR_BASE_URL", url)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("sh");
+        assert!(status.success(), "the seeder must never fail an update");
+
+        let link = std::fs::read_link(root.join("current"))
+            .ok()
+            .map(|p| p.display().to_string());
+        let content = std::fs::read_to_string(root.join("current/duck_detect.rknn")).ok();
+        (link, content)
+    }
+
+    fn fake_detector_hub(dir: &std::path::Path, marker: &str) {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        for name in robotd_params::DETECTOR_FILES {
+            std::fs::write(dir.join(name), format!("{marker}-{name}")).expect("model");
+        }
+    }
+
+    /// Nothing installed, the Hub reachable: both files arrive, `current` points at the pin,
+    /// and the provenance record names the repo `robotctl duck-detector check` will ask.
+    #[test]
+    fn the_pinned_detector_is_downloaded_from_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("detector");
+        fake_detector_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (link, content) = seed_detector(&root, "duck-v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/seed-duck-v1"));
+        assert_eq!(content.as_deref(), Some("hub-duck_detect.rknn"));
+        for name in robotd_params::DETECTOR_FILES {
+            assert!(root.join("current").join(name).exists(), "{name} missing");
+        }
+        let source = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        assert!(
+            source.contains("repo=pollen-robotics/microduck-duck-detector"),
+            "{source}"
+        );
+        assert!(source.contains("version=duck-v1"), "{source}");
+    }
+
+    /// A revision missing the CPU fallback is not installed at all: half a set is worse than
+    /// none, because a board whose NPU is off would have a detector that exists and never loads.
+    #[test]
+    fn a_detector_revision_missing_a_file_is_not_installed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("detector");
+        std::fs::create_dir_all(&hub).unwrap();
+        std::fs::write(hub.join("duck_detect.rknn"), "npu only").unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (link, _) = seed_detector(&root, "duck-v1", Some(&hub));
+        assert_eq!(link, None, "nothing partial goes live");
+        assert!(
+            !root.join("releases/.staging").exists(),
+            "staging is cleaned up"
+        );
+    }
+
+    /// The rule the handover rests on: a set already installed — the pin, a newer one from
+    /// `robotctl duck-detector update`, or somebody else's — is never replaced by a daemon update.
+    #[test]
+    fn an_installed_detector_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("detector");
+        fake_detector_hub(&hub, "one");
+        std::fs::create_dir_all(&root).unwrap();
+        seed_detector(&root, "duck-v1", Some(&hub));
+
+        fake_detector_hub(&hub, "two");
+        let (link, content) = seed_detector(&root, "duck-v2", Some(&hub));
+        assert_eq!(
+            link.as_deref(),
+            Some("releases/seed-duck-v1"),
+            "the newer pin is a floor"
+        );
+        assert_eq!(content.as_deref(), Some("one-duck_detect.rknn"));
+
+        // Something else's set, under a name that is not ours.
+        let theirs = root.join("releases/theirs");
+        std::fs::create_dir_all(&theirs).unwrap();
+        std::fs::remove_file(root.join("current")).unwrap();
+        std::os::unix::fs::symlink("releases/theirs", root.join("current")).unwrap();
+        let (link, _) = seed_detector(&root, "duck-v2", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/theirs"));
+    }
+
+    /// A board that cannot reach the Hub ends up with no detector, and the update is not failed.
+    #[test]
+    fn an_unreachable_hub_leaves_the_board_without_a_detector() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("detector");
+        std::fs::create_dir_all(&root).unwrap();
+        let (link, _) = seed_detector(&root, "duck-v1", None);
+        assert_eq!(link, None);
+    }
+
+    /// **The fallback list must still be what `robotd` can ask for.**
+    ///
+    /// The download list comes from the set's own `manifest.json` now, so a tenth policy is a tag
+    /// rather than an edit here. What is left in the script is the fallback for a revision tagged
+    /// before the manifest existed — and it is still a list that can go wrong in both directions:
+    /// a name nothing asks for is dead weight on the eMMC, and one a slot defaults to that is
+    /// missing is a slot that will not load, reported as degraded on every board.
+    ///
+    /// This goes with the fallback, once every tagged set carries a manifest.
+    #[test]
+    fn the_fallback_list_is_exactly_what_robotd_defaults_to() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let script = std::fs::read_to_string(root.join("scripts/seed-policies.sh")).unwrap();
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("FALLBACK_FILES="))
+            .expect("seed-policies.sh must declare FALLBACK_FILES");
+        let mut listed: Vec<String> = line
+            .trim_start_matches("FALLBACK_FILES=")
+            .trim_matches('"')
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        listed.sort();
+
+        assert_eq!(
+            listed,
+            policies_robotd_expects(),
+            "the fallback list and robotd's own defaults have drifted"
+        );
+    }
+
+    /// **The seeder's `sed` must match what the manifest actually says.**
+    ///
+    /// There is no JSON parser where that script runs — a release on a board with curl and a
+    /// POSIX shell — so the file list is extracted with one pattern over a file whose shape is
+    /// ours. That is fine exactly as long as the two agree, and silently downloads nothing the
+    /// moment they do not: a fresh board would fall back to nine names and never see a tenth.
+    #[test]
+    fn the_seeders_pattern_reads_the_manifest_it_is_given() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let script = root.join("scripts/seed-policies.sh");
+
+        // The shape `robotd_params::SetManifest` deserializes, written the way we would publish
+        // it — including a policy whose name differs from its file, and one with nothing but a
+        // file, so the pattern is not relying on neighbouring fields.
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "policies": [
+                { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                { "file": "ball_kick_left.onnx", "name": "kick_left",
+                  "kind": "episodic", "duration_s": 0.5 },
+                // A command block: nested keys the pattern must neither match nor choke on.
+                { "file": "alpha_ground_pick.onnx", "name": "ground_pick", "kind": "episodic",
+                  "duration_s": 2.8, "command": { "encoding": "phase", "period_s": 4.0,
+                  "end_phase": 0.7, "slots": "twist.vx,twist.vy" } },
+                { "file": "roulade.onnx" }
+            ]
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("manifest.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        // The same expression the script runs, so a change to one fails here rather than on a
+        // board six weeks later.
+        let text = std::fs::read_to_string(&script).unwrap();
+        let sed = text
+            .lines()
+            .find(|l| l.contains("sed -n 's/.*\"file\""))
+            .expect("the extraction line");
+        let expression = sed
+            .split_once('\'')
+            .and_then(|(_, rest)| rest.rsplit_once('\''))
+            .map(|(expr, _)| expr.to_owned())
+            .expect("a quoted sed expression");
+
+        let out = std::process::Command::new("sed")
+            .arg("-n")
+            .arg(&expression)
+            .arg(&path)
+            .output()
+            .expect("sed");
+        let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+
+        assert_eq!(
+            files,
+            vec![
+                "alpha_walking.onnx".to_string(),
+                "ball_kick_left.onnx".to_string(),
+                "alpha_ground_pick.onnx".to_string(),
+                "roulade.onnx".to_string()
+            ],
+            "the pattern and the manifest have drifted"
+        );
+    }
+
+    /// The ordinary path: nothing installed, the Hub reachable, the pinned set arrives whole.
+    #[test]
+    fn the_pinned_set_is_downloaded_from_the_hub() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let (link, content) = seed(&root, "v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/seed-v1"));
+        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
+
+        let mut installed: Vec<String> = std::fs::read_dir(root.join("releases/seed-v1"))
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".onnx"))
             .collect();
-        policies.sort();
+        installed.sort();
+        assert_eq!(installed, policies_robotd_expects(), "the whole set");
         assert!(
-            policies.len() >= 8,
-            "expected the vendored policy set, found {policies:?}"
+            root.join("releases/seed-v1/.source").exists(),
+            "and a record of where it came from, which is what `policy check` reads"
         );
-
-        for site in PACKAGING_SITES {
-            let text =
-                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
-            for policy in &policies {
-                let expected = format!("=policies/{policy}");
-                assert!(
-                    text.contains(&expected),
-                    "{site} does not package policies/{policy}. \
-                     Add:  --include \"policies/{policy}=policies/{policy}\""
-                );
-            }
-        }
     }
 
-    /// The petting classifier ships like the policies do, and drifts the same way: three
-    /// `--include` copies. robotd's default `pet_model` path expects `models/pet_detect.onnx`
+    /// **A manifest entry that is not a file name is ignored, not fetched.** The repo this
+    /// downloads from is an environment variable, and `${staging}/${name}` would otherwise let a
+    /// `file` naming `../../etc/…` choose where a download lands. `files_in_manifest` in
+    /// `updater::policy` applies the same rule to the same field, for the same reason.
+    #[test]
+    fn a_manifest_file_name_that_climbs_out_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let escape = "../../escaped.onnx";
+        std::fs::write(
+            hub.join("manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "policies": [
+                    { "file": "alpha_walking.onnx", "kind": "perpetual" },
+                    { "file": escape },
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Reachable if the seeder asks for it, so the test can tell "refused" from "404".
+        std::fs::write(hub.join("escaped.onnx"), "escaped").unwrap();
+
+        let (link, content) = seed(&root, "v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/seed-v1"));
+        assert_eq!(content.as_deref(), Some("hub-alpha_walking.onnx"));
+        assert!(
+            !root.join("escaped.onnx").exists() && !tmp.path().join("escaped.onnx").exists(),
+            "nothing was written outside the set"
+        );
+    }
+
+    /// **The pinned set already installed means no network at all.** This runs inside every
+    /// update, and re-downloading seven megabytes each time to arrive at the same bytes would be
+    /// both slow and a way to spend the hook's timeout budget on nothing.
+    #[test]
+    fn an_already_pinned_set_is_not_downloaded_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let first = seed(&root, "v1", Some(&hub));
+        // No Hub at all the second time: reaching for one would fall back and change the answer.
+        assert_eq!(seed(&root, "v1", None), first);
+    }
+
+    /// **A set installed before the provenance record existed must gain one.**
+    ///
+    /// From a board: the fast path — the pinned set is already installed, so no network — exits
+    /// before anything is written, which is right for the policies and wrong for the record. A
+    /// board seeded by the previous version of this script would take that branch forever and
+    /// never gain one, and `robotctl policy check` reported a robot with a perfectly good set as
+    /// having nothing installed.
+    #[test]
+    fn a_set_with_no_provenance_record_gains_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        let seeded = root.join("releases/seed-v1");
+        std::fs::create_dir_all(&seeded).unwrap();
+        for name in policies_robotd_expects() {
+            std::fs::write(seeded.join(&name), "x").unwrap();
+        }
+        std::os::unix::fs::symlink("releases/seed-v1", root.join("current")).unwrap();
+        assert!(
+            !root.join("current/.source").exists(),
+            "the board's starting state"
+        );
+
+        // No Hub, deliberately: the point is that this happens on the branch that touches no
+        // network at all, which is the branch such a board takes every time.
+        seed(&root, "v1", None);
+
+        let record = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        assert!(record.contains("version=v1"), "{record}");
+        assert!(record.contains("repo=pollen-robotics/"), "{record}");
+    }
+
+    /// And it is written once. This runs on every update, and rewriting the file each time just
+    /// to move a timestamp is churn on an eMMC for nothing.
+    #[test]
+    fn a_provenance_record_is_not_rewritten_on_every_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        let hub = tmp.path().join("hub");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(&root).unwrap();
+
+        seed(&root, "v1", Some(&hub));
+        let first = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        seed(&root, "v1", Some(&hub));
+        assert_eq!(
+            std::fs::read_to_string(root.join("current/.source")).unwrap(),
+            first
+        );
+    }
+
+    /// **An installed set is never replaced, whatever the pin says.**
+    ///
+    /// The pin is a floor — what a board with nothing gets — and not a ceiling. This used to
+    /// replace an older set on the reasoning that a daemon update was still how a retrained gait
+    /// reached a board; `robotctl policy update` is now how, and the old rule became a trap. A
+    /// board moved forward to v2 by hand had `current -> releases/seed-v2`, which matches the
+    /// `seed-*` the seeder called its own, so the next unrelated daemon update would have put v1
+    /// back — silently reverting somebody's gait as a side effect of a binary update.
+    #[test]
+    fn a_set_already_installed_is_left_alone_whatever_the_pin_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let v2 = tmp.path().join("hub-v2");
+        fake_hub(&v2, "chosen");
+        seed(&root, "v2", Some(&v2));
+
+        // The release pins v1 and offers it. A board on v2 must stay on v2.
+        let v1 = tmp.path().join("hub-v1");
+        fake_hub(&v1, "pinned");
+        let (link, content) = seed(&root, "v1", Some(&v1));
+
+        assert_eq!(link.as_deref(), Some("releases/seed-v2"));
+        assert_eq!(content.as_deref(), Some("chosen-alpha_walking.onnx"));
+    }
+
+    /// A board that cannot reach the Hub on a first install ends up with no policies, and that
+    /// is the accepted shape rather than a bug: `robotd` holds its pose and reports *degraded*,
+    /// the update gate passes, and the next update fetches. What must not happen is the seeder
+    /// failing — a non-zero exit here fails the post-install hook, which rolls the update back
+    /// over a network problem that has nothing to do with the release.
+    #[test]
+    fn an_unreachable_hub_installs_nothing_and_does_not_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(seed(&root, "v1", None), (None, None));
+    }
+
+    /// **A set this script did not install is never touched.**
+    ///
+    /// The rule the whole handover rests on. Once anything else puts policies there — `robotctl
+    /// policy`, or whatever tool publishes them — the release must stop replacing it, or the next
+    /// unrelated daemon update silently reverts somebody's gait. No flag, no config.
+    #[test]
+    fn policies_this_script_did_not_install_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        let hub = tmp.path().join("hub");
+        fake_hub(&hub, "hub");
+        std::fs::create_dir_all(root.join("releases/from-a-tool")).unwrap();
+        std::fs::write(
+            root.join("releases/from-a-tool/alpha_walking.onnx"),
+            "installed-by-something-else",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("releases/from-a-tool", root.join("current")).unwrap();
+
+        let (link, content) = seed(&root, "v1", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/from-a-tool"));
+        assert_eq!(content.as_deref(), Some("installed-by-something-else"));
+    }
+
+    /// A partial download must never become the live set. `robotd` would refuse the truncated
+    /// file at load and report degraded, which is the right end state — but the set it is
+    /// refusing should not have replaced a working one to get there.
+    #[test]
+    fn a_partial_download_does_not_replace_a_working_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let good = tmp.path().join("hub-v1");
+        fake_hub(&good, "one");
+        seed(&root, "v1", Some(&good));
+
+        // A revision that is missing one file, which is what a half-published set looks like.
+        let broken = tmp.path().join("hub-v2");
+        fake_hub(&broken, "two");
+        std::fs::remove_file(broken.join("roulade.onnx")).unwrap();
+
+        let (link, content) = seed(&root, "v2", Some(&broken));
+        assert_ne!(
+            link.as_deref(),
+            Some("releases/seed-v2"),
+            "a set missing a file must not be installed as the pinned one"
+        );
+        assert_eq!(
+            content.as_deref(),
+            Some("one-alpha_walking.onnx"),
+            "and the board keeps something that works"
+        );
+    }
+
+    /// The petting classifier still ships inside the release, and drifts the way the policies
+    /// used to: three `--include` copies. It is a detector rather than a control policy, small,
+    /// and nothing versions it independently — so it stays where the policies left. robotd's default `pet_model` path expects `models/pet_detect.onnx`
     /// inside the release, so a site that forgets it produces robots that silently cannot
     /// hear — the mic worker logs "unavailable" once and everything else looks fine.
     #[test]
@@ -1180,6 +1742,33 @@ mod tests {
             assert!(
                 text.contains("=models/pet_detect.onnx"),
                 "{site} does not package the petting classifier"
+            );
+        }
+    }
+
+    /// The duck detector left the release the way the policies did: it is seeded from the Hub
+    /// by a script the release carries, and the model files themselves are no longer vendored.
+    /// A site that still packages `models/duck_detect.*` would ship fourteen megabytes nothing
+    /// reads; one that forgets the seeder leaves fresh boards with a detector that cannot start.
+    #[test]
+    fn the_detector_seeder_is_packaged_and_the_model_is_not() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask/ has a parent");
+        assert!(
+            !root.join("duck-detect/models").exists(),
+            "the detector model is vendored again; it belongs on the Hub"
+        );
+        for site in PACKAGING_SITES {
+            let text =
+                std::fs::read_to_string(root.join(site)).unwrap_or_else(|e| panic!("{site}: {e}"));
+            assert!(
+                text.contains("=scripts/seed-detector.sh"),
+                "{site} does not package the detector seeder"
+            );
+            assert!(
+                !text.contains("duck_detect"),
+                "{site} still packages the detector model inside the release"
             );
         }
     }

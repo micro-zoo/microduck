@@ -43,18 +43,18 @@ the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip 
 quaternion out of the same register block the servos answer at. One board, one code path, no
 IMU abstraction. It is listed first in the id vector so it answers before the servo burst.
 
-**One owner at a time, and nothing hard-enforces it.** `serialport` sets `TIOCEXCL`, which
+**One owner at a time; tty exclusivity alone does not enforce it.** `serialport` sets `TIOCEXCL`, which
 turns a second *unprivileged* open into `EBUSY` — but `robotd.service` runs as root, because
-motor control needs the character devices, and root is not stopped by that flag. So the
-exclusion is arranged rather than enforced, and each other claimant is kept off the port
-deliberately:
+motor control needs the character devices, and root is not stopped by that flag. The daemon
+and standalone `init` therefore share an advisory lock, and other claimants are kept off the
+port separately:
 
 - **The control loop** owns it for as long as the daemon runs.
-- **`robotd init`** opens the port itself, and as root it will succeed *while the daemon is
-  running* — two writers interleaving packets on one bus, which reads as a hardware fault. So
-  it wants the daemon stopped, and that is exactly why `robot.init` and `robot.relax` exist as
-  IPC methods (§3.3): the daemon serves both from inside the loop, so nothing else has to open
-  the bus at all. `init` is the escape hatch for a robot whose daemon is not running.
+- **`robotd init`** opens the port itself, but must first take the daemon's endpoint lock.
+  It holds that lock through the entire ramp: a running daemon refuses `init`, and an `init`
+  already moving the robot refuses a daemon startup or another `init`. `robot.init` and
+  `robot.relax` remain the IPC methods (§3.3) for a running daemon; standalone `init` is the
+  escape hatch for a robot whose daemon is not running.
 - **`serial-getty@ttyS2`** — Armbian runs a login console on UART2 by default, and an `agetty`
   holding the port makes every servo invisible to everything else. `scripts/setup-board.sh`
   masks the unit; `fuser -v /dev/ttyS2` naming `agetty` is how that was found, and it is still
@@ -62,11 +62,28 @@ deliberately:
 - **The runtime**, at a coarser grain: it drives the same bus, so a board runs the runtime or
   `robotd` and never both, and the units say so with `Conflicts=` (§5.2).
 
+**Socket ownership.** Both entry points acquire `<socket>.lock` (normally
+`/run/robotd.sock.lock`) before publishing `/run/robotd/identity.json` or opening the bus.
+The daemon also binds its listener before starting the control thread, and keeps the lock
+through control-thread shutdown and socket cleanup. A refused duplicate must not overwrite
+the owner's PID and build: `robotctl health` and updater startup checks read that identity.
+For a listener left by an older daemon without a lock, the daemon's bind path removes only
+an actual socket that refuses a bounded connection probe; live listeners and ambiguous paths
+are preserved. Standalone `init` only locks and never binds or cleans up the socket.
+
+**Never unlink the lock file, even at shutdown.** The kernel releases the advisory lock when
+its file is closed or the process exits, including `SIGKILL`; the file itself stays in place.
+Deleting and recreating it could leave contenders locking two different inodes under the same
+name. File existence does not mean the lock is held. The lock is per `--socket`, so callers
+using the same physical bus must use the same socket setting; separate endpoints remain useful
+for independent fake daemons. Older binaries and other tools do not participate in this lock
+and must still be stopped before standalone `init` takes over the bus.
+
 ### 1.2 Who talks to `robotd`
 
 ```text
    ┌──────────┐   robot.move / robot.head      ┌─────────────────────┐
-   │  padd    │───(notifications, 50 Hz)──────►│                     │
+   │  padd    │──(notifications, ≤50 Hz)──────►│                     │
    │ gamepad  │   robot.stop / robot.enable    │                     │
    └──────────┘───(requests, answered)────────►│                     │
                                                │   /run/robotd.sock  │
@@ -256,6 +273,15 @@ saying so:
   swapped in arrives at 250, so the check is what removes a whole class of "why is it slow on
   this robot". `shutdown = 52` is the error mask that latches on overload, overheating and
   input-voltage faults.
+- **A swapped-in servo is adopted, not configured by hand.** A new XL330 answers as ID 1 at
+  57 600 baud, and neither is used on this bus. So before the register check, `open_bus` pings
+  the fifteen expected IDs; if *exactly one* is silent, it looks for ID 1 — first at 1 Mbps,
+  then by reopening the port at 57 600 — writes it the missing ID and then the bus's baud rate,
+  reopens at 1 Mbps, runs the same register check on it, and reboots it. The reboot is what
+  clears the hardware-error alert the flash leaves set, which would otherwise hold torque off
+  until someone pulled the battery. A complete bus pays fifteen pings for this and nothing
+  else — the 57 600 probe never runs unless a servo is missing. Two missing servos are left
+  alone: there is no telling which one a fresh servo replaces, and the journal says so.
 - The position P gain is written with I and D at **zero**, the runtime's `--ki`/`--kd`
   defaults. These are RAM registers, so a power cycle restores the servo's factory values, and
   the factory D is not zero: left in place it damps the servo's internal PID and the robot runs
@@ -393,6 +419,11 @@ until the next walk; here scale and gain are recomputed from the active state ev
 Policy files come from paths in the params file, defaulting into the release directory — so a
 normal update carries the policy trained against the binary, and a dev points a path at their
 own `.onnx` and iterates without cutting a release.
+
+*Which* file fills a slot — the release's copy, a component from the Hub, or something a dev
+dropped on the board — is [`policy-channel-design.md`](policy-channel-design.md)'s, along with
+the commands that change it and what happens when a load fails. This section owns what a policy
+is and how it is validated and run, and stops there.
 
 Everything is validated at **load**, not at inference: observation width, action count, and
 whether ONNX Runtime is present at all. Every net must be 61-input, 14-output, checked at load
@@ -746,9 +777,19 @@ single last-writer slot would lose.
 
 ### 4.2 Params
 
-A TOML file read at startup, **not watched** — live reload comes later. It lives outside
+A TOML file read at startup and, for the most part, **not watched**. It lives outside
 `releases/<ver>/` so it survives update *and* rollback, next to the updater's own config at
 `/etc/robot/robotd.toml`.
+
+Two parts of it are watched, and both are exceptions earned by what a restart would cost rather
+than steps towards watching the whole file. `padd` stats the file once a second and re-reads
+`[pad]` and `[pad_imu_head_control]` when the mtime moves: a binding is changed from a phone, and restarting
+`padd` to apply it would drop the pad session and let `robotd`'s deadman zero a walking robot.
+`robotd` re-reads `[policy]` — all of it but `mode` and `enabled` — when asked to, which is how
+`robotctl policy add` lands a skill without taking motor control away from a standing robot.
+Re-reading `[safety]` or `[control]` under a running loop is a different and much larger promise,
+and it is still not made. `robotctl configure` knows which of the three answers a key wants, and
+a key that says nothing fails a test in `robotctl`.
 
 Belonging to the board rather than the release is what makes a hand-edited policy path stick: the
 defaults point inside `releases/<ver>/`, so an ordinary update keeps a policy alongside the
@@ -954,3 +995,24 @@ path map now does. §4.4.
    has to reach the board, so prefer pure-Rust crates on that path. *Unverified on macOS:* the
    cross-build needs an aarch64 sysroot, which a Mac cannot provide, so `cargo board --bins` fails
    locally there — build the shipped set with `-p updater -p robotd -p robotctl`, or build on Linux.
+
+## Mapping telemetry (API v24)
+
+A mapper on the far end of the video — a laptop today, a server later — needs three things from
+the robot that `robot.state` did not carry: a clock shared with `tof.frame`, the IMU beyond its
+projected gravity, and where the camera and the ToF sensor are. All three are additive.
+
+- **`t_ns`** on `robot.state` and `tof.frame` is `CLOCK_MONOTONIC` in nanoseconds (`proto::clock`).
+  `t` and `at_us` stay: they are each daemon's own elapsed time, and a reader that only has one
+  stream still wants a number that starts at zero. `mediad`'s `media.video` answer reads
+  `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
+  wall-clock — can be put on the same axis.
+- **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
+  it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
+  anything yet; when it is, it streams beside `tof.frame`, not here.
+- **`frames: {camera, tof}`** are trunk-frame poses at this tick's *measured* head joints from
+  `kinematics::head::HeadFk` — the same FK `robot.look` solves against — and **`robot.model`**
+  answers the static geometry (trunk height, joint order, ToF beam directions, the poses at head
+  zero). The kinematics stay in one crate; a client asks rather than transcribes.
+
+Cost: three small structs per published tick, only while someone is subscribed; the FK is ~50 ns.

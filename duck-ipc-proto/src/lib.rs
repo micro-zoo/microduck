@@ -161,7 +161,200 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// results are not `deny_unknown_fields`. An older `updaterd` answers `update.show` with
 /// [`code::METHOD_NOT_FOUND`] naming it, which is the designed skew behaviour rather than a
 /// handshake refusal.
-pub const API_VERSION: u32 = 16;
+///
+/// # v23 — `account.*`
+///
+/// A robot can belong to a Hugging Face account, which is the thing that has to be true before it
+/// can be reached from outside its own LAN: the robot's relay proves to a rendezvous service that
+/// it belongs to an account, the service shows a client only its own robots, and those two
+/// together are the authorisation a bridged session arrives with. Nothing about the *robot's* own
+/// gate changes — there still is not one — see `docs/design/remote-access-design.md` §7.
+///
+/// Additive as methods, and `updaterd` serves them for the reasons `policy.*` is there: it is the
+/// daemon with a network stack, and the credential it stores is also what would reach a private
+/// Hub repo. An older `updaterd` answers [`code::METHOD_NOT_FOUND`] naming the method, which is
+/// the designed skew behaviour rather than a handshake refusal.
+///
+/// **`account.login` answers with a code rather than with a token**, and that shape is not an
+/// implementation detail: the flow is RFC 8628, so somebody has to read a short code and approve
+/// it in a browser, and the client that showed them the code may well be gone by the time they
+/// do — a phone that opens a browser backgrounds itself, and iOS then tears the GATT link down.
+/// So `login` returns immediately, `updaterd` owns the waiting, and `status` is what a client
+/// comes back to. A login that reported success by holding the connection open would work on a
+/// laptop and fail on the device it is for.
+///
+/// # v22 — `robot.skills`, `robot.setSkill`, `robot.removeSkill`
+///
+/// The last thing in the policy path a terminal on the robot could reach and nothing else could.
+/// `[[policy.skill]]` is a repeating table, so `robotctl policy add` wrote it directly — there
+/// was no method to route, and a remote client could fetch a policy and fill a *slot* with it but
+/// never make it answer to `robot.do` by name.
+///
+/// `robotd` writes the file and reloads itself, so one call is the whole operation. The
+/// alternative was a client writing and then remembering `robot.reloadPolicies`, and one that
+/// forgot would leave a robot whose config and behaviour disagree until the next restart.
+///
+/// [`SkillParams`] is the same shape read and written, and every optional field means "the
+/// default for this" — so a client may list, change one field and send it back. An entry that
+/// already exists supplies whatever the call leaves out.
+///
+/// [`SkillsResult`] also carries `built_in`: the names `robot.do` answers to that are not table
+/// entries, because the daemon drives them itself. A client listing what a robot can do needs
+/// both, and `policies.skills` alone omitted two of the five the pad ships bound to — the same
+/// trap `do_names` exists to close on the robot side.
+///
+/// # v21 — `pad.bindings`, `pad.bind`
+///
+/// Which button runs which skill stops being a thing only somebody at a keyboard on the robot can
+/// change. `robotctl pad bind` edited the config file directly, so unlike every other command it
+/// had no wire surface at all and routing could not help.
+///
+/// **Two methods in `pad.*` that `configd` does not serve.** The rest of that namespace is about
+/// the radio and is `configd`'s; a binding is about what a button does to the robot, and checking
+/// a name needs the skill list, which only `robotd` has. Routing is per method throughout, so
+/// this costs nothing — `policy.*` and `robot.loadPolicy` already split one concept across two
+/// daemons the same way. An older `updaterd` or `configd` reached by mistake answers
+/// [`code::METHOD_NOT_FOUND`] naming it.
+///
+/// Additive as methods. `pad.bind` is the first call on either radio transport that **writes the
+/// config file**, and it has to be: `padd` re-reads `[pad]` every second, so a binding held in
+/// memory would be reverted before the caller let go of the phone. That also means it needs no
+/// reload and no restart.
+///
+/// # v20 — `robot.policies` carries the skills
+///
+/// One field, and it is what makes any of this usable from something that is not `robotctl`:
+/// which one-shot skills a robot has is config now, so a client cannot assume a list and cannot
+/// offer a "bow" button without being told there is a bow. The names were already published in
+/// `robot.subscribe`'s acknowledgement, but that is a 50 Hz stream and the question is asked
+/// once — the wrong shape for a phone, and BLE deliberately does not route it.
+///
+/// Additive: a client that ignores the field is unaffected, and an older `robotd` omits it,
+/// which deserialises to empty rather than failing because results are not
+/// `deny_unknown_fields`. A client reading an empty list should treat it as "this robot did not
+/// say" rather than "this robot has no skills" — the same distinction `unavailable` draws for
+/// the gait.
+///
+/// # v19 — `policy.*` and `robot.reloadPolicies`
+///
+/// The official policy set stops needing a daemon release to change. `policy.check` asks the Hub
+/// what revisions exist against the one installed, `policy.install` fetches one, and
+/// `robot.reloadPolicies` is how the thing that swapped the set tells `robotd` to re-read it —
+/// necessary because installing a set swaps a symlink *underneath* unchanged paths, so
+/// `robot.loadPolicy` would correctly conclude there was nothing to do.
+///
+/// Additive as methods. `policy.*` is the first namespace `updaterd` serves that is not
+/// `update.*`, and it is there rather than in `robotd` because it needs a network stack, and not
+/// in `robotctl` because that must not link one. See `docs/design/policy-channel-design.md` §8.
+///
+/// # v18 — `robot.policies`, `robot.loadPolicy`
+///
+/// Which `.onnx` fills a slot stops being a restart-only decision: a policy can be swapped into
+/// one slot while the robot runs, and dropped again, without editing a file by hand. Additive as
+/// methods, and the state they expose was previously unavailable at all rather than available in
+/// another shape, so nothing an older client reads changes meaning — the policy names in the
+/// `robot.subscribe` acknowledgement could already change mid-session as of v15.
+///
+/// **`robot.loadPolicy` persists.** A slot is `[policy] <slot>` in `robotd.toml` and nothing
+/// else, so the daemon writes the key before it queues the swap and a gait chosen over the wire
+/// is the gait the robot boots into. Worth stating on the wire rather than only in the daemon,
+/// because it is the difference between a call a client offers as "try this" and one it offers
+/// as "use this" — and the undo is the same method with no path, not a restart.
+///
+/// An older `robotd` answers either with [`code::METHOD_NOT_FOUND`] naming the method, which is
+/// the designed skew behaviour and not a handshake refusal. See
+/// `docs/design/policy-channel-design.md` §8.
+///
+/// # v17 — a unit state that can say "crash loop"
+///
+/// [`UnitState`] gains `Restarting` and `Failed`, which `system.services` can now answer with.
+/// Not additive in the way a new method is: an older client deserialising a `Vec<ServiceUnit>`
+/// rejects a member it has no variant for, and `robotctl` reads that reply with `.ok()` — so an
+/// older `robotctl` against this `configd` prints no `units` block at all rather than a wrong one.
+/// Both come out of the same release and an apply restarts both, so the skew lasts as long as the
+/// update does; a board left mid-update sees a missing block, not a lie.
+///
+/// # v24 — a clock every stream shares, and what a map needs from the robot
+///
+/// Three additive fields and one read, for a mapper that pairs a camera frame with the joint
+/// angles and depth cells of the same instant (`docs/design/robotd-design.md` §mapping):
+///
+/// - [`RobotState::t_ns`] and [`TofFrame::t_ns`] are the same `CLOCK_MONOTONIC`, nanoseconds,
+///   so a sample from `robotd` and a frame from `tofd` can be put on one axis without guessing
+///   the offset between two daemons' start times. `t` and `at_us` stay as they were.
+/// - [`RobotState::imu`] is the trunk IMU as the loop sees it: gyro and orientation, not only
+///   the projected gravity [`SafetyState`] already carried. [`RobotState::frames`] is the
+///   camera and ToF sensor pose in the trunk frame, from the same head FK `robot.look` uses —
+///   published so no client has to carry a copy of the kinematics.
+/// - `robot.model` ([`ModelResult`]) answers the static geometry those poses are stated in.
+///
+/// `mediad`'s `media.video` answer gains `mono_ns` and `real_ns`, the two clocks read at the
+/// same instant, so a peer can put RTP timestamps (whose RTCP sender reports are wall-clock)
+/// onto the same monotonic axis. Additive everywhere: an older client ignores fields it does
+/// not know, and an older daemon leaves them at their defaults (zero, or absent).
+///
+/// # v25 — the whole skeleton's pose, for a viewer
+///
+/// [`RobotState::skeleton`] carries every body's pose in the trunk frame this tick, and
+/// [`ModelResult::skeleton`] the matching static tree (each link's name and parent). Together they
+/// let a viewer draw the robot moving for real — the full kinematics, of which
+/// [`RobotState::frames`] (camera, ToF, head IMU) is a few leaves — without carrying a copy of the
+/// kinematics, the same reason `frames` and `tof_beams` come from the robot. Both from the same FK
+/// `robot.look` uses. Additive: the `Vec`s are empty from a daemon predating it.
+///
+/// # v26 — `system.logs`
+///
+/// The tail of one daemon's journal, over the wire. Until now the answer to "what did it say
+/// before it stopped" was `journalctl` over ssh, which needs a network the robot may not have and
+/// an address a phone has no way to reach — so the one question support asks first was the one
+/// question the wire could not answer.
+///
+/// Additive as a method, and narrow on purpose: a unit from a fixed list, a line count, and which
+/// boot. Not a `journalctl` command line — see [`LogsParams`] for why that boundary is where it is.
+///
+/// An older `configd` answers [`code::METHOD_NOT_FOUND`] naming the method, which is the designed
+/// skew and not a handshake refusal: a new `duckctl` against a robot on an older release reports
+/// that the robot is too old rather than failing obscurely.
+///
+/// # v28 — `detector.*`
+///
+/// The duck detector leaves the release the way the policies did at v19: `mediad` reads it from
+/// `/opt/robot/detector/current`, the release's postinstall hook seeds that from a pinned Hub
+/// revision, and `detector.check` / `detector.install` are how a board asks what exists and
+/// moves to it — `policy.check` / `policy.install` with a different root, answered by the same
+/// daemon for the same reason (it has the network stack). An install restarts `mediad`, which is
+/// where the model is loaded, and says whether that took.
+///
+/// Additive as methods; the parameters and answers are the policy set's own types.
+///
+/// # v27 — the pad's IMU, on the pad tap
+///
+/// Three more [`PadReport`] variants: a pad's inertial unit as a second evdev node beside the one
+/// that drives, its samples, and its going away. The "Pro Controller" Switch clones ship a
+/// six-axis IMU and the kernel's `hid-nintendo` exposes it as a separate accelerometer device
+/// under the same HID parent; an Xbox pad has none and a subscriber never sees the variants.
+///
+/// A new variant on a tagged enum is what a robotctl built before it cannot decode, which is the
+/// one reason this is a bump rather than a note: the tap is still `padd`'s own socket, and every
+/// other client is untouched.
+pub const API_VERSION: u32 = 28;
+
+/// The observation width every policy this robot family runs is built against.
+///
+/// Here rather than only in `duck_control` because it is a **contract with whoever publishes a
+/// policy**, not an implementation detail: it is what a repo's manifest declares, what
+/// `updaterd` refuses a mismatched policy on before downloading it, and what `robotd` refuses it
+/// on at load. `duck_control::obs` is still where the observation is built, and a test there
+/// asserts the two agree.
+pub const POLICY_OBS_LEN: usize = 61;
+
+/// The action count, on the same footing as [`POLICY_OBS_LEN`]: fifteen servos, fourteen of them
+/// driven by a policy.
+pub const POLICY_ACTION_LEN: usize = 14;
+
+/// The robot this daemon drives, as a policy manifest spells it. Refusing a policy published for
+/// something else is cheaper than discovering it in the way the robot moves.
+pub const ROBOT_MODEL: &str = "microduck";
 
 /// The longest an update may legitimately go quiet, in seconds — the pre-install hook's ceiling.
 ///
@@ -340,6 +533,12 @@ pub mod method {
     /// yield a fallen robot is commanded at, which keeps torque on. This is the register.
     pub const ROBOT_RELAX: &str = "robot.relax";
 
+    /// Reboot servos: the REBOOT instruction, which clears a latched hardware error (overload,
+    /// overheating, electrical shock) that otherwise holds torque off until the battery is pulled.
+    /// Torque is cut on every joint first and the robot is back at limp afterwards, so `robot.init`
+    /// or `robot.enable` brings it up from a known state. Discrete; send as a request.
+    pub const ROBOT_REBOOT_MOTORS: &str = "robot.rebootMotors";
+
     // ── skills ───────────────────────────────────────────────────────────────
     //
     // One-shot scripted moves, ported from `microduck_runtime`. Each swaps a dedicated
@@ -412,6 +611,77 @@ pub mod method {
     /// comes back in the configured mode.
     pub const ROBOT_SET_MODE: &str = "robot.setMode";
 
+    /// What each policy slot is running, and where that file came from.
+    ///
+    /// Distinct from [`ROBOT_MODE`], which says which *set* of slots is in play. This says what
+    /// is in them — and, when a load failed, what is in them instead of what was asked for.
+    pub const ROBOT_POLICIES: &str = "robot.policies";
+
+    /// The static geometry [`RobotState::frames`] and [`TofFrame`] are stated in — see
+    /// [`ModelResult`]. A read; asked once per session.
+    pub const ROBOT_MODEL: &str = "robot.model";
+
+    /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
+    ///
+    /// Answered like [`ROBOT_SET_MODE`] and for the same reason: the swap happens at the home
+    /// pose, seconds later, so the reply says the request was accepted and
+    /// [`ROBOT_POLICIES`] says what came of it.
+    pub const ROBOT_LOAD_POLICY: &str = "robot.loadPolicy";
+
+    /// Re-read every policy slot from disk, whatever the paths say.
+    ///
+    /// Distinct from [`ROBOT_LOAD_POLICY`] because the paths do not change: installing a newer
+    /// official set swaps a symlink underneath them, so every slot still resolves to the same
+    /// string and a load would correctly conclude there is nothing to do. This is how the thing
+    /// that swapped the symlink says otherwise.
+    pub const ROBOT_RELOAD_POLICIES: &str = "robot.reloadPolicies";
+
+    // ── policy.* ─────────────────────────────────────────────────────────────
+    //
+    // Served by `updaterd`, not `robotd`, and the split is the same one everywhere else here:
+    // `robotd` says what it is *running*, `updaterd` is the thing with a network stack and is
+    // therefore what asks the Hub what exists. `robotctl` must not link an HTTP client — it is on
+    // the recovery path and its dependency list is deliberately short — so the fetch cannot live
+    // in the CLI either. `docs/design/policy-channel-design.md` §8.
+
+    /// Is there a newer policy set than the one installed?
+    pub const POLICY_CHECK: &str = "policy.check";
+    /// Install a policy set from the Hub and make it live.
+    pub const POLICY_INSTALL: &str = "policy.install";
+    /// Fetch one policy from any Hub repo into this robot's library.
+    pub const POLICY_FETCH: &str = "policy.fetch";
+    /// Search the Hub for policies.
+    pub const POLICY_SEARCH: &str = "policy.search";
+
+    // ── detector.* ───────────────────────────────────────────────────────────
+    //
+    // The duck detector's set, served by `updaterd` for `policy.*`'s reason. The answers are
+    // `policy.*`'s types: a set is a set, whatever is in it.
+
+    /// Is there a newer duck detector than the one installed?
+    pub const DETECTOR_CHECK: &str = "detector.check";
+    /// Install a duck detector from the Hub, and restart `mediad` onto it.
+    pub const DETECTOR_INSTALL: &str = "detector.install";
+
+    // ── account.* ────────────────────────────────────────────────────────────
+    //
+    // Which Hugging Face account this robot belongs to. Served by `updaterd` for `policy.*`'s
+    // reasons exactly — it is the daemon with a network stack, and `robotctl` must not link one —
+    // and because the credential it stores is also what reaches a *private* Hub repo, which is
+    // already this daemon's job.
+    //
+    // The account is what makes a robot reachable from outside the LAN: the relay proves the robot
+    // belongs to an account, the rendezvous service shows a client only its own robots, and the
+    // pair of those is the authorisation a bridged session arrives with.
+    // `docs/design/remote-access-design.md` §2.
+
+    /// Begin an OAuth device-code login. Answers immediately with a code to show somebody.
+    pub const ACCOUNT_LOGIN: &str = "account.login";
+    /// Which account this robot belongs to, and whether a login is in flight.
+    pub const ACCOUNT_STATUS: &str = "account.status";
+    /// Forget the account. The robot stops being reachable from outside the LAN.
+    pub const ACCOUNT_LOGOUT: &str = "account.logout";
+
     /// Turn the connection into a stream of [`ROBOT_STATE`] notifications.
     pub const ROBOT_SUBSCRIBE: &str = "robot.subscribe";
     /// Server → client. Never carries an `id`.
@@ -444,6 +714,8 @@ pub mod method {
     pub const SYSTEM_INFO: &str = "system.info";
     /// What systemd says about each daemon, and which release each is running from.
     pub const SYSTEM_SERVICES: &str = "system.services";
+    /// The tail of one unit's journal, for a client with no shell on the robot.
+    pub const SYSTEM_LOGS: &str = "system.logs";
     /// Rename the robot. This is the name a phone sees.
     pub const SYSTEM_SET_NAME: &str = "system.setName";
     /// Reboot, cleanly, through systemd.
@@ -472,6 +744,11 @@ pub mod method {
     pub const PAD_PAIR: &str = "pad.pair";
     /// Forget a pad, so it stops reconnecting.
     pub const PAD_FORGET: &str = "pad.forget";
+    pub const PAD_BINDINGS: &str = "pad.bindings";
+    pub const PAD_BIND: &str = "pad.bind";
+    pub const ROBOT_SKILLS: &str = "robot.skills";
+    pub const ROBOT_SET_SKILL: &str = "robot.setSkill";
+    pub const ROBOT_REMOVE_SKILL: &str = "robot.removeSkill";
 
     /// Subscribe to the raw input stream of the pad `padd` is driving from.
     ///
@@ -519,6 +796,13 @@ pub mod method {
 
     /// One 8×8 depth frame, pushed after [`TOF_STREAM`].
     pub const TOF_FRAME: &str = "tof.frame";
+
+    /// Subscribe to the head IMU (BMI088 on the HAT, same I²C bus as the ToF). The answer
+    /// describes the sensor, then [`HEAD_IMU_FRAME`] notifications arrive until the connection closes.
+    pub const HEAD_IMU_STREAM: &str = "head_imu.stream";
+
+    /// One head-IMU sample, pushed after [`HEAD_IMU_STREAM`].
+    pub const HEAD_IMU_FRAME: &str = "head_imu.frame";
 }
 
 /// JSON-RPC error codes.
@@ -618,6 +902,8 @@ pub enum Call {
     RobotInit,
     /// Cut power to the joints. The robot collapses if nothing holds it.
     RobotRelax,
+    /// Reboot servos (all of them, or the ids named), then limp. See [`method::ROBOT_REBOOT_MOTORS`].
+    RobotRebootMotors(RebootMotorsParams),
     /// Run a one-shot skill, or toggle sit↔stand.
     RobotDo(DoParams),
     /// Standing body pose. Continuous. Send as a notification.
@@ -644,6 +930,38 @@ pub enum Call {
     RobotMode,
     /// Switch drive mode; see [`method::ROBOT_SET_MODE`].
     RobotSetMode(SetModeParams),
+    /// What each policy slot runs; see [`method::ROBOT_POLICIES`].
+    RobotPolicies,
+    /// Static robot geometry for a mapper; see [`method::ROBOT_MODEL`].
+    RobotModel,
+    /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
+    RobotLoadPolicy(LoadPolicyParams),
+    /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
+    RobotReloadPolicies,
+
+    // ── policy.* ─────────────────────────────────────────────────────────────
+    /// What is installed and what the Hub offers; see [`method::POLICY_CHECK`].
+    PolicyCheck,
+    /// Install a set and make it live; see [`method::POLICY_INSTALL`].
+    PolicyInstall(PolicyInstallParams),
+    /// Fetch one policy into the library; see [`method::POLICY_FETCH`].
+    PolicyFetch(PolicyFetchParams),
+    /// Search the Hub; see [`method::POLICY_SEARCH`].
+    PolicySearch(PolicySearchParams),
+
+    // ── detector.* ───────────────────────────────────────────────────────────
+    /// What detector is installed and what the Hub offers; see [`method::DETECTOR_CHECK`].
+    DetectorCheck,
+    /// Install a detector and restart `mediad` onto it; see [`method::DETECTOR_INSTALL`].
+    DetectorInstall(PolicyInstallParams),
+
+    // ── account.* ────────────────────────────────────────────────────────────
+    /// Start a device-code login; see [`method::ACCOUNT_LOGIN`].
+    AccountLogin(AccountLoginParams),
+    /// Who this robot belongs to; see [`method::ACCOUNT_STATUS`].
+    AccountStatus,
+    /// Forget the account; see [`method::ACCOUNT_LOGOUT`].
+    AccountLogout,
     RobotSubscribe(SubscribeParams),
     // ── net.* ────────────────────────────────────────────────────────────────
     NetStatus,
@@ -654,6 +972,8 @@ pub enum Call {
     // ── system.* ─────────────────────────────────────────────────────────────
     SystemInfo,
     SystemServices,
+    /// The tail of one unit's journal; see [`method::SYSTEM_LOGS`].
+    SystemLogs(LogsParams),
     SystemSetName(SetNameParams),
     SystemReboot,
     /// Read the pairing PIN.
@@ -676,10 +996,17 @@ pub enum Call {
     PadStatus,
     PadPair(PadPairParams),
     PadForget(PadForgetParams),
+    PadBindings,
+    PadBind(PadBindParams),
+    RobotSkills,
+    RobotSetSkill(SkillParams),
+    RobotRemoveSkill(SkillNameParams),
     /// Subscribe to the raw pad input stream. Answered by `padd`, not `configd`.
     PadInput,
     /// Subscribe to the ToF depth stream. Answered by `tofd`.
     TofStream,
+    /// Subscribe to the head IMU (BMI088 on the HAT); see [`method::HEAD_IMU_STREAM`].
+    HeadImuStream,
 }
 
 /// The service that owns the answer to a call.
@@ -758,6 +1085,7 @@ impl Call {
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
             Call::RobotInit => method::ROBOT_INIT,
             Call::RobotRelax => method::ROBOT_RELAX,
+            Call::RobotRebootMotors(_) => method::ROBOT_REBOOT_MOTORS,
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
@@ -770,6 +1098,19 @@ impl Call {
             Call::RobotShutdown => method::ROBOT_SHUTDOWN,
             Call::RobotMode => method::ROBOT_MODE,
             Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
+            Call::RobotPolicies => method::ROBOT_POLICIES,
+            Call::RobotModel => method::ROBOT_MODEL,
+            Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
+            Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
+            Call::PolicyCheck => method::POLICY_CHECK,
+            Call::PolicyInstall(_) => method::POLICY_INSTALL,
+            Call::PolicyFetch(_) => method::POLICY_FETCH,
+            Call::PolicySearch(_) => method::POLICY_SEARCH,
+            Call::DetectorCheck => method::DETECTOR_CHECK,
+            Call::DetectorInstall(_) => method::DETECTOR_INSTALL,
+            Call::AccountLogin(_) => method::ACCOUNT_LOGIN,
+            Call::AccountStatus => method::ACCOUNT_STATUS,
+            Call::AccountLogout => method::ACCOUNT_LOGOUT,
             Call::RobotSubscribe(_) => method::ROBOT_SUBSCRIBE,
             Call::NetStatus => method::NET_STATUS,
             Call::NetScan => method::NET_SCAN,
@@ -777,6 +1118,7 @@ impl Call {
             Call::NetForget(_) => method::NET_FORGET,
             Call::SystemInfo => method::SYSTEM_INFO,
             Call::SystemServices => method::SYSTEM_SERVICES,
+            Call::SystemLogs(_) => method::SYSTEM_LOGS,
             Call::SystemSetName(_) => method::SYSTEM_SET_NAME,
             Call::SystemReboot => method::SYSTEM_REBOOT,
             Call::SystemPairingPin => method::SYSTEM_PAIRING_PIN,
@@ -785,8 +1127,14 @@ impl Call {
             Call::PadStatus => method::PAD_STATUS,
             Call::PadPair(_) => method::PAD_PAIR,
             Call::PadForget(_) => method::PAD_FORGET,
+            Call::PadBindings => method::PAD_BINDINGS,
+            Call::PadBind(_) => method::PAD_BIND,
+            Call::RobotSkills => method::ROBOT_SKILLS,
+            Call::RobotSetSkill(_) => method::ROBOT_SET_SKILL,
+            Call::RobotRemoveSkill(_) => method::ROBOT_REMOVE_SKILL,
             Call::PadInput => method::PAD_INPUT,
             Call::TofStream => method::TOF_STREAM,
+            Call::HeadImuStream => method::HEAD_IMU_STREAM,
         }
     }
 
@@ -816,6 +1164,25 @@ impl Call {
                 // `pad.status` is a read and stays ungated.
                 | Call::PadPair(_)
                 | Call::PadForget(_)
+                // Replacing the policy set changes what drives fifteen servos, which is at least
+                // as consequential as bonding a pad. `policy.check` is a read and stays ungated,
+                // like `pad.status` and every other question about what a robot is.
+                | Call::PolicyInstall(_)
+                // Putting a stranger's network on the board is at least as consequential as
+                // replacing the official set. `policy.search` and `policy.fetch`'s read-only
+                // cousins stay ungated — asking what exists changes nothing.
+                | Call::PolicyFetch(_)
+                // Replacing the detector writes to the eMMC and restarts `mediad`, which drops
+                // every video session. `detector.check` is a read and stays ungated.
+                | Call::DetectorInstall(_)
+                // Signing the robot in binds it to a Hugging Face account, and signing it out
+                // takes it away again. That is the most consequential pair here by one measure
+                // nothing else in this list shares: it decides who can reach the robot *from
+                // outside the building*, and it outlives every session and every reboot.
+                // `account.status` is a read and stays ungated — a support engineer should be
+                // able to ask which account a robot thinks it belongs to.
+                | Call::AccountLogin(_)
+                | Call::AccountLogout
         )
     }
 
@@ -861,6 +1228,26 @@ impl Call {
             // enforces at write time, so the answer cannot grow without limit however long
             // a hook talked for.
             Call::Show(_) => (Updater, Prompt),
+            // `check` is one HTTP round trip. `install` downloads a policy set and then asks
+            // `robotd` to reload, which is the same order of magnitude as a small update — long,
+            // but bounded and not a stream.
+            Call::PolicyCheck | Call::PolicyInstall(_) => (Updater, Prompt),
+            // The same two, for the detector: one round trip, or a fourteen-megabyte download
+            // and a `mediad` restart.
+            Call::DetectorCheck | Call::DetectorInstall(_) => (Updater, Prompt),
+            // `fetch` downloads one file and `search` is a single query; both are bounded and
+            // neither streams.
+            Call::PolicyFetch(_) | Call::PolicySearch(_) => (Updater, Prompt),
+            // `login` is one HTTP round trip to Hugging Face and answers with the code to
+            // show somebody; the *waiting* happens in a task `updaterd` owns, not on this
+            // connection, so it is `Slow` for the round trip rather than `Stream` for the login.
+            // That is the whole reason `login` returns a code instead of a token: a client that
+            // backgrounds itself while its user reads the code — which is what a phone does when
+            // it opens a browser — must be able to come back and ask `status`.
+            Call::AccountLogin(_) => (Updater, Slow),
+            // Both read or write local state only. `status` is asked on a poll while a login is
+            // in flight, so it must not queue behind anything.
+            Call::AccountStatus | Call::AccountLogout => (Updater, Prompt),
             // Owns its connection until the peer goes away and never reads another request.
             Call::Subscribe => (Updater, Stream),
 
@@ -869,6 +1256,8 @@ impl Call {
             | Call::RobotHealth
             | Call::RobotModelApi
             | Call::RobotRemoteSessionActive
+            | Call::RobotPolicies
+            | Call::RobotModel
             | Call::RobotMode => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
@@ -879,6 +1268,7 @@ impl Call {
             | Call::RobotEnable(_)
             | Call::RobotInit
             | Call::RobotRelax
+            | Call::RobotRebootMotors(_)
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
@@ -886,6 +1276,8 @@ impl Call {
             | Call::RobotTheremin(_)
             | Call::RobotChorale(_)
             | Call::RobotSetMode(_)
+            | Call::RobotLoadPolicy(_)
+            | Call::RobotReloadPolicies
             | Call::RobotShutdown => (Robot, Prompt),
             Call::RobotSubscribe(_) => (Robot, Stream),
             // `btd` asking what to put on the air. The answering connection carries the beacon
@@ -897,12 +1289,29 @@ impl Call {
             | Call::NetForget(_)
             | Call::SystemInfo
             | Call::SystemServices
+            | Call::SystemLogs(_)
             | Call::SystemSetName(_)
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::SystemSetPairingPin(_)
             | Call::PadStatus
             | Call::PadForget(_) => (Config, Prompt),
+
+            // **The one place `pad.*` splits across two daemons.** Pairing is about the radio,
+            // which `configd` owns. A binding is about what a button does to the robot, and
+            // answering it needs two things only `robotd` has: the list of skills this robot
+            // actually has, so a name can be refused rather than becoming a dead button, and the
+            // config path it is already parsing. Its true sibling is `robot.loadPolicy`, not
+            // `pad.pair`.
+            //
+            // Routing is per method throughout this table — `policy.*` goes to `updaterd` while
+            // `robot.loadPolicy` goes to `robotd`, for the same concept — so this costs nothing
+            // mechanically. It is only worth a comment because the name suggests otherwise.
+            Call::PadBindings | Call::PadBind(_) => (Robot, Prompt),
+
+            // The skill table. `robotd` writes it and reloads itself afterwards, so one call is
+            // enough — and it is the daemon that has to accept the result either way.
+            Call::RobotSkills | Call::RobotSetSkill(_) | Call::RobotRemoveSkill(_) => (Robot, Slow),
             // Re-sweeps the radio rather than returning the last scan.
             Call::NetScan => (Config, Slow),
             // `configd` polls NetworkManager for up to 45 seconds before calling a join failed,
@@ -917,6 +1326,7 @@ impl Call {
             // exists today reaches neither: what a call *is* does not depend on who may ask it.
             Call::PadInput => (Pad, Stream),
             Call::TofStream => (Tof, Stream),
+            Call::HeadImuStream => (Tof, Stream),
 
             // ── answered by no service ──────────────────────────────────────
             //
@@ -968,9 +1378,16 @@ impl Call {
             Call::RobotLook(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
             Call::RobotDo(p) => encode(p),
+            Call::RobotRebootMotors(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
+            Call::RobotLoadPolicy(p) => encode(p),
+            Call::PolicyInstall(p) => encode(p),
+            Call::DetectorInstall(p) => encode(p),
+            Call::PolicyFetch(p) => encode(p),
+            Call::PolicySearch(p) => encode(p),
+            Call::AccountLogin(p) => encode(p),
             Call::RobotSound(p) => encode(p),
             Call::RobotTheremin(p) => encode(p),
             Call::RobotChorale(p) => encode(p),
@@ -979,11 +1396,15 @@ impl Call {
             Call::RobotSubscribe(p) => encode(p),
             Call::NetConnect(p) => encode(p),
             Call::NetForget(p) => encode(p),
+            Call::SystemLogs(p) => encode(p),
             Call::SystemSetName(p) => encode(p),
             Call::SystemSetPairingPin(p) => encode(p),
             Call::SystemAuthenticate(p) => encode(p),
             Call::PadPair(p) => encode(p),
             Call::PadForget(p) => encode(p),
+            Call::PadBind(p) => encode(p),
+            Call::RobotSetSkill(p) => encode(p),
+            Call::RobotRemoveSkill(p) => encode(p),
             Call::Status
             | Call::Subscribe
             | Call::RobotSafeToRestart
@@ -994,6 +1415,13 @@ impl Call {
             | Call::RobotInit
             | Call::RobotRelax
             | Call::RobotShutdown
+            | Call::RobotPolicies
+            | Call::RobotModel
+            | Call::RobotReloadPolicies
+            | Call::PolicyCheck
+            | Call::DetectorCheck
+            | Call::AccountStatus
+            | Call::AccountLogout
             | Call::RobotMode => Value::Object(serde_json::Map::new()),
             Call::NetStatus
             | Call::NetScan
@@ -1002,8 +1430,11 @@ impl Call {
             | Call::SystemReboot
             | Call::SystemPairingPin
             | Call::PadStatus
+            | Call::PadBindings
+            | Call::RobotSkills
             | Call::PadInput
             | Call::TofStream
+            | Call::HeadImuStream
             | Call::ChoraleSubscribe => Value::Object(serde_json::Map::new()),
         }
     }
@@ -1043,6 +1474,7 @@ impl Call {
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             method::ROBOT_INIT => Call::RobotInit,
             method::ROBOT_RELAX => Call::RobotRelax,
+            method::ROBOT_REBOOT_MOTORS => Call::RobotRebootMotors(decode(params)?),
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
@@ -1055,6 +1487,19 @@ impl Call {
             method::ROBOT_SHUTDOWN => Call::RobotShutdown,
             method::ROBOT_MODE => Call::RobotMode,
             method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
+            method::ROBOT_POLICIES => Call::RobotPolicies,
+            method::ROBOT_MODEL => Call::RobotModel,
+            method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
+            method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
+            method::POLICY_CHECK => Call::PolicyCheck,
+            method::POLICY_INSTALL => Call::PolicyInstall(decode(params)?),
+            method::POLICY_FETCH => Call::PolicyFetch(decode(params)?),
+            method::POLICY_SEARCH => Call::PolicySearch(decode(params)?),
+            method::DETECTOR_CHECK => Call::DetectorCheck,
+            method::DETECTOR_INSTALL => Call::DetectorInstall(decode(params)?),
+            method::ACCOUNT_LOGIN => Call::AccountLogin(decode(params)?),
+            method::ACCOUNT_STATUS => Call::AccountStatus,
+            method::ACCOUNT_LOGOUT => Call::AccountLogout,
             method::ROBOT_SUBSCRIBE => Call::RobotSubscribe(decode(params)?),
             method::NET_STATUS => Call::NetStatus,
             method::NET_SCAN => Call::NetScan,
@@ -1062,6 +1507,7 @@ impl Call {
             method::NET_FORGET => Call::NetForget(decode(params)?),
             method::SYSTEM_INFO => Call::SystemInfo,
             method::SYSTEM_SERVICES => Call::SystemServices,
+            method::SYSTEM_LOGS => Call::SystemLogs(decode(params)?),
             method::SYSTEM_SET_NAME => Call::SystemSetName(decode(params)?),
             method::SYSTEM_REBOOT => Call::SystemReboot,
             method::SYSTEM_PAIRING_PIN => Call::SystemPairingPin,
@@ -1078,8 +1524,14 @@ impl Call {
                 Call::PadPair(decode(params.or(Some(&empty)))?)
             }
             method::PAD_FORGET => Call::PadForget(decode(params)?),
+            method::PAD_BINDINGS => Call::PadBindings,
+            method::PAD_BIND => Call::PadBind(decode(params)?),
+            method::ROBOT_SKILLS => Call::RobotSkills,
+            method::ROBOT_SET_SKILL => Call::RobotSetSkill(decode(params)?),
+            method::ROBOT_REMOVE_SKILL => Call::RobotRemoveSkill(decode(params)?),
             method::PAD_INPUT => Call::PadInput,
             method::TOF_STREAM => Call::TofStream,
+            method::HEAD_IMU_STREAM => Call::HeadImuStream,
             other => {
                 return Err(Error::new(
                     code::METHOD_NOT_FOUND,
@@ -1175,8 +1627,9 @@ pub mod test_support {
             }),
             Call::RobotInit,
             Call::RobotRelax,
+            Call::RobotRebootMotors(RebootMotorsParams { ids: vec![3, 11] }),
             Call::RobotDo(DoParams {
-                skill: Skill::GroundPick,
+                skill: "ground_pick".into(),
             }),
             Call::RobotPose(PoseParams {
                 z: -0.01,
@@ -1191,6 +1644,32 @@ pub mod test_support {
             }),
             Call::RobotShutdown,
             Call::RobotMode,
+            Call::RobotPolicies,
+            Call::RobotModel,
+            Call::RobotReloadPolicies,
+            Call::PolicyCheck,
+            Call::PolicyInstall(PolicyInstallParams {
+                version: Some("v2".into()),
+            }),
+            Call::PolicyFetch(PolicyFetchParams {
+                repo: "RemiFabre/microduck-flamingo-cycle".into(),
+                revision: None,
+                file: None,
+            }),
+            Call::PolicySearch(PolicySearchParams {
+                query: "microduck".into(),
+            }),
+            Call::DetectorCheck,
+            Call::DetectorInstall(PolicyInstallParams {
+                version: Some("v2".into()),
+            }),
+            Call::AccountLogin(AccountLoginParams { force: false }),
+            Call::AccountStatus,
+            Call::AccountLogout,
+            Call::RobotLoadPolicy(LoadPolicyParams {
+                slot: Some("walk".into()),
+                path: Some("/var/lib/robot/policies/bouncy.onnx".into()),
+            }),
             Call::RobotSubscribe(SubscribeParams { hz: Some(10) }),
             Call::NetStatus,
             Call::NetScan,
@@ -1203,6 +1682,11 @@ pub mod test_support {
             }),
             Call::SystemInfo,
             Call::SystemServices,
+            Call::SystemLogs(LogsParams {
+                unit: "robotd".into(),
+                lines: 40,
+                boot: -1,
+            }),
             Call::SystemSetName(SetNameParams {
                 name: "duck-01".into(),
             }),
@@ -1222,8 +1706,19 @@ pub mod test_support {
             Call::PadForget(PadForgetParams {
                 mac: "78:86:2E:BB:13:28".into(),
             }),
+            Call::RobotSkills,
+            Call::RobotSetSkill(SkillParams::default()),
+            Call::RobotRemoveSkill(SkillNameParams {
+                name: "polite-bow".into(),
+            }),
+            Call::PadBindings,
+            Call::PadBind(PadBindParams {
+                button: "x".into(),
+                skill: Some("polite-bow".into()),
+            }),
             Call::PadInput,
             Call::TofStream,
+            Call::HeadImuStream,
         ]
     }
 }
@@ -1321,6 +1816,24 @@ impl Request {
     /// Read a depth-frame notification back.
     pub fn as_tof_frame(&self) -> Option<TofFrame> {
         if self.method != method::TOF_FRAME {
+            return None;
+        }
+        serde_json::from_value(self.params.clone()?).ok()
+    }
+
+    /// A head-IMU sample notification: no `id`.
+    pub fn notify_head_imu_frame(frame: &HeadImuFrame) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_owned(),
+            id: None,
+            method: method::HEAD_IMU_FRAME.to_owned(),
+            params: Some(serde_json::to_value(frame).unwrap_or(Value::Null)),
+        }
+    }
+
+    /// Read a head-IMU notification back.
+    pub fn as_head_imu_frame(&self) -> Option<HeadImuFrame> {
+        if self.method != method::HEAD_IMU_FRAME {
             return None;
         }
         serde_json::from_value(self.params.clone()?).ok()
@@ -1670,27 +2183,26 @@ pub struct ThereminState {
 ///
 /// An enum rather than a free string so a typo is [`code::INVALID_PARAMS`] at the door,
 /// not a silently ignored request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Skill {
-    /// Toggle the optional whole-body reference-tracking skill. The daemon owns the current state
-    /// and performs a home-pose ramp on both entry and exit; clients must not keep a local toggle.
-    WbcToggle,
-    /// Phase-scripted pick from the ground. One shot, ~3 s.
-    GroundPick,
-    /// Left-leg kick. One shot, half a second, blind to any ball.
-    KickLeft,
-    /// Right-leg kick.
-    KickRight,
-    /// Sit if standing, stand if sitting. The daemon knows which; the client need not.
-    SitToggle,
-    /// Forward roll, ~1 s. One request is one roll; a request that arrives while a roll
-    /// runs chains another when the current one completes — which is how a client maps
-    /// "button held" onto it: keep sending while the button is down.
-    Roulade,
+/// Which one-shot skill to run, for [`Call::RobotDo`].
+///
+/// **A name, not an enumeration.** It was five variants — ground pick, the two kicks, the sit
+/// toggle and roulade — each of which needed a `Net`, a config slot and a branch in the control
+/// loop before a robot could do it. A robot's skills are now a list in its config, so what a
+/// client may ask for is whatever that robot has, and `robot.subscribe`'s acknowledgement is
+/// where a client learns the names rather than assuming them.
+///
+/// The five above are still the names a stock robot answers to. An unknown one is refused with
+/// the list it does know, which is the same shape as a bad policy slot.
+pub type Skill = String;
+
+/// Which servos [`method::ROBOT_REBOOT_MOTORS`] reboots. Empty means every servo.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RebootMotorsParams {
+    pub ids: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DoParams {
     pub skill: Skill,
@@ -1751,6 +2263,316 @@ pub struct ModeResult {
     pub mode: String,
 }
 
+/// Which slot to change, and to what, for [`Call::RobotLoadPolicy`].
+///
+/// The two `Option`s mirror the config key this ends up writing: `[policy] walk` is an
+/// `Option<PathBuf>` where unset means "resolve this slot's default for the current mode", so
+/// clearing an override and asking for the default are the same operation on the wire as they
+/// are on disk.
+///
+/// | `slot` | `path` | means |
+/// |---|---|---|
+/// | `Some` | `Some` | run this file in this slot |
+/// | `Some` | `None` | drop this slot's override, back to the default |
+/// | `None` | `None` | drop every override — "put it all back" |
+/// | `None` | `Some` | refused; there is no such thing as loading one file into every slot |
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoadPolicyParams {
+    /// `"walk"`, `"stand"`, `"sitstand"`, `"ground_pick"`, `"kick_left"`, `"kick_right"` or
+    /// `"roulade"`. A string for the reason [`SetModeParams`] carries one: a slot this build
+    /// does not have should be refused with the list of ones it does, not fail to parse.
+    pub slot: Option<String>,
+    /// The `.onnx` to run. Absolute — the daemon resolves nothing relative, because its working
+    /// directory is not the caller's and a path that meant one file to each would be worse than
+    /// a refusal.
+    pub path: Option<String>,
+}
+
+/// Answer to [`Call::RobotPolicies`] — what is actually loaded, not what was configured.
+///
+/// The distinction is the point. A slot whose override failed to load reports the file it fell
+/// back to in `path` and says why in `error`, so "I loaded a policy and the robot did not
+/// change" has an answer that does not require reading the journal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoliciesResult {
+    /// `"walk"` or `"roller"` — which mode's slot defaults are in play.
+    pub mode: String,
+    /// Whether policies are loaded at all (`[policy] enabled`). False is a legitimate bench
+    /// configuration, not a fault — the slots below then say what *would* load, and nothing is
+    /// running. Without this a client cannot tell a deliberately quiet robot from a broken one.
+    pub enabled: bool,
+    /// One entry per slot this build has, including the empty ones.
+    pub slots: Vec<PolicySlot>,
+    /// The one-shot skills this robot has, in priority order — the names `robot.do` answers to.
+    ///
+    /// **A client cannot offer a "bow" button without knowing the robot has a bow.** Which skills
+    /// exist is config now, so there is no list to compile in; the other place it is published is
+    /// `robot.subscribe`'s acknowledgement, and that is a 50 Hz stream — the wrong thing to open
+    /// over BLE to answer a question asked once. Here it rides the read a client already makes to
+    /// show what is loaded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    /// Why the last policy change failed, when it was not a change to one slot.
+    ///
+    /// **A slot's failure is reported on the slot**; this is for the two that name none — a
+    /// reload and a whole-robot reset — where the answer would otherwise be a log line on the
+    /// robot and silence on the wire. `robot.setSkill` accepts and then triggers a reload, so
+    /// without this a client is told a skill was added and discovers it was not by pressing the
+    /// button.
+    ///
+    /// Cleared by the next change that succeeds. The robot is running the policy it had
+    /// throughout — a failed change swaps nothing — so this is *degraded*, never unhealthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_error: Option<String>,
+}
+
+/// One policy slot's state, for [`PoliciesResult`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySlot {
+    /// `"walk"`, `"stand"`, …
+    pub slot: String,
+    /// The file running in it. Absent means the slot is empty, which is a capability this
+    /// robot does not have rather than a fault — roller mode has no standing network.
+    pub path: Option<String>,
+    /// `"official"`, `"community"` or `"local"`. Absent when the slot is empty.
+    ///
+    /// A string rather than an enum so a client that predates an origin reports it verbatim
+    /// instead of failing to parse a robot's answer about what it is running.
+    pub origin: Option<String>,
+    /// Whether config overrides this slot, as opposed to it resolving to the mode's default.
+    pub overridden: bool,
+    /// Why this slot is not running what was asked of it. Set when an override failed to load
+    /// and the default was used instead; `path` then names what is actually running.
+    pub error: Option<String>,
+}
+
+/// Which set to install, for [`Call::PolicyInstall`] and [`Call::DetectorInstall`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyInstallParams {
+    /// A revision in the policy repo — a tag like `v2`, or a branch. Absent means whatever
+    /// [`Call::PolicyCheck`] calls the newest, which is the ordinary case and saves a client
+    /// having to make two calls to do the obvious thing.
+    pub version: Option<String>,
+}
+
+/// Answer to [`Call::PolicyCheck`].
+///
+/// Deliberately says what is installed *and* what exists, rather than a bare "update available".
+/// A robot two versions behind, a robot ahead of its release's pin, and a robot whose Hub is
+/// unreachable are three different situations, and a boolean makes them all look alike.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyCheckResult {
+    /// The Hub repo the installed set came from, per its own provenance record.
+    pub repo: Option<String>,
+    /// The revision installed, e.g. `v1`.
+    pub installed: Option<String>,
+    /// The newest revision the repo offers, if the Hub could be reached.
+    pub available: Option<String>,
+    /// Every revision the repo offers, newest first. What makes going *back* possible.
+    pub versions: Vec<String>,
+    /// Why `available` is absent. An unreachable Hub is a fact to report, not an error to fail
+    /// on — the robot is walking either way.
+    pub unreachable: Option<String>,
+}
+
+/// Answer to [`Call::PolicyInstall`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyInstallResult {
+    /// What is now live.
+    pub installed: String,
+    /// What was live before, when it was something else. Absent on a first install.
+    pub previous: Option<String>,
+    /// Whether `robotd` picked the new set up. False means the files are in place and the robot
+    /// is still running the old ones — a restart away from correct, and worth saying so rather
+    /// than reporting a success the robot has not acted on.
+    pub reloaded: bool,
+}
+
+/// Which policy to fetch, for [`Call::PolicyFetch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicyFetchParams {
+    /// A Hub repo, `org/name`.
+    pub repo: String,
+    /// A branch, tag or commit. Absent means `main`.
+    pub revision: Option<String>,
+    /// Which file in the repo. Absent means "the only `.onnx` in it", which is what every
+    /// microduck policy repo published so far actually has — they all carry one `policy.onnx`.
+    /// A repo with several is a refusal naming them, not a guess.
+    pub file: Option<String>,
+}
+
+/// What a fetched policy turned out to be, for [`Call::PolicyFetch`].
+///
+/// Most of this comes from the repo's `manifest.json`, which the community convention already
+/// carries and which is **untrusted**: it is a stranger's description of a stranger's file. It is
+/// worth reading anyway, because a policy that says it is 51-D can be refused before the download
+/// rather than after the robot has been asked to run it — and a manifest that lies is caught by
+/// the shape gate at load, which is where the real check has always been.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyFetchResult {
+    /// Where it landed. This is what goes in `[policy] <slot>`.
+    pub path: String,
+    pub repo: String,
+    pub revision: String,
+    /// The commit the revision resolved to, so a moving branch can be noticed later.
+    pub commit: Option<String>,
+    pub file: String,
+    /// `"official"` or `"community"`, by the org the repo belongs to.
+    pub origin: String,
+    /// The manifest's own name for it, if it had one.
+    pub name: Option<String>,
+    /// One line about what it does, from the manifest. Untrusted display text.
+    pub description: Option<String>,
+    /// The manifest's `kind` — `episodic` for a policy that returns itself to a safe pose,
+    /// `perpetual` for one that holds until told otherwise. Untrusted, and what decides whether
+    /// the daemon has to supply an ending.
+    pub kind: Option<String>,
+    /// How long the policy runs, from the manifest. Absent for a perpetual one, which has no
+    /// length of its own — a caller wanting it as a one-shot has to say how long to hold it.
+    pub duration_s: Option<f64>,
+    /// The manifest's `action_scale`, if it declared one.
+    pub action_scale: Option<f64>,
+    /// Seconds a perpetual policy needs to get back to its idle command, from the manifest.
+    pub unwind_s: Option<f64>,
+    /// The manifest's `command.idle` — the twist that means "stop", and what a skill unwinds to.
+    pub idle: Option<[f64; 3]>,
+    /// The manifest's `command.encoding`: absent or `"constant"` for the skill family, `"phase"`
+    /// for a ground pick, `"posture_flag"` for a sit↔stand. What decides whether the policy can
+    /// be a generic one-shot at all — a phase policy fed a constant is a robot moving plausibly
+    /// and wrongly.
+    pub encoding: Option<String>,
+    /// Whether holding the button chains another run, from the manifest.
+    pub chain: bool,
+    /// The manifest's `schema_version`, so a client can say which convention it read.
+    pub schema_version: Option<u32>,
+}
+
+/// What to search the Hub for, for [`Call::PolicySearch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolicySearchParams {
+    pub query: String,
+}
+
+/// What to pass [`Call::AccountLogin`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountLoginParams {
+    /// Sign in even though this robot already belongs to an account, or is already waiting for
+    /// a code to be approved.
+    ///
+    /// Without it, a robot that is already signed in refuses with [`code::INVALID_PARAMS`] naming
+    /// the account it belongs to, and one with a live code refuses with [`code::BUSY`]. The
+    /// second is the same permission as the first in a smaller size — replacing an *attempt* at
+    /// belonging to somebody — and it is the only way out of a code nobody is going to approve
+    /// that does not mean signing the robot out or waiting five minutes for it to expire.
+    ///
+    /// A superseded login is inert: it keeps its device code, and if Hugging Face approves it
+    /// later the answer is dropped rather than written. That is not ceremony: `account.login` is routed to BLE and to a
+    /// datachannel, so on a LAN anybody who can reach the robot can start one — and a login that
+    /// silently replaced the owner would convert "was on the wifi once" into remote access that
+    /// outlives being there. Taking a robot from its owner should require saying so.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Answer to [`Call::AccountLogin`], and the `login` member of [`AccountStatusResult`].
+///
+/// RFC 8628: show `user_code` to a person, send them to `verification_uri`, and poll
+/// [`Call::AccountStatus`] until it says who signed in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLoginResult {
+    /// The short code somebody types. Display it prominently — see the note on
+    /// `verification_uri_complete`.
+    pub user_code: String,
+    /// Where they type it.
+    pub verification_uri: String,
+    /// RFC 8628's "page that needs no code typed into it", when a server sends one.
+    ///
+    /// **Hugging Face does not, and today this is `verification_uri` unchanged.** An earlier
+    /// version of the robot appended `?user_code=`; HF's device page ignores the parameter and
+    /// prefills nothing, so that URL read as a promise the page then broke. The field stays
+    /// because it is the protocol's — a server that starts sending a real one is used with no
+    /// wire change — which means a client must treat it as "somewhere to send them", not as
+    /// "the code is handled".
+    ///
+    /// So whatever this says, a client **leads with the code and never opens a browser by
+    /// itself**. The mini's app learned that the expensive way: auto-switching to Safari hid the
+    /// code before the user could read it, and the page asks them to type it anyway.
+    pub verification_uri_complete: String,
+    /// How long the code is good for. In [`AccountStatusResult`] this is what is *left*.
+    pub expires_in: u64,
+    /// How often the robot polls Hugging Face, in seconds. Informational — the robot does the
+    /// polling. A client polls [`Call::AccountStatus`] at whatever rate suits it.
+    pub interval: u64,
+}
+
+/// Answer to [`Call::AccountStatus`].
+///
+/// Three independent facts rather than one state, because they genuinely are: a `force` login can
+/// be in flight while the robot still belongs to the previous account, and a login that failed
+/// leaves both the previous account and a reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStatusResult {
+    /// Who this robot belongs to. `None` means it belongs to nobody and cannot be reached from
+    /// outside its LAN.
+    pub account: Option<Account>,
+    /// A login in flight, with the code still to be approved and the time it has left.
+    pub login: Option<AccountLoginResult>,
+    /// Why the last login attempt failed, when one did and nothing has superseded it.
+    pub last_error: Option<String>,
+}
+
+/// The account a robot belongs to, in [`AccountStatusResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Account {
+    /// The Hugging Face username, as `/oauth/userinfo` reports it. What to show a person.
+    pub username: String,
+    /// Seconds until the stored access token expires, negative once it has.
+    ///
+    /// Present so a client can say "signed in, but this robot has not been online in a month"
+    /// rather than only discovering it when the robot stops appearing. The robot refreshes on its
+    /// own well before this reaches zero; it going negative means the robot could not.
+    pub token_expires_in: i64,
+    /// Whether a refresh token is stored, so an expiring access token can be renewed without
+    /// anybody signing in again.
+    pub refreshable: bool,
+}
+
+/// Answer to [`Call::AccountLogout`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountLogoutResult {
+    /// Who it was signed in as, or `None` if it was not signed in at all — so a client can tell
+    /// "signed out" from "there was nothing to sign out of" without asking first.
+    pub was: Option<String>,
+}
+
+/// Answer to [`Call::PolicySearch`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySearchResult {
+    pub models: Vec<PolicySearchHit>,
+}
+
+/// One Hub model matching a search. Everything here is written by whoever published it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicySearchHit {
+    /// `org/name`.
+    pub id: String,
+    pub origin: String,
+    pub likes: Option<u64>,
+    pub downloads: Option<u64>,
+}
+
 /// How often a subscriber wants [`method::ROBOT_STATE`].
 ///
 /// Decimation is per-subscriber and happens server-side, so a dashboard asking for 10 Hz
@@ -1798,12 +2620,11 @@ pub struct SubscribeResult {
     pub sitstand: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ground_pick: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kick_left: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kick_right: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub roulade: Option<String>,
+    /// The configurable one-shot skills this robot has, in priority order, and the names
+    /// `robot.do` answers to. A list rather than a field per skill, because which skills a robot
+    /// has is now config: a client learns them here instead of assuming five.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
 }
 
 /// Whether the policy should run. Discrete intent — see [`method::ROBOT_ENABLE`].
@@ -2545,6 +3366,20 @@ impl IntentResult {
         }
     }
 
+    /// Accepted, and there was nothing to do — the robot is already in the state asked for.
+    ///
+    /// Distinct from [`Self::accepted`] only by carrying a reason, which is the whole signal: an
+    /// acceptance that queued no work still succeeded, but a caller that then waits for something
+    /// to change is waiting for a change that is never coming. `robot.loadPolicy` is the case
+    /// this exists for — resetting a slot that was never overridden would otherwise send the
+    /// robot home, reload every network and come back to exactly what it was running.
+    pub fn already(reason: impl Into<String>) -> Self {
+        Self {
+            accepted: true,
+            reason: Some(reason.into()),
+        }
+    }
+
     pub fn refused(reason: impl Into<String>) -> Self {
         Self {
             accepted: false,
@@ -2589,6 +3424,103 @@ pub struct RobotState {
     /// state of a duck — see [`ChoraleState`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chorale: Option<ChoraleState>,
+    /// `CLOCK_MONOTONIC` at this tick, nanoseconds — the same clock as [`TofFrame::t_ns`], so a
+    /// mapper can put a state sample and a depth frame on one axis. Zero from a daemon predating
+    /// it; `t` is still the loop's own elapsed time. (v24)
+    #[serde(default)]
+    pub t_ns: u64,
+    /// The trunk IMU as the loop read it this tick. Absent from a daemon predating it, or while
+    /// no sensors have been read. (v24)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imu: Option<ImuState>,
+    /// Where the camera and the ToF sensor are in the trunk frame at this tick's measured head
+    /// joints, from the same head FK `robot.look` uses. Published so a client that pairs a picture
+    /// with a pose never carries its own copy of the kinematics. (v24)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<FramesState>,
+    /// Every body's pose in the trunk frame this tick, in [`ModelResult::skeleton`] order, from the
+    /// same head FK `robot.look` uses — the whole skeleton, so a viewer can draw the robot moving
+    /// for real. `frames` is a few leaves of this. Empty from a daemon predating it. (v25)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skeleton: Vec<PoseState>,
+}
+
+/// The trunk IMU, in [`RobotState::imu`]. Trunk frame: x forward, y left, z up.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImuState {
+    /// Angular velocity, rad/s.
+    pub gyro: [f64; 3],
+    /// Orientation trunk → world, scalar-first `[w, x, y, z]`. The world is the IMU's own
+    /// gravity-aligned frame with an arbitrary yaw at boot — the same frame `odom` lives in.
+    pub quat: [f64; 4],
+}
+
+/// A pose in the trunk frame: position in metres, orientation scalar-first `[w, x, y, z]`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PoseState {
+    pub pos: [f64; 3],
+    pub quat: [f64; 4],
+}
+
+/// Sensor poses in the trunk frame, in [`RobotState::frames`].
+///
+/// Conventions, stated once: `camera` is the OpenCV camera frame (+x right, +y down, +z along
+/// the optical axis) — the frame intrinsics and a pixel's ray are expressed in. `tof` is the
+/// VL53L5CX/L8CX integration frame (+x along the optical axis, +y left, +z up), the frame
+/// [`ModelResult::tof_beams`] is stated in. Both come from `kinematics::head::HeadFk`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FramesState {
+    pub camera: PoseState,
+    pub tof: PoseState,
+    /// The head IMU (BMI088) in the trunk frame. The `head_imu.stream` samples are in the IMU's
+    /// own tilted axes; this pose (sensor→trunk, from the same head FK) is how a consumer rotates
+    /// them into the trunk/camera frame. Absent from a daemon predating it. (v24)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_imu: Option<PoseState>,
+}
+
+/// Answer to [`Call::RobotModel`]: the geometry that does not change while the robot runs.
+///
+/// Everything a mapper needs beyond the per-tick poses in [`RobotState::frames`], so that the
+/// kinematics stay in one place — the `kinematics` crate — and a laptop or a server asks rather
+/// than transcribes. Angles and distances in radians and metres.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelResult {
+    /// Which MJCF asset the numbers come from, e.g. `alpha`.
+    pub asset: String,
+    /// Height of the trunk origin above the floor when standing at rest.
+    pub trunk_height_m: f64,
+    /// Every joint, in [`RobotState::joints`] order.
+    pub joint_names: Vec<String>,
+    /// The four head joints in the order [`RobotState::head`] uses.
+    pub head_joints: Vec<String>,
+    /// Unit direction of each ToF zone in the sensor frame, row-major like
+    /// [`TofFrame::distance_mm`]: row 0 is the top of the grid, column 0 the sensor's left.
+    pub tof_beams: Vec<[f64; 3]>,
+    /// The sensor's field of view per axis, degrees.
+    pub tof_fov_deg: f64,
+    /// Sensor poses at every head joint zero — a fixed reference; the live ones are in
+    /// [`RobotState::frames`].
+    pub frames_at_zero: FramesState,
+    /// The body tree the per-tick [`RobotState::skeleton`] poses are stated in: each link's name
+    /// and parent, in the same order. Empty from a daemon predating it. (v25)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skeleton: Vec<SkeletonLink>,
+}
+
+/// One link in the body tree — a name and its parent — so a viewer can match a
+/// [`RobotState::skeleton`] pose to a link and draw the edge to its parent. (v25)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkeletonLink {
+    /// The MJCF body name, e.g. `trunk_base`, `upper_leg_left`.
+    pub name: String,
+    /// Index of this link's parent in [`ModelResult::skeleton`], or `None` for the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
 }
 
 /// What the duck chorale is doing, in [`RobotState`].
@@ -2864,15 +3796,35 @@ pub struct Pad {
 
 /// Whether one of the robot's units is running, as systemd sees it.
 ///
-/// Named for the unit rather than for `padd`, which is where it started: the same four answers are
-/// what [`ServiceUnit`] needs about every daemon. The wire form is unchanged by that rename — these
+/// Named for the unit rather than for `padd`, which is where it started: the same answers are what
+/// [`ServiceUnit`] needs about every daemon. The wire form is unchanged by that rename — these
 /// serialise as their own names, not as the type's.
+///
+/// **`Restarting` and `Failed` are here because folding them into their neighbours made a robot
+/// with an unplugged camera report a healthy one.** `mediad` exits when it cannot build a pipeline
+/// and `Restart=always` brings it back five seconds later, forever; systemd calls that
+/// `ActiveState=activating`, `SubState=auto-restart`. Read as `Active` — which is what happened,
+/// for `padd`'s good reason about a daemon still connecting at boot — it printed as a running
+/// daemon, and because systemd deletes `RuntimeDirectory=` on every stop there was no
+/// [`Identity`] to name a build either. The whole of a crash loop reached the operator as
+/// `active · build unknown (old)`: the one explanation that could not be true, since every daemon
+/// in this workspace has published its identity since the commit that introduced it.
+///
+/// `Failed` splits out for the smaller version of the same complaint: it read as `Inactive`, which
+/// is also what a deliberate `systemctl stop` reads as, and those are not the same news.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitState {
     /// Running. With a connected pad, the robot is drivable.
     Active,
-    /// The unit exists and is not running. Someone stopped it, or it is failed.
+    /// Between processes: it exited and systemd is starting it again. Once for an ordinary restart,
+    /// or every `RestartSec=` for a daemon that cannot start at all — this state cannot tell those
+    /// apart, and nothing that reads it should pretend otherwise.
+    Restarting,
+    /// It could not start, and systemd has stopped trying.
+    Failed,
+    /// The unit exists and is not running, because something stopped it. A robot whose owner has no
+    /// gamepad and disabled `padd` is the ordinary case, which is why this is not a fault.
     Inactive,
     /// No such unit on this board — a release older than the one that added it.
     Absent,
@@ -2904,6 +3856,63 @@ pub struct ServiceUnit {
     /// stopped, or a build too old to publish. [`UnitState`] tells those apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
+}
+
+/// Which unit's journal to read, and how much of it. Parameters of [`Call::SystemLogs`].
+///
+/// **A unit name, not a filter expression.** The service picks from a fixed list and refuses
+/// anything else, because this call is reachable from a phone in radio range and `journalctl`
+/// arguments are not a language to hand such a peer. What that costs is `-g`, `--since` and
+/// several other things a person with a shell would reach for; what it buys is that the worst a
+/// client can ask for is the tail of a daemon this project ships.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogsParams {
+    /// `robotd` or `robotd.service` — the service resolves either. See `configd::logs` for the
+    /// units it will read.
+    pub unit: String,
+    /// How many lines from the end. Clamped to [`MAX_LOG_LINES`], and the byte budget below
+    /// usually binds first.
+    pub lines: usize,
+    /// Which boot: `0` is the current one, `-1` the one before it, and so on backwards.
+    ///
+    /// Negative rather than an index because that is the question — "what did it say before it
+    /// restarted" — and because it is `journalctl -b`'s own convention, so the answer to "which
+    /// boot did I just read" is the same number in both places.
+    pub boot: i32,
+}
+
+/// Ceiling on [`LogsParams::lines`], applied by the service rather than trusted from the caller.
+pub const MAX_LOG_LINES: usize = 500;
+
+/// Ceiling on the serialised `lines` array, in bytes.
+///
+/// **This exists because of the transport, and it is the binding limit in practice.** BLE
+/// reassembles a reply into one line, and the client's buffer for that is bounded — a peer that
+/// never sends a newline must not be able to grow it without limit. 48 KiB leaves the rest of a
+/// JSON-RPC envelope room inside a 64 KiB client buffer, and at a typical ATT MTU it is already
+/// several seconds on the air, which is the other reason not to raise it.
+///
+/// The service drops the *oldest* lines to fit and says it did, because the newest are the ones
+/// somebody asked for.
+pub const MAX_LOG_BYTES: usize = 48 * 1024;
+
+/// Answer to [`Call::SystemLogs`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsResult {
+    /// The unit as systemd names it, so a caller that typed `robotd` sees what it actually read.
+    pub unit: String,
+    /// Oldest first, the way a journal reads. No trailing newlines.
+    ///
+    /// **A line in `-- … --` is the robot's, not the journal's.** `journalctl` uses that shape
+    /// for what it inserts rather than recorded (`-- Reboot --`, `-- No entries --`) and this
+    /// borrows it for the one thing a tail cannot otherwise show: `-- new robotd process, pid
+    /// 3227 --`, where the daemon restarted. A tail spanning an update carries two different
+    /// builds' output, and nothing in the lines themselves says where one ends.
+    pub lines: Vec<String>,
+    /// Lines were dropped from the front to fit [`MAX_LOG_BYTES`]. Not an error — it is what
+    /// asking for more than the radio can carry looks like, and a caller can say so.
+    pub truncated: bool,
 }
 
 /// Answer to [`Call::PadStatus`].
@@ -2946,6 +3955,111 @@ pub enum PadPairResult {
         /// BlueZ's own words, for a support ticket. `reason` is what a client acts on.
         detail: Option<String>,
     },
+}
+
+/// One entry in the skill table, as a client sees it and as it is written back.
+///
+/// **The same shape read and written**, so a client can list, change one field and send it back
+/// without knowing which fields it is allowed to omit. Every optional one means "the default for
+/// this", which is what an absent key in `[[policy.skill]]` means too.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SkillParams {
+    /// What `robot.do` answers to. The key of the table: setting an existing name replaces it.
+    pub name: String,
+    /// The `.onnx`. Absent means the file this robot's own set ships under `<name>.onnx`, which
+    /// is what makes overriding a built-in's *timing* possible without naming its file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Seconds it runs. Required for a skill this robot does not already have — a policy that
+    /// holds until told otherwise has no length of its own and something must choose one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+    /// The twist fed to the network while it runs. Absent is all zeros, which is what a policy
+    /// trained on `zero_command_padding` expects and what most one-shots want.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<[f64; 3]>,
+    /// The twist driven on the way back, for a policy that does not end itself. A manifest's
+    /// `command.idle` is where this comes from when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unwind: Option<[f64; 3]>,
+    /// Seconds spent driving `unwind` before handing back to the gait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unwind_s: Option<f64>,
+    /// Whether a request arriving while it runs starts another when this one finishes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<bool>,
+    /// Scales raw output into a joint offset, when this skill wants its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_scale: Option<f64>,
+    /// Servo gain relative to the gait's, when this skill wants its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_ratio: Option<f64>,
+    /// Read-only: whether config has an opinion about this skill, or it is one the release ships.
+    /// Ignored on the way in — a client cannot make a built-in an override by saying so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overridden: bool,
+}
+
+/// Parameters for [`Call::RobotRemoveSkill`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillNameParams {
+    pub name: String,
+}
+
+/// Answer to [`Call::RobotSkills`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SkillsResult {
+    /// Every skill this robot has, in the order `robot.do` tries them.
+    pub skills: Vec<SkillParams>,
+    /// Names `robot.do` answers to that are **not** in the table above, because the daemon drives
+    /// them itself — `ground_pick` writes a scripted phase, `sit_toggle` is latched. A client
+    /// listing what a robot can do needs both, and neither can be edited here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub built_in: Vec<String>,
+}
+
+/// Parameters for [`Call::PadBind`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PadBindParams {
+    /// `"a"`, `"x"`, `"lb"`, `"rb"` or `"dpad_down"`. A string for the reason a slot is one: a
+    /// button this build does not have should be refused with the list of ones it does.
+    pub button: String,
+    /// Three states in one field, the same shape [`LoadPolicyParams`] uses for a path.
+    ///
+    /// - a name — run that skill;
+    /// - `""` — the button does nothing, switched off on purpose;
+    /// - absent — put it back to what this robot ships with.
+    ///
+    /// "Off" and "back to the default" are genuinely different wishes and a client needs both, so
+    /// neither can be spelled the way the other is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+}
+
+/// Answer to [`Call::PadBindings`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PadBindingsResult {
+    /// One entry per bindable button, in the order a listing should show them.
+    pub bindings: Vec<PadBinding>,
+}
+
+/// What one pad button runs.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PadBinding {
+    pub button: String,
+    /// Empty means switched off, which is not the same as a button this robot cannot bind — those
+    /// are simply absent from the list.
+    pub skill: String,
+    /// Whether this differs from what the robot ships with, so a client can show what somebody
+    /// changed without knowing the defaults itself.
+    pub overridden: bool,
+    /// Set when the bound name is not a skill this robot has: a button that will do nothing when
+    /// pressed. Nothing else reports this, and pressing it is otherwise the only way to find out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Answer to [`Call::PadForget`].
@@ -3074,6 +4188,81 @@ pub enum PadReport {
         /// usually an errno the operator wants verbatim.
         why: String,
     },
+    /// The pad has an inertial unit and its node is open. Sent on subscribing if one is already
+    /// being read, and again each time one appears — the same one code path as `Attached`.
+    ///
+    /// Independent of `Attached`: the IMU is a second evdev device with a life of its own, and a
+    /// pad without one simply never sends this. Everything in a [`PadImuSample`] is read against
+    /// the device here.
+    ImuAttached { device: Box<PadImuDevice> },
+    /// Inertial samples, as many as the kernel handed over in one read — see [`PadImuBatch`].
+    Imu(PadImuBatch),
+    /// The IMU node closed.
+    ImuDetached { why: String },
+}
+
+/// A pad's inertial unit, as the kernel describes it.
+///
+/// One device rather than six axes in [`PadInputDevice::axes`], because the kernel keeps them
+/// apart: an accelerometer node carries `INPUT_PROP_ACCELEROMETER` and its `ABS_X..Z` are metres
+/// per second squared, not a stick. Reading them as a stick is what gilrs would do, which is why
+/// `padd` drives from the other node and this one is only ever tapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuDevice {
+    /// As the kernel names it: "Nintendo Switch Pro Controller IMU".
+    pub name: String,
+    /// The event node being read.
+    pub node: String,
+    /// Raw units per **g** on the accelerometer axes, from the driver's `resolution`. 4096 on
+    /// `hid-nintendo`. Zero when the driver did not say, in which case the raw numbers are all a
+    /// reader has.
+    pub accel_per_g: i32,
+    /// Raw units per **degree per second** on the gyro axes. 14247 on `hid-nintendo`.
+    pub gyro_per_dps: i32,
+    /// The accelerometer's full scale, raw units, so a reader can tell a clipped sample.
+    pub accel_max: i32,
+    /// The gyro's full scale, raw units.
+    pub gyro_max: i32,
+}
+
+/// The inertial samples one read of the IMU node produced.
+///
+/// A batch rather than one sample per report, because of what a sample costs to send: at six
+/// hundred a second, one JSON line and one socket write each was measured at 6.6% of a core on the
+/// board (2026-09-09, `padd` with a subscriber, above its 1.6% idle). The kernel already groups
+/// them — the clone packs three samples into every HID packet — so the tap sends what one `read`
+/// returned, and the viewer takes them in order: measured at exactly three per batch, two hundred
+/// batches a second, and 4.4% of a core. Nothing is summarised: every sample is here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuBatch {
+    /// In the order the kernel delivered them, oldest first. Never empty on the wire.
+    pub samples: Vec<PadImuSample>,
+    /// Batches this subscriber missed because its own socket was behind, since the last one it did
+    /// receive. Counted apart from [`PadFrame::socket_dropped`]: a dropped IMU batch says nothing
+    /// about the stick reports.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub socket_dropped: u64,
+}
+
+/// One inertial sample: everything the IMU node delivered between two `SYN_REPORT`s.
+///
+/// Raw kernel units, deliberately — the tap hands out what the device said and the resolution to
+/// read it with, and the conversion happens once, in the viewer. Six integers rather than a
+/// `PadFrame`'s event list because this arrives at several hundred a second and every byte is
+/// paid for on the board's CPU.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadImuSample {
+    /// Samples since this IMU attached, counted by `padd`. A hole is a batch this subscriber
+    /// missed — [`PadImuBatch::socket_dropped`].
+    pub seq: u64,
+    /// The kernel's timestamp, microseconds since the epoch — the same clock and the same
+    /// caveats as [`PadFrame::at_us`].
+    pub at_us: u64,
+    /// `ABS_X`, `ABS_Y`, `ABS_Z`: acceleration, including gravity. At rest on a table the axis
+    /// pointing up reads about `+accel_per_g`.
+    pub accel: [i32; 3],
+    /// `ABS_RX`, `ABS_RY`, `ABS_RZ`: angular rate about the same three axes.
+    pub gyro: [i32; 3],
 }
 
 /// One report from the pad: everything the kernel delivered between two `SYN_REPORT`s.
@@ -3220,10 +4409,59 @@ pub struct TofFrame {
     /// Microseconds since `tofd` started — the sender's monotonic clock, like
     /// [`PadFrame::at_us`].
     pub at_us: u64,
+    /// `CLOCK_MONOTONIC` when the frame was read, nanoseconds — the clock
+    /// [`RobotState::t_ns`] shares. Zero from a `tofd` predating it. (v24)
+    #[serde(default)]
+    pub t_ns: u64,
     pub rows: u8,
     pub cols: u8,
     pub distance_mm: Vec<i16>,
     pub status: Vec<u8>,
+}
+
+/// Answer to [`Call::HeadImuStream`]. Describes the head IMU rather than merely accepting, like
+/// [`TofStreamResult`]: a duck without the sensor still gets `accepted` with `sensor: None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeadImuStreamResult {
+    pub accepted: bool,
+    /// The IMU that answered, e.g. `BMI088`. `None` when there is none — see `unavailable`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensor: Option<String>,
+    /// Why there is no IMU: not fitted, bus unreadable, chip-id mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// Sample rate the reader runs at, Hz.
+    pub hz: u8,
+}
+
+/// One head-IMU sample — a [`method::HEAD_IMU_FRAME`] notification.
+///
+/// The BMI088 on the HAT, read by `tofd` (it owns that I²C bus). All values are in the IMU's own
+/// axes, which are tilted relative to the head/camera — the mount is not axis-aligned. To place a
+/// sample in the trunk/camera frame, rotate it by [`FramesState::head_imu`] (the sensor→trunk
+/// pose the kinematics compute for this tick). This is the head IMU, distinct from the body IMU
+/// that [`RobotState::imu`] carries on the motor bus. Units: rad/s, m/s², unitless quaternion.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeadImuFrame {
+    /// Samples since this `tofd` started — a consumer can see a gap it did not cause.
+    pub seq: u64,
+    /// Microseconds since `tofd` started (sender's monotonic clock, like [`TofFrame::at_us`]).
+    pub at_us: u64,
+    /// `CLOCK_MONOTONIC` when the sample was read, ns — the clock [`RobotState::t_ns`] shares.
+    pub t_ns: u64,
+    /// Angular velocity, rad/s, in the BMI088's own (tilted) sensor axes — NOT the head or
+    /// camera frame. Combine with [`FramesState::head_imu`] (the sensor→trunk pose from the
+    /// kinematics) to place it. See that field.
+    pub gyro: [f32; 3],
+    /// Specific force, m/s², BMI088 sensor axes.
+    pub accel: [f32; 3],
+    /// Madgwick orientation, scalar-first `[w, x, y, z]`, sensor→world (gravity down, yaw
+    /// arbitrary). The world here is the IMU's own; relate it to the trunk via the mount pose.
+    pub quat: [f32; 4],
+    /// Chip temperature, °C.
+    pub temp_c: f32,
 }
 
 /// See [`method::ROBOT_CHORALE`].
@@ -3714,6 +4952,46 @@ macro_rules! log_startup_identity {
     }};
 }
 
+/// The clocks every daemon stamps with, so no two of them disagree about which clock
+/// "monotonic" means. Nanoseconds. `monotonic` is `CLOCK_MONOTONIC` — what
+/// [`RobotState::t_ns`] and [`TofFrame::t_ns`] carry; `realtime` is `CLOCK_REALTIME`, the
+/// clock RTCP sender reports are stated in, read together in `media.video` so a peer can
+/// relate the two.
+pub mod clock {
+    fn read(clock: libc::clockid_t) -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec and the clock ids are the constants libc
+        // exports for this platform.
+        let rc = unsafe { libc::clock_gettime(clock, &mut ts) };
+        debug_assert_eq!(rc, 0, "clock_gettime failed");
+        (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+    }
+
+    /// `CLOCK_MONOTONIC`, nanoseconds.
+    pub fn monotonic_ns() -> u64 {
+        read(libc::CLOCK_MONOTONIC)
+    }
+
+    /// `CLOCK_REALTIME`, nanoseconds since the Unix epoch.
+    pub fn realtime_ns() -> u64 {
+        read(libc::CLOCK_REALTIME)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn monotonic_advances_and_realtime_is_this_century() {
+            let a = super::monotonic_ns();
+            let b = super::monotonic_ns();
+            assert!(b >= a);
+            assert!(super::realtime_ns() > 1_600_000_000_000_000_000);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::test_support::every_call;
@@ -3836,6 +5114,7 @@ mod tests {
                             | Call::RobotSubscribe(_)
                             | Call::PadInput
                             | Call::TofStream
+                            | Call::HeadImuStream
                     ),
                     "{} is on the Stream lane but is not a subscription",
                     call.method()
@@ -3848,7 +5127,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            46,
+            67,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -3928,7 +5207,7 @@ mod tests {
     #[test]
     fn the_wbc_toggle_has_a_stable_wire_name() {
         let call = Call::RobotDo(DoParams {
-            skill: Skill::WbcToggle,
+            skill: "wbc_toggle".into(),
         });
         let line = serde_json::to_string(&Request::call(Id::Number(1), &call)).unwrap();
         assert!(line.contains(r#""skill":"wbc_toggle""#), "{line}");
@@ -4063,6 +5342,25 @@ mod tests {
                 method::PIN,
                 // Powering the machine off is as consequential as rebooting it.
                 method::ROBOT_SHUTDOWN,
+                // Replacing the policy set is at least as consequential as bonding a pad: it
+                // decides what drives fifteen servos. `policy.check` must stay off this list —
+                // asking whether a newer gait exists is inspection, and support has to be able
+                // to ask it on a robot it may not change.
+                method::POLICY_INSTALL,
+                // Putting a stranger's network in a slot is at least as consequential as
+                // replacing the official set. `policy.check` and `policy.search` stay off this
+                // list: asking what exists is inspection, and support has to be able to ask it
+                // on a robot it may not change.
+                method::POLICY_FETCH,
+                // Replacing the detector writes fourteen megabytes to the eMMC and restarts
+                // `mediad`. `detector.check` stays off this list, like `policy.check`.
+                method::DETECTOR_INSTALL,
+                // Binding the robot to an account, and unbinding it. On this list for a reason
+                // none of the others share: it decides who can reach the robot from outside the
+                // building, and it survives every reboot. `account.status` must stay off it —
+                // which account a robot thinks it belongs to is the first thing support asks.
+                method::ACCOUNT_LOGIN,
+                method::ACCOUNT_LOGOUT,
                 method::NET_CONNECT,
                 method::NET_FORGET,
                 method::SYSTEM_SET_NAME,
@@ -4423,6 +5721,10 @@ mod tests {
     fn the_theremin_block_is_absent_until_there_is_a_theremin() {
         let mut state = RobotState {
             t: 1.5,
+            t_ns: 0,
+            imu: None,
+            frames: None,
+            skeleton: Vec::new(),
             movement: MoveState {
                 requested: [0.0; 3],
                 applied: [0.0; 3],
@@ -4480,6 +5782,10 @@ mod tests {
     fn robot_state_uses_the_documented_field_names() {
         let state = RobotState {
             t: 1.5,
+            t_ns: 0,
+            imu: None,
+            frames: None,
+            skeleton: Vec::new(),
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],

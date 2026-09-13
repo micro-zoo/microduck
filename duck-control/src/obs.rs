@@ -53,6 +53,15 @@ pub const OBS_LEN: usize = 61;
 /// Actions a policy returns — the 15 joints minus the mouth.
 pub const ACTION_LEN: usize = 14;
 
+/// These two are also a published contract, in `duck_ipc_proto` — a policy manifest declares
+/// them, and `updaterd` refuses a mismatched policy on them before it downloads 800 KB. Two
+/// copies of a number that decides whether a robot walks is exactly the drift this repository
+/// keeps writing tests about, so here is the test.
+const _: () = {
+    assert!(OBS_LEN == duck_ipc_proto::POLICY_OBS_LEN);
+    assert!(ACTION_LEN == duck_ipc_proto::POLICY_ACTION_LEN);
+};
+
 /// Joints that appear in the observation: all but the mouth.
 pub const OBS_JOINTS: usize = NUM_JOINTS - 1;
 
@@ -133,6 +142,13 @@ fn fill<const N: usize>(block: &mut [f32; N], values: [f64; N]) {
 #[derive(Debug, Clone, Copy)]
 pub struct Observation {
     data: [f32; OBS_LEN],
+}
+
+/// Replay an already assembled observation (for offline policy rehearsal).
+impl From<[f32; OBS_LEN]> for Observation {
+    fn from(data: [f32; OBS_LEN]) -> Self {
+        Self { data }
+    }
 }
 
 impl Observation {

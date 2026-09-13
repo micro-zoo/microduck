@@ -9,9 +9,20 @@
 //! the way an API only the phone app uses inevitably would. The cost is a socket hop: tens
 //! of microseconds against a 20 ms tick.
 //!
-//! ## The mapping is the prototype's
+//! ## The mapping is the prototype's, and now it is config
 //!
-//! Muscle memory carries over from `microduck_runtime`:
+//! Muscle memory carries over from `microduck_runtime`, and the five one-shot buttons are
+//! `[pad]` in `robotd.toml` — so a robot that has learned a new skill can put it on a button
+//! without a release. The defaults are exactly the mapping below, so a robot with no `[pad]`
+//! section behaves as it always has.
+//!
+//! Only those five. `Start`, the two mode toggles, held `Select` and held `D-pad up` are not
+//! `robot.do` calls, and the button that powers a robot off is the one binding worth not being
+//! able to lose to a config edit.
+//!
+//! This daemon still knows nothing about what a skill *is*. It reads which button went down,
+//! looks up the name beside it, and sends that name; `robotd` decides whether the robot has such
+//! a thing and answers with the list it does have when it does not.
 //!
 //! ```text
 //! Start        toggle the policy
@@ -20,9 +31,11 @@
 //! A (South)    ground pick
 //! LB / RB      left / right kick
 //! DPad-Down    sit ↔ stand
+//! DPad-Right tap   reboot servos on release
 //! DPad-Right, 2 s  start / stop the optional WBC skill
 //! RT / LT      mouth (either trigger; the max wins) · RT quacks · LT rides the wheee
-//! Select, 2 s  sit down, then power off
+//! Select       torque off, on release — the emergency stop
+//! Select, 2 s  sit down, torque off, then power off — the release does nothing more
 //! ```
 //!
 //! Head and body-pose mode both zero the velocity while active, as the prototype does — a
@@ -57,8 +70,9 @@
 //!
 //! One socket, read-only, for `pad.input` and nothing else — `src/tap.rs`, and it does not make this
 //! a privileged process. It exists because `padd` is the reason a stalled radio is invisible: the
-//! sticks are *polled*, so the last known value keeps being sent at 50 Hz whether or not the pad is
-//! still talking, and every surface downstream then shows a robot with a live driver. The event
+//! sticks are *polled*, so the last known value keeps being sent — at the full rate, since a stick
+//! reading anything but centre is never held back — whether or not the pad is still talking, and
+//! every surface downstream then shows a robot with a live driver. The event
 //! stream one layer below has the evidence, so it is passed out unaltered rather than summarised.
 //! `robotctl monitor` draws it; `docs/robot/pair-a-gamepad.md` says how to read it.
 //!
@@ -70,7 +84,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -99,6 +113,16 @@ mod tap {
         pub fn watch(&self, _pad: &gilrs::Gamepad<'_>) {}
 
         pub fn idle(&self) {}
+
+        pub fn imu_control(&self, _on: bool) {}
+
+        pub fn has_imu(&self) -> bool {
+            false
+        }
+
+        pub fn attitude(&self) -> Option<[f32; 4]> {
+            None
+        }
     }
 }
 
@@ -109,10 +133,23 @@ struct Args {
     #[arg(long, default_value = "/run/robotd.sock")]
     socket: PathBuf,
 
-    /// How often to send intents. Matching the control rate exactly buys nothing — the loop
-    /// reads the latest value once per tick — but staying at or above it keeps the added
-    /// latency under one tick.
-    #[arg(long, default_value_t = 50)]
+    /// Where the button bindings are read from — the same file everything else is configured in.
+    #[arg(long, default_value = robotd_params::DEFAULT_PATH)]
+    config: PathBuf,
+
+    /// How often to read the pad, 1–1000 Hz. Matching the control rate exactly buys nothing —
+    /// the loop reads the latest value once per tick — but staying at or above it keeps the
+    /// added latency under one tick.
+    ///
+    /// Not quite how often intents are *sent*: a frame identical to the last one and asking
+    /// for no motion is held back, down to [`HEARTBEAT`]. See [`Continuous`].
+    // Bounded both ways, and refused rather than clamped so the flag says what it did.
+    // Zero reaches `1.0 / 0.0` and `Duration::from_secs_f64` panics on infinity. The ceiling
+    // is the other half of the same line: a rate this loop cannot keep gives a period of 0 ns,
+    // `checked_sub` never has anything left to sleep on, and the pad spins on robotd's socket —
+    // the same busy loop `robotctl monitor` clamps for, and the range `control.hz` already
+    // rejects outside.
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..=1000))]
     hz: u32,
 
     /// Deflection below this counts as centre. Analogue sticks rarely rest at exactly zero,
@@ -157,6 +194,58 @@ const IDLE_POLL: Duration = Duration::from_millis(500);
 /// Select held this long sits the robot down and powers it off.
 const SHUTDOWN_HOLD: Duration = Duration::from_secs(2);
 
+/// The Select button, which does one of two things depending on how long it was held — and so
+/// has to wait for the release to know which.
+///
+/// A short press is the emergency stop: `robot.relax`, torque off, the robot drops. Held for
+/// [`SHUTDOWN_HOLD`] it is the shutdown sequence instead: sit down, torque off, power off. The two
+/// cannot both fire — a robot that has already gone limp cannot sit — so the stop is sent **on
+/// release**, and only if the hold never reached the shutdown. The cost is that the stop lands
+/// when the thumb comes off rather than when it goes down, which for a button somebody presses
+/// and lets go of is the same instant.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SelectButton {
+    /// When the current hold began. `None` between presses.
+    held_since: Option<Instant>,
+    /// The shutdown was sent for this hold, so its release is not a stop.
+    shutdown_sent: bool,
+}
+
+/// What Select asks for this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectAction {
+    Nothing,
+    /// Held long enough: sit, torque off, power off. Once per hold.
+    Shutdown,
+    /// Let go before that: torque off now.
+    Relax,
+}
+
+impl SelectButton {
+    /// One tick: is the button down now, and did it come up since the last tick.
+    ///
+    /// `released` is the edge from the event queue, because a press and release inside one tick
+    /// leaves `pressed` false on both sides and would otherwise be a stop nobody saw.
+    fn tick(&mut self, pressed: bool, released: bool, now: Instant) -> SelectAction {
+        if pressed {
+            let since = *self.held_since.get_or_insert(now);
+            if now.duration_since(since) >= SHUTDOWN_HOLD && !self.shutdown_sent {
+                self.shutdown_sent = true;
+                return SelectAction::Shutdown;
+            }
+            return SelectAction::Nothing;
+        }
+        let was_shutdown = self.shutdown_sent;
+        self.held_since = None;
+        self.shutdown_sent = false;
+        if released && !was_shutdown {
+            return SelectAction::Relax;
+        }
+        // A release after the shutdown, or a tick with nothing to say.
+        SelectAction::Nothing
+    }
+}
+
 /// D-pad up held this long switches drive mode, walk ⇄ roller.
 ///
 /// Three seconds, longer than the shutdown hold, and the prototype's number. D-pad up is a
@@ -166,6 +255,40 @@ const MODE_HOLD: Duration = Duration::from_secs(3);
 
 /// D-pad right held this long asks `robotd` to toggle the optional WBC skill.
 const WBC_HOLD: Duration = Duration::from_secs(2);
+
+// Right press is ambiguous until release or the WBC hold threshold. Never reboot
+// on press: that would power down the robot before the same hold requested WBC.
+#[derive(Debug, Default)]
+struct RightButton {
+    held_since: Option<Instant>,
+    wbc_sent: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+enum RightAction {
+    Nothing,
+    Reboot,
+    Wbc,
+}
+impl RightButton {
+    fn tick(&mut self, pressed: bool, released: bool, now: Instant) -> RightAction {
+        if pressed {
+            let since = *self.held_since.get_or_insert(now);
+            if now.duration_since(since) >= WBC_HOLD && !self.wbc_sent {
+                self.wbc_sent = true;
+                return RightAction::Wbc;
+            }
+            return RightAction::Nothing;
+        }
+        let was_wbc = self.wbc_sent;
+        self.held_since = None;
+        self.wbc_sent = false;
+        if released && !was_wbc {
+            RightAction::Reboot
+        } else {
+            RightAction::Nothing
+        }
+    }
+}
 
 /// Body-pose stick ranges, from the training env via the prototype: z is asymmetric
 /// (little headroom up at the standing height, more crouch down), angles capped at ~15°.
@@ -187,6 +310,100 @@ enum Mode {
     Drive,
     Head,
     BodyPose,
+}
+
+/// How often to look for a rewritten config. See the loop.
+const BINDINGS_POLL: Duration = Duration::from_secs(1);
+
+/// The button bindings and the IMU head switch, or the defaults.
+///
+/// A file that will not parse is never a reason to leave somebody without a pad: the defaults
+/// are a working robot, and the reason is logged. That matters more here than elsewhere because
+/// this is re-read while running — a half-saved file caught mid-write must not take the buttons
+/// away, and the next read a second later gets the finished one.
+fn read_bindings(
+    path: &Path,
+) -> (
+    robotd_params::PadParams,
+    robotd_params::PadImuHeadControlParams,
+) {
+    match robotd_params::Params::load(path, false) {
+        Ok(params) => {
+            let pad = params.pad;
+            let imu_head = params.pad_imu_head_control;
+            tracing::info!(
+                a = %pad.a, x = %pad.x, lb = %pad.lb, rb = %pad.rb,
+                dpad_down = %pad.dpad_down,
+                pad_imu_head_control = imu_head.enabled, pad_imu_head_gain = imu_head.gain,
+                "button bindings"
+            );
+            (pad, imu_head)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "cannot read the button bindings; using the default mapping"
+            );
+            (
+                robotd_params::PadParams::default(),
+                robotd_params::PadImuHeadControlParams::default(),
+            )
+        }
+    }
+}
+
+/// Where the pad's IMU stands in relation to the head. See `[pad_imu_head_control]` in `robotd-params`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PadImuHead {
+    /// Y means what it always did.
+    Off,
+    /// The head follows the pad's attitude relative to `reference`, the attitude at the press
+    /// that started this. The sticks keep driving.
+    Following { reference: [f32; 4] },
+    /// The head stays where the last pose left it; nothing is sent for it. The sticks drive.
+    Holding,
+}
+
+impl PadImuHead {
+    /// Y was pressed with an IMU pad and the feature on. Off or holding → follow **from here**,
+    /// which is what beats the gyro's yaw drift: every re-entry makes the pad's current attitude
+    /// the new centre. Following → hold.
+    fn on_y(self, attitude: [f32; 4]) -> Self {
+        match self {
+            Self::Off | Self::Holding => Self::Following {
+                reference: attitude,
+            },
+            Self::Following { .. } => Self::Holding,
+        }
+    }
+}
+
+/// The head pose for a pad attitude relative to its reference.
+///
+/// `relative` is body → world of the pad now, in the frame of the reference — [`pad_imu::relative`].
+/// Its pitch, roll and yaw become the head's, scaled by `gain` and clamped to `max_head`. The signs
+/// are the ones that made the head copy the pad on the robot (2026-09-09): pad nose-up is a
+/// positive `head_pitch`, pad yaw to the left a positive `head_yaw`, and the pad rolling right
+/// (left side up) a negative `head_roll`. Pitch and roll came out opposite to the stick mapping's
+/// guess, which is worth knowing: the sticks' signs describe "stick up looks up", not the joint
+/// axes, and the pad frame is the joints'. The neck stays at zero: one pitch joint is enough to
+/// follow a wrist.
+fn head_from_pad(relative: [f32; 4], gain: f64, max_head: f64) -> proto::HeadParams {
+    let [pitch, roll, yaw] = pad_imu::euler_deg(relative);
+    let angle = |degrees: f32| (f64::from(degrees).to_radians() * gain).clamp(-max_head, max_head);
+    proto::HeadParams {
+        neck_pitch: 0.0,
+        head_pitch: angle(pitch),
+        head_yaw: angle(yaw),
+        head_roll: -angle(roll),
+    }
+}
+
+/// When the config was last written, for spotting a change. `None` for a file that is not there,
+/// which is a real state and compares equal to itself.
+fn config_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 fn main() -> std::process::ExitCode {
@@ -250,54 +467,103 @@ fn main() -> std::process::ExitCode {
         socket = %args.socket.display(),
         hz = args.hz,
         roller,
-        "driving — Start toggles the policy, Y head mode, B body pose, A ground pick, \
-         LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Up (3s) walk/roller, \
-         DPad-Right (2s) WBC, Select (2s) shutdown"
+        "driving — Start once stands up, Start again toggles the policy, Y head mode, B body pose, \
+         A ground pick, LB/RB kicks, DPad-Down sit, triggers mouth, DPad-Right release reboots / hold 2s WBC, \
+         DPad-Up (3s) walk/roller, Select (release) torque off, Select (2s) sit and shutdown"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
+    // The button bindings, read once like every other daemon reads its config. A file that will
+    // not parse is not a reason to leave somebody without a pad: the mapping the prototype had is
+    // the fallback, and the reason is logged.
+    let (mut bindings, mut imu_head_cfg) = read_bindings(&args.config);
+    // When the file was last written, so a change is picked up without a restart. `padd` holds
+    // no motor control and no session state — the whole of it is this table — so re-reading is a
+    // swap between two ticks rather than anything to sequence.
+    let mut bindings_at = config_mtime(&args.config);
+    let mut bindings_checked = Instant::now();
+
     let mut mode = Mode::Drive;
+    // IMU head control, when `[pad_imu_head_control]` is on and the pad has one. Off whenever the pad is
+    // gone: a reference taken against one pad means nothing to the next.
+    let mut imu_head = PadImuHead::Off;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
-    let mut select_held_since: Option<Instant> = None;
+    let mut select = SelectButton::default();
+    let mut right = RightButton::default();
     let mut dpad_up_held_since: Option<Instant> = None;
-    let mut dpad_right_held_since: Option<Instant> = None;
     let mut mode_switch_sent = false;
-    let mut wbc_switch_sent = false;
-    let mut shutdown_sent = false;
     // Trigger levels last tick, for the sound edges: RT quacks on its rising edge, LT
     // starts the wheee ride. The prototype's threshold.
     let mut prev_rt = 0.0f64;
     let mut prev_lt = 0.0f64;
+    // Does this pad think the robot is up (torque on, at the home pose)? When not, Start sends
+    // `robot.init` (stand up and hold) instead of enabling the policy; the next Start enables it.
+    // Starts false: padd starts with the robot, and a robotd restart restarts padd too.
+    let mut up = false;
+    // The continuous intents, and the buffer this tick's are built in. Both live across
+    // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
+    let mut continuous = Continuous::default();
+    let mut frame: Vec<proto::Call> = Vec::with_capacity(2);
 
     loop {
         let tick = Instant::now();
+
+        // Once a second, not every tick: a `stat` at 50 Hz to catch a file somebody edits by
+        // hand a few times a week is work for nothing, and a second is faster than typing the
+        // next command.
+        if tick.duration_since(bindings_checked) >= BINDINGS_POLL {
+            bindings_checked = tick;
+            let now = config_mtime(&args.config);
+            if now != bindings_at {
+                bindings_at = now;
+                (bindings, imu_head_cfg) = read_bindings(&args.config);
+                tracing::warn!("button bindings reloaded");
+            }
+        }
 
         // Drain the queue so axis polling below sees present state, and catch button
         // *edges* — a held Start must toggle once, not fifty times a second.
         let mut toggle_enable = false;
         let mut toggle_head = false;
         let mut toggle_body = false;
-        let mut ground_pick = false;
-        let mut kick_left = false;
-        let mut kick_right = false;
-        let mut sit_toggle = false;
-        let mut roulade = false;
+        // Which bindable buttons went down this tick, by their config name. A list rather than
+        // a flag apiece, because what each one runs is config now and this loop no longer knows.
+        let mut pressed: Vec<&'static str> = Vec::new();
+        let mut relax = false;
+        let mut select_released = false;
+        let mut reboot_motors = false;
+        let mut right_released = false;
         while let Some(event) = gilrs.next_event() {
+            // Select is the one button read on its release: a short press stops, a long hold shuts
+            // down, and which it was is only known when the thumb comes off.
+            if let gilrs::EventType::ButtonReleased(Button::Select, _) = event.event {
+                select_released = true;
+            }
+            if let gilrs::EventType::ButtonReleased(Button::DPadRight, _) = event.event {
+                right_released = true;
+            }
             if let gilrs::EventType::ButtonPressed(button, _) = event.event {
                 match button {
                     Button::Start => toggle_enable = true,
                     Button::North => toggle_head = true,
                     Button::East => toggle_body = true,
-                    Button::South => ground_pick = true,
-                    // X on an Xbox pad. Press = one roulade; holding it chains rolls,
-                    // which the resend below carries.
-                    Button::West => roulade = true,
-                    // gilrs names the bumpers `LeftTrigger`/`RightTrigger`; the analog
-                    // triggers are `LeftTrigger2`/`RightTrigger2`.
-                    Button::LeftTrigger => kick_left = true,
-                    Button::RightTrigger => kick_right = true,
-                    Button::DPadDown => sit_toggle = true,
+                    // The five bindable ones. What each runs is `[pad]` in the config; this
+                    // only knows which physical control was pressed.
+                    //
+                    // gilrs names the *bumpers* `LeftTrigger`/`RightTrigger`; the analog
+                    // triggers are `LeftTrigger2`/`RightTrigger2`. Getting that backwards binds
+                    // a skill to a control nobody presses.
+                    Button::South => pressed.push("a"),
+                    Button::West => pressed.push("x"),
+                    Button::LeftTrigger => pressed.push("lb"),
+                    Button::RightTrigger => pressed.push("rb"),
+                    Button::DPadDown => pressed.push("dpad_down"),
+                    // Select is handled on release — see `SelectButton`.
+                    Button::Select => {}
+                    // Reboot the servos: the way back from a tripped overload without pulling
+                    // the battery.
+                    Button::DPadRight => {}
                     _ => {}
                 }
             }
@@ -315,8 +581,8 @@ fn main() -> std::process::ExitCode {
                 tracing::warn!("pad gone — sending nothing; robotd's deadman holds the robot");
                 driving = false;
             }
-            dpad_right_held_since = None;
-            wbc_switch_sent = false;
+            right = RightButton::default();
+            imu_head = PadImuHead::Off;
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
             }
@@ -334,15 +600,60 @@ fn main() -> std::process::ExitCode {
         // enough that a tap following the old one would report the rest of the session as silence.
         if let Some(tap) = tap.as_ref() {
             tap.watch(&pad);
+            // Every tick, like the bindings: switching the feature on in the config has to start
+            // the IMU reader without a restart, and off has to let it go.
+            tap.imu_control(imu_head_cfg.enabled);
+        }
+
+        // The pad's attitude this tick, when the feature is on and the pad has an IMU that has
+        // said something believable. `None` is every other case, and Y then means the sticks.
+        let attitude = if imu_head_cfg.enabled {
+            tap.as_ref().and_then(|tap| tap.attitude())
+        } else {
+            None
+        };
+        if attitude.is_none() && imu_head != PadImuHead::Off {
+            // The feature went off, or the IMU went away under us. Not silent: a head that stops
+            // following mid-turn wants a line in the journal saying why.
+            tracing::info!("IMU head control off — no attitude to follow");
+            imu_head = PadImuHead::Off;
         }
 
         if toggle_head {
-            mode = if mode == Mode::Head {
-                Mode::Drive
-            } else {
-                Mode::Head
-            };
-            tracing::info!(?mode, "mode");
+            match attitude {
+                Some(attitude) => {
+                    // Y is the IMU's. The sticks never pose the head while this is possible: two
+                    // sources for one joint set is a head that shakes.
+                    if mode == Mode::Head {
+                        mode = Mode::Drive;
+                    }
+                    imu_head = imu_head.on_y(attitude);
+                    match imu_head {
+                        PadImuHead::Following { .. } => tracing::info!(
+                            "IMU head control: following the pad from here — sticks keep driving"
+                        ),
+                        PadImuHead::Holding => {
+                            tracing::info!("IMU head control: holding the head where it is")
+                        }
+                        PadImuHead::Off => {}
+                    }
+                }
+                None => {
+                    if imu_head_cfg.enabled && tap.as_ref().is_some_and(|tap| tap.has_imu()) {
+                        // The IMU is there and has not spoken yet — a second after connecting,
+                        // typically. Saying so beats silently doing the other thing.
+                        tracing::warn!(
+                            "the pad's IMU has no attitude yet; Y is stick head mode this once"
+                        );
+                    }
+                    mode = if mode == Mode::Head {
+                        Mode::Drive
+                    } else {
+                        Mode::Head
+                    };
+                    tracing::info!(?mode, "mode");
+                }
+            }
         }
         if toggle_body {
             let leaving = mode == Mode::BodyPose;
@@ -363,7 +674,16 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        if toggle_enable {
+        if toggle_enable && !up {
+            tracing::warn!("Start — robot.init: standing up. Press Start again to drive");
+            match request(&mut stream, &mut next_id, &proto::Call::RobotInit) {
+                Err(e) => {
+                    tracing::error!(error = %e, "init failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                Ok(_) => up = true,
+            }
+        } else if toggle_enable {
             // The robot owns the toggle. A local on/off belief here drifts from the
             // robot's the moment anything else moves it — robot.relax, the shutdown
             // sequence, either side restarting — and a stale belief turns Start into a
@@ -391,50 +711,44 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        let wbc_toggle = if pad.is_pressed(Button::DPadRight) {
-            let held = dpad_right_held_since.get_or_insert(tick);
-            if tick.duration_since(*held) >= WBC_HOLD && !wbc_switch_sent {
-                wbc_switch_sent = true;
-                tracing::warn!("DPad-Right held — asking the robot to toggle WBC");
-                true
-            } else {
-                false
+        // One-shot skills. Answered, because "refused, and here is why" is a real outcome — a
+        // skill this robot does not have, one mid-flight, or the policy not driving.
+        //
+        // The name comes from config and is sent as it was written. `padd` does not check it
+        // against anything: which skills exist is the robot's to know, and it answers an unknown
+        // one with the list it does have, which is a better error than this side could give.
+        for button in &pressed {
+            // An empty binding is a button switched off on purpose, not a fault.
+            let skill = bindings.skill(button).unwrap_or_default();
+            if skill.is_empty() {
+                tracing::debug!(button, "no skill bound");
+                continue;
             }
-        } else {
-            dpad_right_held_since = None;
-            wbc_switch_sent = false;
-            false
-        };
-
-        // One-shot skills. Answered, because "refused, and here is why" is a real outcome —
-        // there may be no kick policy on this robot, or another move mid-flight.
-        for (fired, skill) in [
-            (wbc_toggle, proto::Skill::WbcToggle),
-            (ground_pick, proto::Skill::GroundPick),
-            (kick_left, proto::Skill::KickLeft),
-            (kick_right, proto::Skill::KickRight),
-            (sit_toggle, proto::Skill::SitToggle),
-            (roulade, proto::Skill::Roulade),
-        ] {
-            if fired {
-                let call = proto::Call::RobotDo(proto::DoParams { skill });
-                if let Err(e) = request(&mut stream, &mut next_id, &call) {
-                    tracing::error!(error = %e, "skill request failed");
-                    return std::process::ExitCode::FAILURE;
-                }
+            let call = proto::Call::RobotDo(proto::DoParams {
+                skill: skill.to_owned(),
+            });
+            if let Err(e) = request(&mut stream, &mut next_id, &call) {
+                tracing::error!(error = %e, "skill request failed");
+                return std::process::ExitCode::FAILURE;
             }
         }
 
-        // X held: keep the roulade chain alive. The robot chains another roll when a
-        // request lands near the end of the current one, so "held" is spelled "resent every
-        // tick" — as a notification, because fifty answered requests a second would spend
-        // their time waiting on replies, and the press above already got the real answer.
+        // X held: keep a chaining skill going. The robot starts another when a request lands
+        // near the end of the current one, so "held" is spelled "resent every tick" — as a
+        // notification, because fifty answered requests a second would spend their time waiting
+        // on replies, and the press above already got the real answer.
+        //
+        // Whatever X is bound to, not the word "roulade": a skill that does not chain simply
+        // refuses the resend, which costs a notification nobody reads. Only X, because it is the
+        // button the prototype held and the only one anybody holds.
+        let held = bindings.skill("x").unwrap_or_default();
         if pad.is_pressed(Button::West)
-            && !roulade
+            && !pressed.contains(&"x")
+            && !held.is_empty()
             && let Err(e) = notify(
                 &mut stream,
                 &proto::Call::RobotDo(proto::DoParams {
-                    skill: proto::Skill::Roulade,
+                    skill: held.to_owned(),
                 }),
             )
         {
@@ -442,21 +756,58 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
 
-        // Select held two seconds: sit down, then power off. Sent once per hold — the
-        // robot owns the sequence from there, and a second request would be a no-op anyway.
-        if pad.is_pressed(Button::Select) {
-            let held = select_held_since.get_or_insert(tick);
-            if tick.duration_since(*held) >= SHUTDOWN_HOLD && !shutdown_sent {
-                shutdown_sent = true;
-                tracing::warn!("Select held — asking the robot to sit and power off");
+        // Select: a short press is the emergency stop, on release; held two seconds it is the
+        // shutdown sequence — sit down, torque off, power off — sent once per hold, and the
+        // release after it does nothing. The robot owns the sequence from there.
+        match select.tick(pad.is_pressed(Button::Select), select_released, tick) {
+            SelectAction::Nothing => {}
+            SelectAction::Relax => relax = true,
+            SelectAction::Shutdown => {
+                up = false;
+                tracing::warn!("Select held — asking the robot to sit, torque off and power off");
                 if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotShutdown) {
                     tracing::error!(error = %e, "shutdown request failed");
                     return std::process::ExitCode::FAILURE;
                 }
             }
-        } else {
-            select_held_since = None;
-            shutdown_sent = false;
+        }
+
+        if relax {
+            tracing::warn!("Select released — robot.relax: torque off");
+            // Torque off leaves the robot limp, so the next Start stands it up again rather
+            // than toggling the policy on a robot that is lying on the floor.
+            up = false;
+            if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotRelax) {
+                tracing::error!(error = %e, "relax request failed");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+
+        match right.tick(pad.is_pressed(Button::DPadRight), right_released, tick) {
+            RightAction::Nothing => {}
+            RightAction::Reboot => reboot_motors = true,
+            RightAction::Wbc => {
+                let call = proto::Call::RobotDo(proto::DoParams {
+                    skill: "wbc_toggle".into(),
+                });
+                if let Err(e) = request(&mut stream, &mut next_id, &call) {
+                    tracing::error!(error = %e, "WBC request failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+        if reboot_motors {
+            tracing::warn!(
+                "DPad-Right — asking the robot to reboot its servos (robot.rebootMotors)"
+            );
+            // The reboot leaves the robot limp, so the next Start has to stand it up again
+            // rather than toggle the policy on a robot that is lying down.
+            up = false;
+            let call = proto::Call::RobotRebootMotors(proto::RebootMotorsParams::default());
+            if let Err(e) = request(&mut stream, &mut next_id, &call) {
+                tracing::error!(error = %e, "reboot request failed");
+                return std::process::ExitCode::FAILURE;
+            }
         }
 
         // D-pad up held three seconds: switch drive mode, which is what somebody who has just
@@ -558,8 +909,12 @@ fn main() -> std::process::ExitCode {
             }
         }
 
-        let call = match mode {
-            Mode::Drive if roller => proto::Call::RobotMove(proto::MoveParams {
+        // This tick's continuous intents, as one frame. Reused rather than built fresh:
+        // a `Vec` per tick is an allocation fifty times a second to say what the sticks
+        // were doing, which is the shape of thing this loop is meant not to do.
+        frame.clear();
+        match mode {
+            Mode::Drive if roller => frame.push(proto::Call::RobotMove(proto::MoveParams {
                 // The prototype's roller shaping: push harder than you can brake, no
                 // strafe, heading capped independently of the walking limits.
                 vx: left_y
@@ -570,8 +925,8 @@ fn main() -> std::process::ExitCode {
                     },
                 vy: 0.0,
                 vyaw: -right_x * ROLLER_YAW,
-            }),
-            Mode::Drive => proto::Call::RobotMove(proto::MoveParams {
+            })),
+            Mode::Drive => frame.push(proto::Call::RobotMove(proto::MoveParams {
                 vx: left_y
                     * if left_y >= 0.0 {
                         args.max_linear
@@ -582,38 +937,30 @@ fn main() -> std::process::ExitCode {
                 // gilrs normalises.
                 vy: -left_x * args.max_linear,
                 vyaw: -right_x * args.max_angular,
-            }),
+            })),
             Mode::Head => {
                 // The body must not keep its last velocity while the sticks are posing the
                 // head. The deadman would catch it eventually; a robot that keeps walking
                 // because you started moving its head is a bad enough surprise to be
                 // explicit about.
-                if let Err(e) = notify(
-                    &mut stream,
-                    &proto::Call::RobotMove(proto::MoveParams::default()),
-                ) {
-                    tracing::error!(error = %e, "send failed");
-                    return std::process::ExitCode::FAILURE;
-                }
+                //
+                // In the same frame as the head rather than a notification of its own: the
+                // two describe one instant, and sending them separately was two `write_all`
+                // and two `flush` syscalls a tick to say so.
+                frame.push(proto::Call::RobotMove(proto::MoveParams::default()));
                 // The prototype's alpha mapping, signs included (its head_pitch/head_yaw
                 // joint axes are inverted relative to stick direction — verified on
                 // hardware there, kept verbatim here).
-                proto::Call::RobotHead(proto::HeadParams {
+                frame.push(proto::Call::RobotHead(proto::HeadParams {
                     neck_pitch: right_y * args.max_head,
                     head_pitch: -left_y * args.max_head,
                     head_yaw: -left_x * args.max_head,
                     head_roll: right_x * args.max_head,
-                })
+                }));
             }
             Mode::BodyPose => {
-                if let Err(e) = notify(
-                    &mut stream,
-                    &proto::Call::RobotMove(proto::MoveParams::default()),
-                ) {
-                    tracing::error!(error = %e, "send failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-                proto::Call::RobotPose(proto::PoseParams {
+                frame.push(proto::Call::RobotMove(proto::MoveParams::default()));
+                frame.push(proto::Call::RobotPose(proto::PoseParams {
                     z: left_y
                         * if left_y >= 0.0 {
                             BODY_MAX_Z_UP
@@ -623,11 +970,24 @@ fn main() -> std::process::ExitCode {
                     pitch: right_y * BODY_MAX_ANGLE,
                     roll: right_x * BODY_MAX_ANGLE,
                     active: true,
-                })
+                }));
             }
-        };
+        }
 
-        if let Err(e) = notify(&mut stream, &call) {
+        // IMU head control rides in the same frame as the drive: the pad's tilt and the sticks
+        // describe one instant. Only while driving — body-pose mode owns the whole robot for as
+        // long as it lasts, and stick head mode cannot coexist with this (see the Y handling).
+        if mode == Mode::Drive
+            && let (PadImuHead::Following { reference }, Some(now)) = (imu_head, attitude)
+        {
+            frame.push(proto::Call::RobotHead(head_from_pad(
+                pad_imu::relative(reference, now),
+                imu_head_cfg.gain,
+                args.max_head,
+            )));
+        }
+
+        if let Err(e) = continuous.send(&mut stream, &frame, tick) {
             tracing::error!(error = %e, "send failed");
             return std::process::ExitCode::FAILURE;
         }
@@ -644,6 +1004,85 @@ fn notify(stream: &mut UnixStream, call: &proto::Call) -> std::io::Result<()> {
     line.push(b'\n');
     stream.write_all(&line)?;
     stream.flush()
+}
+
+/// How long an unchanged frame may go unsent while the robot is being asked to stand still.
+///
+/// The sticks are *polled*, so an untouched pad re-sent the same three zeros fifty times a
+/// second — a `serde_json` encode, a `write_all`, a `flush`, and a `serde_json` parse on
+/// `robotd`'s side, a hundred messages a second in the modes that send two, to say nothing
+/// changed. Ten a second says it as well.
+///
+/// **Nothing about the robot's safety rests on this number**, which is why it can be picked
+/// for legibility rather than argued against `[safety] deadman_ms` — a value this daemon
+/// cannot read and does not know. A frame is only ever held back when it is byte-identical
+/// to the last one sent *and* asks for no motion ([`Continuous::may_hold`]); a stick that is
+/// doing anything goes out on every tick as it always did. What the heartbeat buys is the
+/// report: without it `robotd`'s twist would age past the deadman while a pad sat connected
+/// and idle, and `robot.state` would carry `limited_by: ["deadman"]` for a robot that is
+/// stationary because it was asked to be.
+const HEARTBEAT: Duration = Duration::from_millis(100);
+
+/// The continuous intents, encoded once a tick and sent when they say something new.
+#[derive(Default)]
+struct Continuous {
+    /// This tick's frame. Kept across ticks so the encode reuses its buffer.
+    line: Vec<u8>,
+    /// The bytes last put on the socket, to compare this tick's against.
+    last: Vec<u8>,
+    /// When that was. `None` until the first send, which therefore always happens.
+    at: Option<Instant>,
+}
+
+impl Continuous {
+    /// Put this tick's intents on the socket, unless they are the ones already there.
+    ///
+    /// One write for the whole frame: the calls describe a single instant, and a peer that
+    /// read half of one would be acting on a head pose without the velocity that came with
+    /// it. `robotd` splits the buffer back into lines on its own read.
+    fn send(
+        &mut self,
+        stream: &mut UnixStream,
+        calls: &[proto::Call],
+        now: Instant,
+    ) -> std::io::Result<()> {
+        self.line.clear();
+        for call in calls {
+            serde_json::to_writer(&mut self.line, &proto::Request::notify(call))?;
+            self.line.push(b'\n');
+        }
+
+        if self.line == self.last && self.may_hold(calls, now) {
+            return Ok(());
+        }
+
+        stream.write_all(&self.line)?;
+        stream.flush()?;
+        // Swapped rather than cloned: the buffer this displaces becomes next tick's
+        // scratch, so a steady state allocates nothing at all.
+        std::mem::swap(&mut self.last, &mut self.line);
+        self.at = Some(now);
+        Ok(())
+    }
+
+    /// Whether an unchanged frame may be left unsent this tick.
+    ///
+    /// Only while it asks for no velocity. The deadman zeroes the twist and nothing else, so
+    /// on a frame that already commands zero, letting it fire changes nothing about what the
+    /// robot does — and on a frame that commands motion it would stop a robot whose stick is
+    /// still held. That is the whole of the argument, and it holds whatever `deadman_ms` is
+    /// set to.
+    ///
+    /// A held stick therefore keeps sending at the full rate. That is the case where the
+    /// robot is walking and the daemon has something to say; this is about the one where it
+    /// is not and does not.
+    fn may_hold(&self, calls: &[proto::Call], now: Instant) -> bool {
+        let asks_for_motion = calls.iter().any(|call| match call {
+            proto::Call::RobotMove(p) => p.vx != 0.0 || p.vy != 0.0 || p.vyaw != 0.0,
+            _ => false,
+        });
+        !asks_for_motion && self.at.is_some_and(|at| now.duration_since(at) < HEARTBEAT)
+    }
 }
 
 /// Send a discrete intent and read its answer.
@@ -683,5 +1122,345 @@ fn request(
             tracing::warn!(error = %e, raw = %answer.trim(), "unparsable answer");
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// A socket pair standing in for `robotd`, and what came out of it.
+    ///
+    /// Non-blocking on the reading end so a test can assert that *nothing* was sent, which
+    /// is the assertion most of these are making.
+    fn socket() -> (UnixStream, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().expect("a socket pair");
+        theirs.set_nonblocking(true).expect("non-blocking");
+        (ours, theirs)
+    }
+
+    fn drain(stream: &mut UnixStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = stream.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8(buffer).expect("utf-8")
+    }
+
+    fn moving() -> Vec<proto::Call> {
+        vec![proto::Call::RobotMove(proto::MoveParams {
+            vx: 0.2,
+            vy: 0.0,
+            vyaw: 0.0,
+        })]
+    }
+
+    fn still() -> Vec<proto::Call> {
+        vec![proto::Call::RobotMove(proto::MoveParams::default())]
+    }
+
+    /// The sticks are polled, so an untouched pad produces the same frame fifty times a
+    /// second. Sending it fifty times is what this stops.
+    #[test]
+    fn an_unchanged_stationary_frame_is_not_resent() {
+        let (mut ours, mut theirs) = socket();
+        let mut continuous = Continuous::default();
+        let at = Instant::now();
+
+        continuous.send(&mut ours, &still(), at).expect("first");
+        let first = drain(&mut theirs);
+        assert!(first.contains("robot.move"), "the first frame must go out");
+
+        for tick in 1..5 {
+            let now = at + Duration::from_millis(20 * tick);
+            continuous.send(&mut ours, &still(), now).expect("held");
+        }
+        assert_eq!(drain(&mut theirs), "", "an idle pad must say nothing");
+    }
+
+    /// **The safety property, and the reason the heartbeat needs no argument about
+    /// `deadman_ms`.** A stick that is asking the robot to walk is re-sent every tick
+    /// whatever the clock says, because a deadman that fires on a held stick stops a robot
+    /// somebody is driving.
+    #[test]
+    fn a_frame_that_asks_for_motion_is_always_sent() {
+        let (mut ours, mut theirs) = socket();
+        let mut continuous = Continuous::default();
+        let at = Instant::now();
+
+        continuous.send(&mut ours, &moving(), at).expect("first");
+        drain(&mut theirs);
+
+        // The same bytes, one tick later — well inside the heartbeat.
+        continuous
+            .send(&mut ours, &moving(), at + Duration::from_millis(20))
+            .expect("second");
+        assert!(
+            drain(&mut theirs).contains("robot.move"),
+            "a held stick must keep being sent"
+        );
+    }
+
+    /// The heartbeat is what keeps `robotd` from reporting a deadman on a robot that is
+    /// standing still because it was asked to.
+    #[test]
+    fn a_stationary_frame_goes_out_again_on_the_heartbeat() {
+        let (mut ours, mut theirs) = socket();
+        let mut continuous = Continuous::default();
+        let at = Instant::now();
+
+        continuous.send(&mut ours, &still(), at).expect("first");
+        drain(&mut theirs);
+
+        continuous
+            .send(
+                &mut ours,
+                &still(),
+                at + HEARTBEAT - Duration::from_millis(1),
+            )
+            .expect("held");
+        assert_eq!(drain(&mut theirs), "", "not due yet");
+
+        continuous
+            .send(&mut ours, &still(), at + HEARTBEAT)
+            .expect("heartbeat");
+        assert!(drain(&mut theirs).contains("robot.move"), "due");
+    }
+
+    /// A stick that moves is heard on the tick it moved, not on the next heartbeat.
+    #[test]
+    fn a_changed_frame_is_sent_at_once() {
+        let (mut ours, mut theirs) = socket();
+        let mut continuous = Continuous::default();
+        let at = Instant::now();
+
+        continuous.send(&mut ours, &still(), at).expect("first");
+        drain(&mut theirs);
+
+        continuous
+            .send(&mut ours, &moving(), at + Duration::from_millis(20))
+            .expect("changed");
+        assert!(
+            drain(&mut theirs).contains("robot.move"),
+            "a stick that moved must not wait for a heartbeat"
+        );
+    }
+
+    /// Head mode's two intents describe one instant and go out in one write. Split across
+    /// two, a reader could act on a head pose without the velocity that came with it.
+    #[test]
+    fn a_two_call_frame_is_one_write_and_two_lines() {
+        let (mut ours, mut theirs) = socket();
+        let mut continuous = Continuous::default();
+        let calls = vec![
+            proto::Call::RobotMove(proto::MoveParams::default()),
+            proto::Call::RobotHead(proto::HeadParams {
+                neck_pitch: 0.1,
+                head_pitch: 0.0,
+                head_yaw: 0.0,
+                head_roll: 0.0,
+            }),
+        ];
+
+        continuous
+            .send(&mut ours, &calls, Instant::now())
+            .expect("sent");
+
+        let sent = drain(&mut theirs);
+        let lines: Vec<&str> = sent.lines().collect();
+        assert_eq!(lines.len(), 2, "two intents, two lines: {sent:?}");
+        assert!(lines[0].contains("robot.move"));
+        assert!(lines[1].contains("robot.head"));
+        assert!(sent.ends_with('\n'), "every line must be terminated");
+    }
+
+    /// A head frame carries a zero velocity, so an untouched pad in head mode holds too —
+    /// which is the mode that was sending a hundred messages a second.
+    #[test]
+    fn an_untouched_pad_in_head_mode_holds_both_intents() {
+        let (mut ours, mut theirs) = socket();
+        let mut continuous = Continuous::default();
+        let at = Instant::now();
+        let calls = vec![
+            proto::Call::RobotMove(proto::MoveParams::default()),
+            proto::Call::RobotHead(proto::HeadParams::default()),
+        ];
+
+        continuous.send(&mut ours, &calls, at).expect("first");
+        drain(&mut theirs);
+
+        continuous
+            .send(&mut ours, &calls, at + Duration::from_millis(20))
+            .expect("held");
+        assert_eq!(drain(&mut theirs), "");
+    }
+
+    /// The bug this catches: `--hz 0` used to reach `Duration::from_secs_f64(1.0 / 0.0)`, and
+    /// that panics on infinity rather than giving a very long period. So a typo killed the
+    /// daemon at startup with a panic instead of saying which flag was wrong.
+    ///
+    /// The ceiling is the same line's other half, and the worse failure of the two: a period
+    /// that rounds to 0 ns leaves `checked_sub` nothing to sleep on, so the loop stops being
+    /// paced and spins on robotd's socket. A panic is at least loud.
+    #[test]
+    fn a_rate_this_loop_cannot_run_at_is_refused_rather_than_divided_by() {
+        assert!(Args::try_parse_from(["padd", "--hz", "0"]).is_err());
+        assert!(Args::try_parse_from(["padd", "--hz", "1"]).is_ok());
+        assert!(Args::try_parse_from(["padd", "--hz", "1000"]).is_ok());
+        assert!(Args::try_parse_from(["padd", "--hz", "1001"]).is_err());
+        assert!(
+            Args::try_parse_from(["padd", "--hz", "4294967295"]).is_err(),
+            "the top of a u32 is a 0 ns period, which is a spin loop"
+        );
+        assert!(
+            Args::try_parse_from(["padd"]).is_ok(),
+            "the default still parses"
+        );
+    }
+
+    /// Y, with an IMU pad: the first press follows from where the pad is, the second holds, the
+    /// third follows again **from where the pad is now** — the new reference is what beats the
+    /// gyro's yaw drift, so a re-entry after a minute of drift starts the head at centre.
+    #[test]
+    fn y_cycles_follow_hold_follow_and_re_centres_each_time() {
+        let level = [1.0, 0.0, 0.0, 0.0];
+        // Yawed 30° by the time of the third press — drift, or a turn; the pad cannot tell.
+        let yawed = [
+            (15.0f32.to_radians()).cos(),
+            0.0,
+            0.0,
+            (15.0f32.to_radians()).sin(),
+        ];
+
+        let following = PadImuHead::Off.on_y(level);
+        assert_eq!(following, PadImuHead::Following { reference: level });
+        let holding = following.on_y(yawed);
+        assert_eq!(
+            holding,
+            PadImuHead::Holding,
+            "the second press holds, whatever the pad did"
+        );
+        let again = holding.on_y(yawed);
+        assert_eq!(
+            again,
+            PadImuHead::Following { reference: yawed },
+            "the third follows from the pad's attitude now, not the first one"
+        );
+        // And that reference reads as centre.
+        let head = head_from_pad(pad_imu::relative(yawed, yawed), 1.0, 2.5);
+        assert!(
+            head.head_yaw.abs() < 1e-4 && head.head_pitch.abs() < 1e-4,
+            "{head:?}"
+        );
+    }
+
+    /// The pad's tilt becomes the head's pose with the signs verified on the robot: nose up is a
+    /// positive head_pitch, yaw left a positive head_yaw, rolled right a negative head_roll. Gain
+    /// scales, the travel limit clamps, the neck stays put.
+    #[test]
+    fn the_head_follows_the_pad_with_the_sticks_signs_gain_and_limit() {
+        let half = 15.0f32.to_radians();
+        // 30° nose up: a rotation about +Y.
+        let nose_up = [half.cos(), 0.0, half.sin(), 0.0];
+        let head = head_from_pad(nose_up, 1.0, 2.5);
+        assert!(
+            (head.head_pitch - 30.0f64.to_radians()).abs() < 0.01,
+            "{head:?}"
+        );
+        assert!(
+            head.head_yaw.abs() < 0.01 && head.head_roll.abs() < 0.01,
+            "{head:?}"
+        );
+        assert_eq!(head.neck_pitch, 0.0);
+
+        // 30° rolled right (left side up): about +X. The head rolls the other sign.
+        let rolled = [half.cos(), half.sin(), 0.0, 0.0];
+        let head = head_from_pad(rolled, 1.0, 2.5);
+        assert!(
+            (head.head_roll - (-30.0f64.to_radians())).abs() < 0.01,
+            "{head:?}"
+        );
+
+        // 30° yaw left: about +Z.
+        let left = [half.cos(), 0.0, 0.0, half.sin()];
+        let head = head_from_pad(left, 1.0, 2.5);
+        assert!(
+            (head.head_yaw - 30.0f64.to_radians()).abs() < 0.01,
+            "{head:?}"
+        );
+
+        // Gain 2 doubles it; a limit of 0.5 rad clamps it.
+        let head = head_from_pad(left, 2.0, 2.5);
+        assert!(
+            (head.head_yaw - 60.0f64.to_radians()).abs() < 0.01,
+            "{head:?}"
+        );
+        let head = head_from_pad(left, 2.0, 0.5);
+        assert!((head.head_yaw - 0.5).abs() < 1e-6, "{head:?}");
+    }
+
+    /// Select is read on release. A short press is the stop, on the release; a hold reaching two
+    /// seconds is the shutdown, once, and the release after it is not a stop as well — the robot
+    /// is sitting down and must not be dropped mid-way.
+    #[test]
+    fn select_stops_on_a_short_release_and_shuts_down_on_a_long_hold() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut select = SelectButton::default();
+
+        // Short press: down for 300 ms, then up.
+        assert_eq!(select.tick(true, false, at(0)), SelectAction::Nothing);
+        assert_eq!(select.tick(true, false, at(300)), SelectAction::Nothing);
+        assert_eq!(select.tick(false, true, at(320)), SelectAction::Relax);
+        assert_eq!(select.tick(false, false, at(340)), SelectAction::Nothing);
+
+        // Press and release inside one tick: the state never read as down, the edge did.
+        assert_eq!(select.tick(false, true, at(1_000)), SelectAction::Relax);
+
+        // Long hold: the shutdown fires at two seconds, once, and the release is silent.
+        assert_eq!(select.tick(true, false, at(2_000)), SelectAction::Nothing);
+        assert_eq!(select.tick(true, false, at(3_990)), SelectAction::Nothing);
+        assert_eq!(select.tick(true, false, at(4_000)), SelectAction::Shutdown);
+        assert_eq!(select.tick(true, false, at(4_020)), SelectAction::Nothing);
+        assert_eq!(select.tick(false, true, at(5_000)), SelectAction::Nothing);
+
+        // And the next short press is a stop again.
+        assert_eq!(select.tick(true, false, at(6_000)), SelectAction::Nothing);
+        assert_eq!(select.tick(false, true, at(6_100)), SelectAction::Relax);
+    }
+    #[test]
+    fn right_short_release_reboots_but_wbc_hold_never_reboots() {
+        let start = Instant::now();
+        let mut button = RightButton::default();
+        assert_eq!(button.tick(true, false, start), RightAction::Nothing);
+        assert_eq!(
+            button.tick(false, true, start + Duration::from_millis(100)),
+            RightAction::Reboot
+        );
+        assert_eq!(
+            button.tick(false, true, start + Duration::from_millis(200)),
+            RightAction::Reboot
+        );
+        assert_eq!(
+            button.tick(true, false, start + Duration::from_secs(1)),
+            RightAction::Nothing
+        );
+        assert_eq!(
+            button.tick(true, false, start + Duration::from_secs(3)),
+            RightAction::Wbc
+        );
+        assert_eq!(
+            button.tick(true, false, start + Duration::from_secs(4)),
+            RightAction::Nothing
+        );
+        assert_eq!(
+            button.tick(false, true, start + Duration::from_secs(5)),
+            RightAction::Nothing
+        );
     }
 }
