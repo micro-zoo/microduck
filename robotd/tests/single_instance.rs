@@ -1,5 +1,4 @@
 //! Startup ownership against the actual binary, with fake I/O and private sockets.
-use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -8,13 +7,17 @@ use std::time::{Duration, Instant};
 
 use updater::robot::{Health, RobotClient, SocketRobotClient};
 
-struct Robotd(Child);
+struct Robotd(Child, tempfile::NamedTempFile);
 
 impl Robotd {
     fn spawn(socket: &Path, extra: &[&str]) -> Self {
         // An explicit empty config keeps host /etc/robot settings out of the test.
         let params = socket.parent().unwrap().join("params.toml");
         std::fs::write(&params, "").unwrap();
+        // Concurrent macOS spawns can retain another child's stderr pipe writer.
+        // Reading that pipe to EOF after the loser exits then waits on the live winner.
+        // A file preserves each child's log without depending on pipe EOF.
+        let log = tempfile::NamedTempFile::new().unwrap();
         Self(
             Command::new(env!("CARGO_BIN_EXE_robotd"))
                 .arg("--socket")
@@ -25,9 +28,10 @@ impl Robotd {
                 .args(extra)
                 .env("RUST_LOG", "warn")
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::from(log.reopen().unwrap()))
                 .spawn()
                 .expect("spawn robotd"),
+            log,
         )
     }
 
@@ -35,13 +39,7 @@ impl Robotd {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = self.0.try_wait().unwrap() {
-                let mut log = String::new();
-                self.0
-                    .stderr
-                    .take()
-                    .unwrap()
-                    .read_to_string(&mut log)
-                    .unwrap();
+                let log = std::fs::read_to_string(self.1.path()).unwrap();
                 return (status, log);
             }
             assert!(Instant::now() < deadline, "robotd did not exit");

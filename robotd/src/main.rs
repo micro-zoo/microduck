@@ -3561,10 +3561,23 @@ fn claim_lock(socket_path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Claim one daemon endpoint, including the window before there is a listener to probe.
 async fn claim_socket(socket_path: &Path) -> std::io::Result<(std::fs::File, UnixListener)> {
-    use std::io::ErrorKind;
+    use std::io::{Error, ErrorKind};
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     let lock = claim_lock(socket_path)?;
+    // macOS bind follows a dangling symlink and can create the socket at its target.
+    // The post-bind AddrInUse check alone therefore cannot protect non-socket paths.
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(meta) if !meta.file_type().is_socket() => {
+            return Err(Error::new(
+                ErrorKind::AddrInUse,
+                "refusing a non-socket IPC path",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let listener = match UnixListener::bind(socket_path) {
         Ok(listener) => listener,
         Err(e) if e.kind() == ErrorKind::AddrInUse => {
