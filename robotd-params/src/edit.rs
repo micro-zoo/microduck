@@ -1068,6 +1068,7 @@ mod tests {
                 "control",
                 "update_gate",
                 "policy",
+                "wbc",
                 "safety",
                 "duck_detector",
                 "chorale",
