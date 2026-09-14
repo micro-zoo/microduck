@@ -4,10 +4,18 @@
 use super::*;
 use crate::model::DEFAULT_POSITION;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::io::Write;
 
 const PWM_CAP: u16 = 300;
 const CURRENT_CAP_MA: i16 = 350;
+fn output_limits(higher_effort: bool) -> (u16, i16, [u16; 3]) {
+    if higher_effort {
+        (600, 700, [100, 50, 1600])
+    } else {
+        (PWM_CAP, CURRENT_CAP_MA, [0, 0, 800])
+    }
+}
 const WATCHDOG: u8 = 15;
 const MAX_GAP: Duration = Duration::from_millis(150);
 const SETTLE: Duration = Duration::from_secs(3);
@@ -64,6 +72,46 @@ struct Sample {
     watchdog: [u8; NUM_JOINTS],
 }
 
+#[derive(Default)]
+struct HomeSettling {
+    samples: VecDeque<(Duration, [f64; NUM_JOINTS])>,
+}
+
+impl HomeSettling {
+    fn observe(&mut self, elapsed: Duration, sample: &Sample) -> bool {
+        if !(0..NUM_JOINTS)
+            .all(|j| (sample.positions[j] - DEFAULT_POSITION[j]).abs() <= 2f64.to_radians())
+        {
+            self.samples.clear();
+            return false;
+        }
+        self.samples.push_back((elapsed, sample.positions));
+        // Keep the sample at the one-second boundary so discrete sampling covers
+        // a full second instead of continually shrinking the window just below it.
+        while self.samples.len() > 1
+            && elapsed.saturating_sub(self.samples[1].0) >= Duration::from_secs(1)
+        {
+            self.samples.pop_front();
+        }
+        if elapsed.saturating_sub(self.samples[0].0) < Duration::from_secs(1) {
+            return false;
+        }
+        (0..NUM_JOINTS).all(|j| {
+            let low = self
+                .samples
+                .iter()
+                .map(|(_, q)| q[j])
+                .fold(f64::INFINITY, f64::min);
+            let high = self
+                .samples
+                .iter()
+                .map(|(_, q)| q[j])
+                .fold(f64::NEG_INFINITY, f64::max);
+            high - low <= 0.5f64.to_radians()
+        })
+    }
+}
+
 fn record(log: &mut impl Write, event: serde_json::Value) -> Result<()> {
     serde_json::to_writer(&mut *log, &event).map_err(|e| bad(e.to_string()))?;
     writeln!(log)
@@ -77,13 +125,16 @@ fn validate_plan(from: &[f64; NUM_JOINTS], duration: Duration) -> Result<()> {
     }
     for j in 0..NUM_JOINTS {
         let delta = (DEFAULT_POSITION[j] - from[j]).abs();
+        // An unpowered neck can hang past the policy's normal working interval.
+        // Its supported recovery remains strictly shorter than a half-turn.
+        let travel_limit = if JOINT_IDS[j] == 30 { 175f64 } else { 90f64 };
         if !from[j].is_finite()
-            || delta > 90f64.to_radians()
+            || delta > travel_limit.to_radians()
             || delta / duration.as_secs_f64() > 6f64.to_radians()
         {
             return Err(bad(format!(
-                "{}: HOME exceeds 90 degrees or 6 degrees/s",
-                JOINT_NAMES[j]
+                "{}: HOME exceeds {travel_limit} degrees or 6 degrees/s",
+                JOINT_NAMES[j],
             )));
         }
     }
@@ -95,7 +146,9 @@ fn check(
     from: &[f64; NUM_JOINTS],
     target: &[f64; NUM_JOINTS],
     initial_temp: &[u8; NUM_JOINTS],
+    higher_effort: bool,
 ) -> Result<()> {
+    let (pwm_cap, current_cap, _) = output_limits(higher_effort);
     let mut total_ma = 0;
     for j in 0..NUM_JOINTS {
         let q = sample.positions[j];
@@ -106,8 +159,8 @@ fn check(
                 JOINT_NAMES[j]
             )));
         }
-        if i32::from(sample.currents_ma[j]).abs() > i32::from(CURRENT_CAP_MA)
-            || i32::from(sample.pwm[j]).abs() > i32::from(PWM_CAP) + 3
+        if i32::from(sample.currents_ma[j]).abs() > i32::from(current_cap)
+            || i32::from(sample.pwm[j]).abs() > i32::from(pwm_cap) + 3
             || !(4.5..=5.5).contains(&sample.volts[j])
             || sample.temperatures[j] >= 40
             || sample.temperatures[j].saturating_sub(initial_temp[j]) >= 3
@@ -234,8 +287,14 @@ impl DynamixelIo {
     /// Explicit hand-supported diagnostic through the same calibration and goal writer
     /// as the daemon. Always relaxes and restores RAM settings, including after failure.
     /// The independent caller watchdog must cover SIGKILL, process death and blocked I/O.
-    pub fn guarded_home(&mut self, duration: Duration, log: &mut impl Write) -> Result<()> {
+    pub fn guarded_home(
+        &mut self,
+        duration: Duration,
+        log: &mut impl Write,
+        higher_effort: bool,
+    ) -> Result<()> {
         let started = Instant::now();
+        let (pwm_cap, current_cap, dip) = output_limits(higher_effort);
         if self.calibration.configured_names().len() != NUM_JOINTS {
             return Err(bad("guarded HOME requires all 15 calibrated joints"));
         }
@@ -252,7 +311,7 @@ impl DynamixelIo {
                 || b[70] != 0
                 || b[98] != 0
                 || b[63] & 0x34 != 0x34
-                || u16_at(b, 36) < PWM_CAP
+                || u16_at(b, 36) < pwm_cap
                 || b[146] > 35
             {
                 return Err(bad(format!(
@@ -274,18 +333,12 @@ impl DynamixelIo {
             log,
             serde_json::json!({"event":"home_preflight", "ids":JOINT_IDS,
             "initial":initial, "target":DEFAULT_POSITION, "duration_s":duration.as_secs_f64(),
-            "pwm_cap":PWM_CAP, "current_cap_ma":CURRENT_CAP_MA, "gain":800}),
+            "pwm_cap":pwm_cap, "current_cap_ma":current_cap, "gain":dip[2], "position_dip":dip, "higher_effort":higher_effort}),
         )?;
         let mut fault_sample = None;
         let run = (|| -> Result<()> {
             self.home_setting(100, 0u16.to_le_bytes().to_vec())?;
-            self.home_setting(
-                80,
-                [0u16, 0, 800]
-                    .into_iter()
-                    .flat_map(u16::to_le_bytes)
-                    .collect(),
-            )?;
+            self.home_setting(80, dip.into_iter().flat_map(u16::to_le_bytes).collect())?;
             self.home_setting(88, vec![0; 4])?;
             self.home_setting(
                 108,
@@ -298,10 +351,10 @@ impl DynamixelIo {
             let from = self.home_sample(started)?.positions;
             validate_plan(&from, duration)?;
             self.write(&JointTargets::new(from))?;
-            self.home_setting(100, PWM_CAP.to_le_bytes().to_vec())?;
+            self.home_setting(100, pwm_cap.to_le_bytes().to_vec())?;
             let ramp = Instant::now();
             let mut last = Instant::now();
-            let mut settled_since = None;
+            let mut settling = HomeSettling::default();
             let mut last_target = from;
             loop {
                 let tick = Instant::now();
@@ -310,7 +363,13 @@ impl DynamixelIo {
                     return Err(bad("HOME telemetry gap exceeded 150 ms"));
                 }
                 last = Instant::now();
-                if let Err(e) = check(&s, &from, &last_target, &initial.temperatures) {
+                if let Err(e) = check(
+                    &s,
+                    &from,
+                    &last_target,
+                    &initial.temperatures,
+                    higher_effort,
+                ) {
                     fault_sample = Some((s, last_target));
                     return Err(e);
                 }
@@ -322,23 +381,16 @@ impl DynamixelIo {
                 if age > duration + SETTLE {
                     return Err(bad("HOME did not settle within 2 degrees"));
                 }
-                if age >= duration {
-                    let settled = (0..NUM_JOINTS).all(|j| {
-                        (s.positions[j] - DEFAULT_POSITION[j]).abs() <= 2f64.to_radians()
-                            && s.velocities[j].abs() <= 2f64.to_radians()
-                    });
-                    if settled {
-                        let since = settled_since.get_or_insert(Instant::now());
-                        if since.elapsed() >= Duration::from_secs(1) {
-                            record(
-                                log,
-                                serde_json::json!({"event":"home_reached", "sample":s, "tolerance_degrees":2}),
-                            )?;
-                            break;
-                        }
-                    } else {
-                        settled_since = None;
-                    }
+                if age >= duration && settling.observe(age, &s) {
+                    // The speed register can report 2.75 deg/s while the encoder
+                    // moves only one tick over a second. Position history establishes
+                    // settling; the independent 60 deg/s motion check still applies.
+                    record(
+                        log,
+                        serde_json::json!({"event":"home_reached", "sample":s,
+                        "tolerance_degrees":2,"maximum_position_span_degrees":0.5,"hold_seconds":1}),
+                    )?;
+                    break;
                 }
                 let t = (age.as_secs_f64() / duration.as_secs_f64()).min(1.);
                 last_target =
@@ -387,6 +439,23 @@ impl DynamixelIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settling_accepts_one_tick_noise_but_not_real_oscillation() {
+        let mut stable = HomeSettling::default();
+        let mut moving = HomeSettling::default();
+        for n in 0..=50 {
+            let mut s = sample();
+            s.positions[6] += (n % 2) as f64 * crate::calibration::RADIANS_PER_TICK;
+            s.velocities[6] = 2.75f64.to_radians();
+            assert_eq!(stable.observe(Duration::from_millis(n * 20), &s), n == 50);
+            s.positions[6] = DEFAULT_POSITION[6] + ((n % 2) as f64).to_radians();
+            assert!(!moving.observe(Duration::from_millis(n * 20), &s));
+        }
+        let mut out = sample();
+        out.positions[6] += 3f64.to_radians();
+        assert!(!stable.observe(Duration::from_millis(1020), &out));
+        assert!(!stable.observe(Duration::from_millis(1040), &sample()));
+    }
     #[test]
     fn read_recovery_is_one_bounded_retry_only_for_transport_faults() {
         let mut calls = 0;
@@ -441,6 +510,12 @@ mod tests {
         from[0] = 30f64.to_radians();
         assert!(validate_plan(&from, Duration::from_secs(5)).is_ok());
         assert!(validate_plan(&from, Duration::from_secs(1)).is_err());
+        from = DEFAULT_POSITION;
+        from[5] = (-140f64).to_radians();
+        assert!(validate_plan(&from, Duration::from_secs(30)).is_ok());
+        assert!(validate_plan(&from, Duration::from_secs(10)).is_err());
+        from[5] = DEFAULT_POSITION[5] - 176f64.to_radians();
+        assert!(validate_plan(&from, Duration::from_secs(30)).is_err());
     }
     #[test]
     fn no_home_corridor_or_load_check_is_exempt() {
@@ -450,7 +525,8 @@ mod tests {
                 &initial,
                 &DEFAULT_POSITION,
                 &DEFAULT_POSITION,
-                &initial.temperatures
+                &initial.temperatures,
+                false
             )
             .is_ok()
         );
@@ -471,11 +547,61 @@ mod tests {
                     &s,
                     &DEFAULT_POSITION,
                     &DEFAULT_POSITION,
-                    &initial.temperatures
+                    &initial.temperatures,
+                    false
                 )
                 .is_err(),
                 "fault {fault}"
             );
         }
+    }
+    #[test]
+    fn higher_effort_still_bounds_load_and_preserves_motion_checks() {
+        let mut s = sample();
+        s.currents_ma[0] = 500;
+        s.pwm[0] = 500;
+        assert!(
+            check(
+                &s,
+                &DEFAULT_POSITION,
+                &DEFAULT_POSITION,
+                &[29; NUM_JOINTS],
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                &s,
+                &DEFAULT_POSITION,
+                &DEFAULT_POSITION,
+                &[29; NUM_JOINTS],
+                false
+            )
+            .is_err()
+        );
+        s.currents_ma[0] = 701;
+        assert!(
+            check(
+                &s,
+                &DEFAULT_POSITION,
+                &DEFAULT_POSITION,
+                &[29; NUM_JOINTS],
+                true
+            )
+            .is_err()
+        );
+        s.currents_ma[0] = 500;
+        s.positions[0] += 4f64.to_radians();
+        assert!(
+            check(
+                &s,
+                &DEFAULT_POSITION,
+                &DEFAULT_POSITION,
+                &[29; NUM_JOINTS],
+                true
+            )
+            .is_err()
+        );
     }
 }

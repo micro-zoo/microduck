@@ -294,6 +294,9 @@ enum Command {
         /// New JSONL file for the guarded probe's measured motion and cleanup result.
         #[arg(long, requires = "guarded")]
         telemetry: Option<PathBuf>,
+        /// Increase guarded HOME output, with damped PID and bounded current.
+        #[arg(long, requires = "guarded")]
+        higher_effort: bool,
     },
 }
 
@@ -987,6 +990,7 @@ async fn main() -> ExitCode {
         duration,
         guarded,
         telemetry,
+        higher_effort,
     }) = args.command
     {
         // init opens the motor bus itself. Keep ownership until the whole ramp returns,
@@ -1000,7 +1004,13 @@ async fn main() -> ExitCode {
         };
         duck_ipc_proto::log_startup_identity!("robotd");
         if guarded {
-            return run_guarded_init(&params, &calibration, duration, telemetry.as_ref().unwrap());
+            return run_guarded_init(
+                &params,
+                &calibration,
+                duration,
+                telemetry.as_ref().unwrap(),
+                higher_effort,
+            );
         }
         return run_init(&params, &calibration, duration);
     }
@@ -1089,6 +1099,7 @@ fn run_guarded_init(
     calibration: &JointCalibration,
     duration: Duration,
     telemetry: &Path,
+    higher_effort: bool,
 ) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
@@ -1117,7 +1128,7 @@ fn run_guarded_init(
                 .open(telemetry)?;
             let mut io = duck_control::bus::DynamixelIo::open(&params.bus.port)?
                 .with_calibration(*calibration);
-            io.guarded_home(duration, &mut log)?;
+            io.guarded_home(duration, &mut log, higher_effort)?;
             log.sync_all()?;
             Ok(())
         })();
@@ -1136,7 +1147,7 @@ fn run_guarded_init(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (params, calibration, duration, telemetry);
+        let _ = (params, calibration, duration, telemetry, higher_effort);
         tracing::error!("guarded init requires Linux");
         ExitCode::FAILURE
     }
