@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
 
+mod homing;
+
 use crate::calibration::JointCalibration;
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
