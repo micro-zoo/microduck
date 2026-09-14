@@ -96,14 +96,15 @@ def reconcile(protocol, port, before, restore_modes=False):
                 wire.exchange(modes.packet(protocol,id,11,before[id][11:12]),.03)
                 if bus.read(id,11,1)!=before[id][11:12]:
                     raise RuntimeError(f'ID {id}: original operating mode was not restored')
+            current=bus.read(id,76,40)
             for address, length in ((98, 1), *modes.RESTORE):
                 wanted = before[id][address:address+length]
-                if bus.read(id, address, length) != wanted:
+                if current[address-76:address-76+length] != wanted:
                     wire.exchange(restore_packet(protocol, id, address, wanted, before[id]), .01)
                     if bus.read(id, address, length) != wanted:
                         raise RuntimeError(f'ID {id} register {address} restoration failed')
         final = {id: modes.snapshot(bus, id) for id in modes.IDS}
-        if any(final[id][:64] != before[id][:64] for id in modes.IDS):
+        if any(final[id][:64] != before[id][:64] or any(final[id][a:a+n]!=before[id][a:a+n] for a,n in ((98,1),*modes.RESTORE)) for id in modes.IDS):
             raise RuntimeError('Unexpected EEPROM change; all motors are OFF')
         return {id: data.hex() for id, data in final.items()}
 

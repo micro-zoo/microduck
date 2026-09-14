@@ -52,7 +52,7 @@ def goals(entry,present):
         result.append(math.trunc(raw))
     return result
 
-def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe_goals=False,service_check=None):
+def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe_goals=False,service_check=None,progress=None):
     before={id:snapshot(bus,id) for id in IDS}
     journal.record('extended_preflight',snapshot={id:v.hex() for id,v in before.items()},apply=apply)
     if not apply:
@@ -68,9 +68,11 @@ def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe
         journal.record('extended_write_readback',id=id,address=address,actual=actual.hex(),matches=actual==data)
         if verify and actual!=data:raise RuntimeError(f'ID {id} register {address} did not retain written value; no resend')
     def restore_tuning(id,prior):
+        # Read the contiguous tuning block once; retain per-write readback checks.
+        current=bus.read(id,76,40)
         for address,length in RESTORE:
             value=prior[address:address+length]
-            if bus.read(id,address,length)!=value:write(id,address,value)
+            if current[address-76:address-76+length]!=value:write(id,address,value)
     def hold_present(id):
         # Firmware 53 was observed to track present position in Goal Position while
         # torque is OFF, so a current-pose hold need not read back one identical tick.
@@ -102,6 +104,7 @@ def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe
             if final[:64]!=bytes(expected) or any(final[a:a+n]!=prior[a:a+n] for a,n in RESTORE):raise RuntimeError('Mode/tuning reconciliation failed')
             journal.record('extended_final_state',id=id,final=final.hex(),restored_original=restore_original)
         journal.record('extended_motor_complete',id=id,goals=probes,goal_probes=probe_goals)
+        if progress:progress(id,final,IDS.index(id)+1,len(IDS))
         print(f'ID {id}: Mode 4 verified; final mode {final[11]}, torque OFF, tuning and hold confirmed',flush=True)
     journal.record('extended_complete',ids=IDS,torque='all off',torque_ever_enabled=False,goal_probes=probe_goals)
 
