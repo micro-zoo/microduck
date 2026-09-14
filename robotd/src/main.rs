@@ -22,6 +22,8 @@ mod chorale;
 mod control;
 mod intents;
 mod params;
+#[cfg(target_os = "linux")]
+mod pose_session;
 mod soc;
 mod sound;
 mod theremin;
@@ -297,6 +299,12 @@ enum Command {
         /// Increase guarded HOME output, with damped PID and bounded current.
         #[arg(long, requires = "guarded")]
         higher_effort: bool,
+        /// Fixed supported pose; zero uses the calibrated closed-mouth reference.
+        #[arg(long,requires="guarded",value_parser=["home","zero"])]
+        pose: Option<String>,
+        /// Hold and accept local pose commands while an independent supervisor is live.
+        #[arg(long, requires = "guarded")]
+        interactive: bool,
     },
 }
 
@@ -991,6 +999,8 @@ async fn main() -> ExitCode {
         guarded,
         telemetry,
         higher_effort,
+        pose,
+        interactive,
     }) = args.command
     {
         // init opens the motor bus itself. Keep ownership until the whole ramp returns,
@@ -1010,6 +1020,8 @@ async fn main() -> ExitCode {
                 duration,
                 telemetry.as_ref().unwrap(),
                 higher_effort,
+                pose.as_deref().unwrap_or("home"),
+                interactive,
             );
         }
         return run_init(&params, &calibration, duration);
@@ -1100,6 +1112,8 @@ fn run_guarded_init(
     duration: Duration,
     telemetry: &Path,
     higher_effort: bool,
+    pose: &str,
+    interactive: bool,
 ) -> ExitCode {
     #[cfg(target_os = "linux")]
     {
@@ -1126,9 +1140,27 @@ fn run_guarded_init(
                 .write(true)
                 .create_new(true)
                 .open(telemetry)?;
+            let mut channel = if interactive {
+                Some(pose_session::PipeSession::open(pipe.unwrap())?)
+            } else {
+                None
+            };
             let mut io = duck_control::bus::DynamixelIo::open(&params.bus.port)?
                 .with_calibration(*calibration);
-            io.guarded_home(duration, &mut log, higher_effort)?;
+            let pose = if pose == "zero" {
+                duck_control::bus::SupportedPose::Zero
+            } else {
+                duck_control::bus::SupportedPose::Home
+            };
+            io.guarded_pose(
+                pose,
+                duration,
+                &mut log,
+                higher_effort,
+                channel
+                    .as_mut()
+                    .map(|s| s as &mut dyn duck_control::bus::PoseSession),
+            )?;
             log.sync_all()?;
             Ok(())
         })();
@@ -1147,7 +1179,15 @@ fn run_guarded_init(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (params, calibration, duration, telemetry, higher_effort);
+        let _ = (
+            params,
+            calibration,
+            duration,
+            telemetry,
+            higher_effort,
+            pose,
+            interactive,
+        );
         tracing::error!("guarded init requires Linux");
         ExitCode::FAILURE
     }

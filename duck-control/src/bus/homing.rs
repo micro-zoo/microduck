@@ -21,6 +21,45 @@ const MAX_GAP: Duration = Duration::from_millis(150);
 const SETTLE: Duration = Duration::from_secs(3);
 const SAVE: &[(u8, u8)] = &[(80, 6), (88, 4), (98, 1), (100, 2), (108, 8)];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupportedPose {
+    Home,
+    Zero,
+}
+impl SupportedPose {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Zero => "zero",
+        }
+    }
+    pub fn positions(self) -> [f64; NUM_JOINTS] {
+        match self {
+            Self::Home => DEFAULT_POSITION,
+            Self::Zero => std::array::from_fn(|j| {
+                if JOINT_IDS[j] == 34 {
+                    crate::model::MOUTH_CLOSED
+                } else {
+                    0.
+                }
+            }),
+        }
+    }
+}
+pub enum PoseCommand {
+    Continue,
+    Move(SupportedPose),
+    Relax,
+}
+/// A supervised operator session. The external guardian requires both browser
+/// heartbeats and progress from this actual control loop, independently.
+pub trait PoseSession {
+    fn poll(&mut self) -> Result<PoseCommand>;
+    fn arm(&mut self) -> Result<()>;
+    fn progress(&mut self) -> Result<()>;
+    fn off(&mut self) -> Result<()>;
+}
+
 fn bad(message: impl Into<String>) -> IoError {
     IoError::Bus(message.into())
 }
@@ -78,9 +117,14 @@ struct HomeSettling {
 }
 
 impl HomeSettling {
-    fn observe(&mut self, elapsed: Duration, sample: &Sample) -> bool {
+    fn observe_target(
+        &mut self,
+        elapsed: Duration,
+        sample: &Sample,
+        destination: &[f64; NUM_JOINTS],
+    ) -> bool {
         if !(0..NUM_JOINTS)
-            .all(|j| (sample.positions[j] - DEFAULT_POSITION[j]).abs() <= 2f64.to_radians())
+            .all(|j| (sample.positions[j] - destination[j]).abs() <= 2f64.to_radians())
         {
             self.samples.clear();
             return false;
@@ -119,12 +163,28 @@ fn record(log: &mut impl Write, event: serde_json::Value) -> Result<()> {
         .map_err(|e| bad(e.to_string()))
 }
 
+fn pose_duration(from: &[f64; NUM_JOINTS], to: &[f64; NUM_JOINTS]) -> Duration {
+    let degrees = (0..NUM_JOINTS)
+        .map(|j| (to[j] - from[j]).abs().to_degrees())
+        .fold(0., f64::max);
+    Duration::from_secs_f64((degrees / 6. + 0.5).clamp(5., 30.))
+}
+
+#[cfg(test)]
 fn validate_plan(from: &[f64; NUM_JOINTS], duration: Duration) -> Result<()> {
+    validate_pose_plan(from, duration, &DEFAULT_POSITION)
+}
+
+fn validate_pose_plan(
+    from: &[f64; NUM_JOINTS],
+    duration: Duration,
+    destination: &[f64; NUM_JOINTS],
+) -> Result<()> {
     if !(5.0..=30.0).contains(&duration.as_secs_f64()) {
         return Err(bad("guarded HOME duration must be 5..30 seconds"));
     }
     for j in 0..NUM_JOINTS {
-        let delta = (DEFAULT_POSITION[j] - from[j]).abs();
+        let delta = (destination[j] - from[j]).abs();
         // An unpowered neck can hang past the policy's normal working interval.
         // Its supported recovery remains strictly shorter than a half-turn.
         let travel_limit = if JOINT_IDS[j] == 30 { 175f64 } else { 90f64 };
@@ -141,10 +201,29 @@ fn validate_plan(from: &[f64; NUM_JOINTS], duration: Duration) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn check(
     sample: &Sample,
     from: &[f64; NUM_JOINTS],
     target: &[f64; NUM_JOINTS],
+    initial_temp: &[u8; NUM_JOINTS],
+    higher_effort: bool,
+) -> Result<()> {
+    check_pose(
+        sample,
+        from,
+        target,
+        &DEFAULT_POSITION,
+        initial_temp,
+        higher_effort,
+    )
+}
+
+fn check_pose(
+    sample: &Sample,
+    from: &[f64; NUM_JOINTS],
+    target: &[f64; NUM_JOINTS],
+    destination: &[f64; NUM_JOINTS],
     initial_temp: &[u8; NUM_JOINTS],
     higher_effort: bool,
 ) -> Result<()> {
@@ -171,15 +250,15 @@ fn check(
             )));
         }
         if !q.is_finite()
-            || q < from[j].min(DEFAULT_POSITION[j]) - 3f64.to_radians()
-            || q > from[j].max(DEFAULT_POSITION[j]) + 3f64.to_radians()
+            || q < from[j].min(destination[j]) - 3f64.to_radians()
+            || q > from[j].max(destination[j]) + 3f64.to_radians()
         {
             return Err(bad(format!(
                 "{}: position {:.2} deg left HOME corridor {:.2}..{:.2} deg",
                 JOINT_NAMES[j],
                 q.to_degrees(),
-                from[j].min(DEFAULT_POSITION[j]).to_degrees(),
-                from[j].max(DEFAULT_POSITION[j]).to_degrees()
+                from[j].min(destination[j]).to_degrees(),
+                from[j].max(destination[j]).to_degrees()
             )));
         }
         if (q - target[j]).abs() > 8f64.to_radians() {
@@ -293,7 +372,21 @@ impl DynamixelIo {
         log: &mut impl Write,
         higher_effort: bool,
     ) -> Result<()> {
+        self.guarded_pose(SupportedPose::Home, duration, log, higher_effort, None)
+    }
+
+    pub fn guarded_pose(
+        &mut self,
+        initial_pose: SupportedPose,
+        mut duration: Duration,
+        log: &mut impl Write,
+        higher_effort: bool,
+        mut session: Option<&mut dyn PoseSession>,
+    ) -> Result<()> {
         let started = Instant::now();
+        let mut pose = initial_pose;
+        let mut destination = pose.positions();
+        let interactive = session.is_some();
         let (pwm_cap, current_cap, dip) = output_limits(higher_effort);
         if self.calibration.configured_names().len() != NUM_JOINTS {
             return Err(bad("guarded HOME requires all 15 calibrated joints"));
@@ -327,15 +420,19 @@ impl DynamixelIo {
         if initial.volts.iter().any(|v| !(4.5..=5.5).contains(v)) {
             return Err(bad("guarded HOME requires a 4.5..5.5 V motor rail"));
         }
-        validate_plan(&initial.positions, duration)?;
-        self.calibration.servo_targets(&DEFAULT_POSITION)?;
+        if interactive {
+            duration = pose_duration(&initial.positions, &destination);
+        }
+        validate_pose_plan(&initial.positions, duration, &destination)?;
+        self.calibration.servo_targets(&destination)?;
         record(
             log,
             serde_json::json!({"event":"home_preflight", "ids":JOINT_IDS,
-            "initial":initial, "target":DEFAULT_POSITION, "duration_s":duration.as_secs_f64(),
+            "initial":initial, "target":destination, "pose":pose.name(), "duration_s":duration.as_secs_f64(),
             "pwm_cap":pwm_cap, "current_cap_ma":current_cap, "gain":dip[2], "position_dip":dip, "higher_effort":higher_effort}),
         )?;
         let mut fault_sample = None;
+        let mut reached = false;
         let run = (|| -> Result<()> {
             self.home_setting(100, 0u16.to_le_bytes().to_vec())?;
             self.home_setting(80, dip.into_iter().flat_map(u16::to_le_bytes).collect())?;
@@ -347,15 +444,27 @@ impl DynamixelIo {
             let hold = self.present_positions()?;
             self.write(&JointTargets::new(hold))?;
             self.home_setting(98, vec![WATCHDOG])?;
+            if let Some(s) = session.as_deref_mut() {
+                if matches!(s.poll()?, PoseCommand::Relax) {
+                    return Ok(());
+                }
+                s.arm()?;
+            }
             self.set_torque(true)?;
-            let from = self.home_sample(started)?.positions;
-            validate_plan(&from, duration)?;
+            let mut from = self.home_sample(started)?.positions;
+            validate_pose_plan(&from, duration, &destination)?;
             self.write(&JointTargets::new(from))?;
             self.home_setting(100, pwm_cap.to_le_bytes().to_vec())?;
-            let ramp = Instant::now();
+            let mut ramp = Instant::now();
             let mut last = Instant::now();
             let mut settling = HomeSettling::default();
             let mut last_target = from;
+            let mut holding = false;
+            let mut last_logged = Instant::now() - Duration::from_secs(1);
+            record(
+                log,
+                serde_json::json!({"event":"pose_moving","pose":pose.name(),"duration_s":duration.as_secs_f64(),"target":destination}),
+            )?;
             loop {
                 let tick = Instant::now();
                 let s = self.home_sample(started)?;
@@ -363,38 +472,72 @@ impl DynamixelIo {
                     return Err(bad("HOME telemetry gap exceeded 150 ms"));
                 }
                 last = Instant::now();
-                if let Err(e) = check(
+                if let Err(e) = check_pose(
                     &s,
                     &from,
                     &last_target,
+                    &destination,
                     &initial.temperatures,
                     higher_effort,
                 ) {
                     fault_sample = Some((s, last_target));
                     return Err(e);
                 }
-                record(
-                    log,
-                    serde_json::json!({"event":"home_sample", "sample":s, "target":last_target}),
-                )?;
+                if let Some(control) = session.as_deref_mut() {
+                    control.progress()?;
+                    match control.poll()? {
+                        PoseCommand::Relax => break,
+                        PoseCommand::Move(next) => {
+                            if !holding {
+                                return Err(bad("wait for the current pose to settle"));
+                            }
+                            pose = next;
+                            destination = pose.positions();
+                            from = s.positions;
+                            duration = pose_duration(&from, &destination);
+                            validate_pose_plan(&from, duration, &destination)?;
+                            self.calibration.servo_targets(&destination)?;
+                            ramp = Instant::now();
+                            last_target = from;
+                            settling = HomeSettling::default();
+                            holding = false;
+                            reached = false;
+                            record(
+                                log,
+                                serde_json::json!({"event":"pose_moving","pose":pose.name(),"duration_s":duration.as_secs_f64(),"target":destination}),
+                            )?;
+                        }
+                        PoseCommand::Continue => (),
+                    }
+                }
+                if !holding || last_logged.elapsed() >= Duration::from_millis(100) {
+                    record(
+                        log,
+                        serde_json::json!({"event":"home_sample", "sample":s, "target":last_target,"pose":pose.name(),"phase":if holding {"holding"} else {"moving"},"progress":(ramp.elapsed().as_secs_f64()/duration.as_secs_f64()).min(1.)}),
+                    )?;
+                    last_logged = Instant::now();
+                }
                 let age = ramp.elapsed();
-                if age > duration + SETTLE {
+                if !holding && age > duration + SETTLE {
                     return Err(bad("HOME did not settle within 2 degrees"));
                 }
-                if age >= duration && settling.observe(age, &s) {
+                if !holding && age >= duration && settling.observe_target(age, &s, &destination) {
                     // The speed register can report 2.75 deg/s while the encoder
                     // moves only one tick over a second. Position history establishes
                     // settling; the independent 60 deg/s motion check still applies.
                     record(
                         log,
-                        serde_json::json!({"event":"home_reached", "sample":s,
+                        serde_json::json!({"event":if pose==SupportedPose::Home {"home_reached"} else {"zero_reached"}, "sample":s,"pose":pose.name(),
                         "tolerance_degrees":2,"maximum_position_span_degrees":0.5,"hold_seconds":1}),
                     )?;
-                    break;
+                    reached = true;
+                    if !interactive {
+                        break;
+                    }
+                    holding = true;
                 }
                 let t = (age.as_secs_f64() / duration.as_secs_f64()).min(1.);
-                last_target =
-                    std::array::from_fn(|j| from[j] + (DEFAULT_POSITION[j] - from[j]) * t);
+                last_target = std::array::from_fn(|j| from[j] + (destination[j] - from[j]) * t);
                 self.write(&JointTargets::new(last_target))?;
                 std::thread::sleep(Duration::from_millis(20).saturating_sub(tick.elapsed()));
             }
@@ -402,6 +545,9 @@ impl DynamixelIo {
         })();
         // No log write or register restoration can delay confirmed torque-off.
         self.home_off()?;
+        if let Some(s) = session.as_deref_mut() {
+            s.off()?;
+        }
         self.home_setting(98, vec![0])?;
         for &(a, n) in SAVE {
             let values: Vec<Vec<u8>> = before
@@ -430,7 +576,7 @@ impl DynamixelIo {
         record(
             log,
             serde_json::json!({"event":"home_cleanup", "all_off":true, "settings_restored":true,
-            "reached":run.is_ok(), "error":run.as_ref().err().map(ToString::to_string)}),
+            "reached":run.is_ok() && reached, "error":run.as_ref().err().map(ToString::to_string)}),
         )?;
         run
     }
@@ -447,14 +593,17 @@ mod tests {
             let mut s = sample();
             s.positions[6] += (n % 2) as f64 * crate::calibration::RADIANS_PER_TICK;
             s.velocities[6] = 2.75f64.to_radians();
-            assert_eq!(stable.observe(Duration::from_millis(n * 20), &s), n == 50);
+            assert_eq!(
+                stable.observe_target(Duration::from_millis(n * 20), &s, &DEFAULT_POSITION),
+                n == 50
+            );
             s.positions[6] = DEFAULT_POSITION[6] + ((n % 2) as f64).to_radians();
-            assert!(!moving.observe(Duration::from_millis(n * 20), &s));
+            assert!(!moving.observe_target(Duration::from_millis(n * 20), &s, &DEFAULT_POSITION));
         }
         let mut out = sample();
         out.positions[6] += 3f64.to_radians();
-        assert!(!stable.observe(Duration::from_millis(1020), &out));
-        assert!(!stable.observe(Duration::from_millis(1040), &sample()));
+        assert!(!stable.observe_target(Duration::from_millis(1020), &out, &DEFAULT_POSITION));
+        assert!(!stable.observe_target(Duration::from_millis(1040), &sample(), &DEFAULT_POSITION));
     }
     #[test]
     fn read_recovery_is_one_bounded_retry_only_for_transport_faults() {

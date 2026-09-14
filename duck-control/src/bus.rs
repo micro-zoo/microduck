@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
 
 mod homing;
+pub use homing::{PoseCommand, PoseSession, SupportedPose};
 
 use crate::calibration::JointCalibration;
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
