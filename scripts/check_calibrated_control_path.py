@@ -5,6 +5,7 @@ Never opens a hardware serial path. The 15 servos and IMU below are register-lev
 emulators, not a physics simulation or evidence of real motor tracking.
 """
 import argparse,json,math,os,pty,re,select,socket,struct,subprocess,tempfile,threading,time,tty
+import copy
 from pathlib import Path
 
 HEADER=b'\xff\xff\xfd\x00'
@@ -194,29 +195,38 @@ def check_guarded_home(args):
     """Real standalone init, including a motor-current fault and verified restoration."""
     ids=source_array(args.model_source,'JOINT_IDS',int)
     home=source_array(args.model_source,'DEFAULT_POSITION',float)
-    cal=json.loads(args.calibration.read_text())
-    cal={'joints':[{k:v for k,v in j.items() if k!='limits_rad'} for j in cal['joints']]}
+    original=json.loads(args.calibration.read_text())
     checks={}
-    for fault in (False,True):
+    for mode,fault in ((3,False),(3,True),(4,False),(4,True)):
+        cal=copy.deepcopy(original) if mode==4 else {'joints':[{k:v for k,v in j.items() if k!='limits_rad'} for j in original['joints']]}
+        duration=10 if mode==4 else 5
         with tempfile.TemporaryDirectory(prefix='guarded-home-') as d:
-            root=Path(d);bus=Bus(cal,ids,mode=3)
+            root=Path(d);bus=Bus(cal,ids,mode=mode)
             try:
                 # All starts are close to HOME and inside a single encoder revolution.
                 # Give the mouth and hip yaw a negative offset to avoid the 4095 seam.
                 with bus.lock:
                     for j,id in enumerate(ids):
                         b=bus.regs[id];zero=bus.cal[id]['zero_tick']
-                        raw=round(zero+(home[j]-.04)/R)
+                        q=home[j]-.04
+                        if mode==4 and id==20:q=.04
+                        if mode==4 and id==30:q=math.radians(63)
+                        raw=round(zero+q/R)
+                        if mode==4:raw%=4096
                         assert 0<=raw<=4095
                         b[36:38]=struct.pack('<H',885);b[38:40]=struct.pack('<H',1750)
                         b[63]=52;b[84:86]=struct.pack('<H',400);b[100:102]=struct.pack('<H',885)
                         b[116:120]=b[132:136]=struct.pack('<i',raw)
                     before={id:bytes(b) for id,b in bus.regs.items()}
+                if mode==4:
+                    from run_guarded_home import recovery_calibration
+                    cal,changes=recovery_calibration(cal,before,args.model_source,duration)
+                    assert any(c['id']==30 for c in changes)
                 original_read=bus.read
                 def read(id,a,n):
                     b=bytearray(original_read(id,a,n))
                     if fault and id==14 and bus.regs[id][64] and a<=126 and a+n>=128:
-                        b[126-a:128-a]=struct.pack('<h',400)
+                        b[126-a:128-a]=struct.pack('<h',800 if mode==4 else 400)
                     return bytes(b)
                 bus.read=read
                 calibration=root/'calibration.json';calibration.write_text(json.dumps(cal))
@@ -226,11 +236,12 @@ def check_guarded_home(args):
                 env={**os.environ,'DUCK_HOME_WATCHDOG_FD':str(write_fd),'DUCK_RUNTIME_DIR':str(root/'run')}
                 try:
                     out=subprocess.run([str(args.robotd),'--params',str(params),'--socket',str(root/'init.sock'),
-                        'init','--guarded','--duration','5s','--telemetry',str(telemetry)],
-                        env=env,pass_fds=(write_fd,),capture_output=True,text=True,timeout=12)
+                        'init','--guarded','--duration',f'{duration}s','--telemetry',str(telemetry),*(['--higher-effort'] if mode==4 else [])],
+                        env=env,pass_fds=(write_fd,),capture_output=True,text=True,timeout=duration+7)
                 finally:os.close(read_fd);os.close(write_fd)
                 events=[json.loads(line) for line in telemetry.read_text().splitlines()]
                 key='guarded_home_fault' if fault else 'guarded_home_success'
+                if mode==4:key+='_extended'
                 (args.output/(key+'.jsonl')).write_text(telemetry.read_text())
                 (args.output/(key+'.log')).write_text(out.stdout+out.stderr)
                 (args.output/(key+'-writes.json')).write_text(json.dumps(bus.writes,indent=2))
