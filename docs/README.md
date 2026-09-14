@@ -13,6 +13,7 @@ docs give the reasoning and point at it.
 |---|---|
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
 | [`joint-calibration.md`](robot/joint-calibration.md) | Per-robot motor zeroes, the configuration path, and closed-mouth reference conversion. |
+| [Live Twin](../scripts/live_twin/README.md) | Live joint telemetry, supported HOME/zero holds, unload, and maintenance of the USB debug page. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
 | [`dev-push.md`](robot/dev-push.md) | Build on your machine and install on the board over ssh, with no CI run. |

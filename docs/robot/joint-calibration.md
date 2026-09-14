@@ -213,6 +213,12 @@ A small ankle movement also does not, by itself, validate a real crossing of 0/4
 
 ## Hand-supported HOME through robotd
 
+This section describes the standalone diagnostic, which unloads when it finishes.
+For the web controls that hold HOME or fixture zero until unloaded, see
+[Live Twin](../../scripts/live_twin/README.md). Its interactive trajectory has
+separate speed/acceleration settings; the diagnostic limits below still apply to
+the standalone launcher.
+
 For a robot supported at the trunk with all joints free to move, the bounded HOME
 diagnostic uses the real `robotd init` calibration and goal writer. Stop `robotd` and
 the read-only twin first, then run on the board:
