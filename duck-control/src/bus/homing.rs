@@ -163,11 +163,77 @@ fn record(log: &mut impl Write, event: serde_json::Value) -> Result<()> {
         .map_err(|e| bad(e.to_string()))
 }
 
-fn pose_duration(from: &[f64; NUM_JOINTS], to: &[f64; NUM_JOINTS]) -> Duration {
-    let degrees = (0..NUM_JOINTS)
-        .map(|j| (to[j] - from[j]).abs().to_degrees())
-        .fold(0., f64::max);
-    Duration::from_secs_f64((degrees / 6. + 0.5).clamp(5., 30.))
+/// Synchronized trapezoidal session motion, bounded in speed and acceleration.
+/// The standalone diagnostic retains its original slow linear ramp.
+#[derive(Clone, Copy)]
+struct SessionRamp {
+    distance: f64,
+    acceleration: f64,
+    accelerating: f64,
+    cruising: f64,
+    natural_duration: f64,
+    duration: Duration,
+}
+impl SessionRamp {
+    fn new(from: &[f64; NUM_JOINTS], to: &[f64; NUM_JOINTS]) -> Self {
+        let distance = (0..NUM_JOINTS)
+            .map(|j| (to[j] - from[j]).abs())
+            .fold(0., f64::max);
+        let acceleration = 40f64.to_radians();
+        let speed = 20f64.to_radians();
+        let accelerating = (distance / acceleration).sqrt().min(speed / acceleration);
+        let peak = acceleration * accelerating;
+        let cruising = if peak > 0. {
+            ((distance - acceleration * accelerating * accelerating) / peak).max(0.)
+        } else {
+            0.
+        };
+        let natural_duration = 2. * accelerating + cruising;
+        Self {
+            distance,
+            acceleration,
+            accelerating,
+            cruising,
+            natural_duration,
+            duration: Duration::from_secs_f64(natural_duration.max(0.5)),
+        }
+    }
+    fn fraction(self, elapsed: Duration) -> f64 {
+        if self.distance == 0. {
+            return 1.;
+        }
+        let t =
+            (elapsed.as_secs_f64() / self.duration.as_secs_f64()).min(1.) * self.natural_duration;
+        let traveled = if t < self.accelerating {
+            0.5 * self.acceleration * t * t
+        } else if t < self.accelerating + self.cruising {
+            0.5 * self.acceleration * self.accelerating * self.accelerating
+                + self.acceleration * self.accelerating * (t - self.accelerating)
+        } else {
+            let remaining = (self.natural_duration - t).max(0.);
+            self.distance - 0.5 * self.acceleration * remaining * remaining
+        };
+        (traveled / self.distance).clamp(0., 1.)
+    }
+}
+
+fn plan_session(
+    from: &[f64; NUM_JOINTS],
+    destination: &[f64; NUM_JOINTS],
+    duration: &mut Duration,
+    interactive: bool,
+) -> Result<Option<SessionRamp>> {
+    // Validate the same finite positions and maximum travel as a slow 30 s probe.
+    // SessionRamp supplies its own analytical 20 deg/s and 40 deg/s² bounds.
+    if interactive {
+        validate_pose_plan(from, Duration::from_secs(30), destination)?;
+        let profile = SessionRamp::new(from, destination);
+        *duration = profile.duration;
+        Ok(Some(profile))
+    } else {
+        validate_pose_plan(from, *duration, destination)?;
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -420,10 +486,7 @@ impl DynamixelIo {
         if initial.volts.iter().any(|v| !(4.5..=5.5).contains(v)) {
             return Err(bad("guarded HOME requires a 4.5..5.5 V motor rail"));
         }
-        if interactive {
-            duration = pose_duration(&initial.positions, &destination);
-        }
-        validate_pose_plan(&initial.positions, duration, &destination)?;
+        plan_session(&initial.positions, &destination, &mut duration, interactive)?;
         self.calibration.servo_targets(&destination)?;
         record(
             log,
@@ -452,7 +515,7 @@ impl DynamixelIo {
             }
             self.set_torque(true)?;
             let mut from = self.home_sample(started)?.positions;
-            validate_pose_plan(&from, duration, &destination)?;
+            let mut profile = plan_session(&from, &destination, &mut duration, interactive)?;
             self.write(&JointTargets::new(from))?;
             self.home_setting(100, pwm_cap.to_le_bytes().to_vec())?;
             let mut ramp = Instant::now();
@@ -494,8 +557,8 @@ impl DynamixelIo {
                             pose = next;
                             destination = pose.positions();
                             from = s.positions;
-                            duration = pose_duration(&from, &destination);
-                            validate_pose_plan(&from, duration, &destination)?;
+                            profile =
+                                plan_session(&from, &destination, &mut duration, interactive)?;
                             self.calibration.servo_targets(&destination)?;
                             ramp = Instant::now();
                             last_target = from;
@@ -536,7 +599,10 @@ impl DynamixelIo {
                     }
                     holding = true;
                 }
-                let t = (age.as_secs_f64() / duration.as_secs_f64()).min(1.);
+                let t = profile.map_or_else(
+                    || (age.as_secs_f64() / duration.as_secs_f64()).min(1.),
+                    |p| p.fraction(age),
+                );
                 last_target = std::array::from_fn(|j| from[j] + (destination[j] - from[j]) * t);
                 self.write(&JointTargets::new(last_target))?;
                 std::thread::sleep(Duration::from_millis(20).saturating_sub(tick.elapsed()));
@@ -585,6 +651,37 @@ impl DynamixelIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn session_ramps_preserve_travel_and_bound_speed_and_acceleration() {
+        for degrees in [0., 0.1, 1., 5., 26., 90., 160., 175.] {
+            let from = DEFAULT_POSITION;
+            let mut to = from;
+            to[5] += f64::to_radians(degrees);
+            let p = SessionRamp::new(&from, &to);
+            let dt = 0.001;
+            let mut previous = 0.;
+            let mut velocity = 0.;
+            for i in 0..=(p.duration.as_secs_f64() / dt).ceil() as u64 + 1 {
+                let q = degrees * p.fraction(Duration::from_secs_f64(i as f64 * dt));
+                let next_velocity = (q - previous) / dt;
+                assert!(next_velocity >= -1e-8 && next_velocity <= 20. + 1e-6);
+                assert!((next_velocity - velocity).abs() / dt <= 40. + 1e-4);
+                previous = q;
+                velocity = next_velocity;
+            }
+            assert!((previous - degrees).abs() < 1e-8);
+        }
+        let mut from = DEFAULT_POSITION;
+        from[5] = (-140f64).to_radians();
+        let mut duration = Duration::from_secs(30);
+        let p = plan_session(&from, &DEFAULT_POSITION, &mut duration, true)
+            .unwrap()
+            .unwrap();
+        assert!(p.duration.as_secs_f64() < 9.);
+        from[5] = DEFAULT_POSITION[5] - 176f64.to_radians();
+        assert!(plan_session(&from, &DEFAULT_POSITION, &mut duration, true).is_err());
+    }
+
     #[test]
     fn settling_accepts_one_tick_noise_but_not_real_oscillation() {
         let mut stable = HomeSettling::default();
