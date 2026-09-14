@@ -190,6 +190,63 @@ class Fixture:
                 except subprocess.TimeoutExpired:p.kill();p.wait()
         self.bus.close();self.temp.cleanup()
 
+def check_guarded_home(args):
+    """Real standalone init, including a motor-current fault and verified restoration."""
+    ids=source_array(args.model_source,'JOINT_IDS',int)
+    home=source_array(args.model_source,'DEFAULT_POSITION',float)
+    cal=json.loads(args.calibration.read_text())
+    cal={'joints':[{k:v for k,v in j.items() if k!='limits_rad'} for j in cal['joints']]}
+    checks={}
+    for fault in (False,True):
+        with tempfile.TemporaryDirectory(prefix='guarded-home-') as d:
+            root=Path(d);bus=Bus(cal,ids,mode=3)
+            try:
+                # All starts are close to HOME and inside a single encoder revolution.
+                # Give the mouth and hip yaw a negative offset to avoid the 4095 seam.
+                with bus.lock:
+                    for j,id in enumerate(ids):
+                        b=bus.regs[id];zero=bus.cal[id]['zero_tick']
+                        raw=round(zero+(home[j]-.04)/R)
+                        assert 0<=raw<=4095
+                        b[36:38]=struct.pack('<H',885);b[38:40]=struct.pack('<H',1750)
+                        b[63]=52;b[84:86]=struct.pack('<H',400);b[100:102]=struct.pack('<H',885)
+                        b[116:120]=b[132:136]=struct.pack('<i',raw)
+                    before={id:bytes(b) for id,b in bus.regs.items()}
+                original_read=bus.read
+                def read(id,a,n):
+                    b=bytearray(original_read(id,a,n))
+                    if fault and id==14 and bus.regs[id][64] and a<=126 and a+n>=128:
+                        b[126-a:128-a]=struct.pack('<h',400)
+                    return bytes(b)
+                bus.read=read
+                calibration=root/'calibration.json';calibration.write_text(json.dumps(cal))
+                params=root/'params.toml';params.write_text(f'[bus]\nport="{bus.path}"\ncalibration="{calibration}"\n[audio]\nenabled=false\n')
+                telemetry=root/'telemetry.jsonl'
+                read_fd,write_fd=os.pipe()
+                env={**os.environ,'DUCK_HOME_WATCHDOG_FD':str(write_fd),'DUCK_RUNTIME_DIR':str(root/'run')}
+                try:
+                    out=subprocess.run([str(args.robotd),'--params',str(params),'--socket',str(root/'init.sock'),
+                        'init','--guarded','--duration','5s','--telemetry',str(telemetry)],
+                        env=env,pass_fds=(write_fd,),capture_output=True,text=True,timeout=12)
+                finally:os.close(read_fd);os.close(write_fd)
+                events=[json.loads(line) for line in telemetry.read_text().splitlines()]
+                key='guarded_home_fault' if fault else 'guarded_home_success'
+                (args.output/(key+'.jsonl')).write_text(telemetry.read_text())
+                (args.output/(key+'.log')).write_text(out.stdout+out.stderr)
+                (args.output/(key+'-writes.json')).write_text(json.dumps(bus.writes,indent=2))
+                tail=events[-1]
+                assert tail['event']=='home_cleanup' and tail['all_off'] and tail['settings_restored'],(out.stderr,tail)
+                assert (out.returncode==0)==(not fault),(out.stderr,tail)
+                assert tail['reached']==(not fault)
+                assert not bus.unsafe_enables,bus.unsafe_enables
+                for id,b in bus.regs.items():
+                    assert b[:64]==before[id][:64] and b[64]==0
+                    for a,n in ((80,6),(88,4),(98,1),(100,2),(108,8)):
+                        assert b[a:a+n]==before[id][a:a+n],(id,a)
+                checks[key+'_relaxes_and_restores']=True
+            finally:bus.close()
+    return checks
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--robotd',type=Path,required=True);p.add_argument('--robotctl',type=Path,required=True);p.add_argument('--calibration',type=Path,help='Existing extended calibration; omit for a generated synthetic fixture')
@@ -266,6 +323,7 @@ def main():
         (args.output/'low-voltage.log').write_text(low.log.read_text())
         if low.actions.exists():(args.output/'low-voltage-host-actions.log').write_text(low.actions.read_text())
         low.close()
+    result['checks'].update(check_guarded_home(args))
     result['complete']=True
     (args.output/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
     print(json.dumps(result,ensure_ascii=False,indent=2))
