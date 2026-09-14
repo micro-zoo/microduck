@@ -10,12 +10,14 @@ The existing joint telemetry and 3D view, with three supported controls:
 
 Support the trunk with the head, neck and legs free to move. These are supported
 pose operations, without an IMU or walking policy. Preparation currently takes
-about 30 seconds to change modes and verify the original settings. Its progress
+less than 5 seconds on the tested board to change modes and verify the original settings. Its progress
 is shown as `准备电机 n/15`; UART handoff is not displayed as a motor disconnection.
 Cancelling also waits for the original settings to be restored. An unloaded neck can fall again.
 Arrival requires every joint within 2 degrees for one second, with no more than
-0.5 degrees of encoder movement within that second. Motion uses the existing
-guarded recovery path at no more than 6 degrees/s, taking 5–30 seconds.
+0.5 degrees of encoder movement within that second. Interactive motion uses a synchronized trapezoidal ramp bounded at 20 degrees/s
+and 40 degrees/s². A typical HOME/zero switch takes about 2 seconds of travel,
+followed by the existing one-second settling check. A deeply slumped neck requires
+a longer path. The standalone guarded diagnostic retains its original slow ramp.
 
 Only the page that started the session can change its held pose. Other authorized
 pages can still unload. Closing, reloading, disconnecting or suspending the owning
@@ -77,3 +79,11 @@ motors; these checks establish control behavior, not physical tracking accuracy.
 Real supported motion must be verified separately with the robot supported.
 Three consecutive empty/failed telemetry reads close and reopen the UART, so a
 failed read handoff cannot leave the page indefinitely showing old samples.
+
+Unicast setup transactions finish after complete validated replies and a 2 ms
+quiet interval, retaining the original timeout for delayed/missing replies. The
+existing parser still rejects CRC errors and truncated frames; extra replies are
+returned for the existing ID/count checks. Device ownership is still scanned in
+full before every write, using `os.scandir` to avoid repeated Path allocations.
+Mode writes retain their settling delay. RAM writes are read back immediately;
+an already correct current-position goal is verified without rewriting it.

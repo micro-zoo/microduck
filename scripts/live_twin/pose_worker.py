@@ -6,6 +6,7 @@ HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(HERE.parent))
 import configure_extended_position as modes
 from run_guarded_home import recovery_calibration,reconcile
+from reply_transport import accelerated
 
 def save(path,value):
     path=Path(path);tmp=path.with_suffix(path.suffix+'.tmp')
@@ -54,7 +55,7 @@ class Commands:
 
 def transport(directory):
     sys.path.insert(0,str(directory));import servo_config
-    return servo_config
+    return accelerated(servo_config)
 
 def cleanup(run,port,protocol_dir):
     run=Path(run);p=run/'before.json'
@@ -105,7 +106,7 @@ def run(args):
         try:
             with protocol.LinuxPort(args.port) as wire:
                 wire.open_serial();wire.set_baud(1000000)
-                modes.execute(protocol,wire,protocol.ServoBus(wire),{j['id']:j for j in cal['joints']},journal,True,service_check=commands.check,progress=preparation)
+                modes.execute(protocol,wire,protocol.ServoBus(wire),{j['id']:j for j in cal['joints']},journal,True,service_check=commands.check,progress=preparation,ram_settle=0)
         finally:journal.close()
         commands.check()
         serial_fd=os.open(args.port,os.O_WRONLY|os.O_NOCTTY|os.O_NONBLOCK);fds.append(serial_fd)

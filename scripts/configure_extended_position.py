@@ -52,7 +52,7 @@ def goals(entry,present):
         result.append(math.trunc(raw))
     return result
 
-def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe_goals=False,service_check=None,progress=None):
+def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe_goals=False,service_check=None,progress=None,ram_settle=.03):
     before={id:snapshot(bus,id) for id in IDS}
     journal.record('extended_preflight',snapshot={id:v.hex() for id,v in before.items()},apply=apply)
     if not apply:
@@ -63,7 +63,7 @@ def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe
         journal.record('extended_write_intent',id=id,address=address,data=data.hex())
         frames=wire.exchange(packet(protocol,id,address,data),.12)
         if any(f.device!=id or f.body!=b'\x55\x00' for f in frames) or len(frames)>1:raise RuntimeError('Unexpected WRITE reply; no resend')
-        time.sleep(.03)
+        time.sleep(.03 if address<64 else ram_settle)
         actual=bus.read(id,address,len(data))
         journal.record('extended_write_readback',id=id,address=address,actual=actual.hex(),matches=actual==data)
         if verify and actual!=data:raise RuntimeError(f'ID {id} register {address} did not retain written value; no resend')
@@ -76,10 +76,14 @@ def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe
     def hold_present(id):
         # Firmware 53 was observed to track present position in Goal Position while
         # torque is OFF, so a current-pose hold need not read back one identical tick.
-        write(id,116,bus.read(id,132,4),verify=False)
         block=bus.read(id,116,20)
         goal=int.from_bytes(block[:4],'little',signed=True)
         present=int.from_bytes(block[16:20],'little',signed=True)
+        if abs(goal-present)>2:
+            write(id,116,bus.read(id,132,4),verify=False)
+            block=bus.read(id,116,20)
+            goal=int.from_bytes(block[:4],'little',signed=True)
+            present=int.from_bytes(block[16:20],'little',signed=True)
         if abs(goal-present)>2:raise RuntimeError('Could not confirm a current-pose hold goal')
         journal.record('extended_hold_confirmed',id=id,goal=goal,present=present)
     for id in IDS:
