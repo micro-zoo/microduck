@@ -1,10 +1,22 @@
 //! Read-only check of the HOME telemetry transaction sizes at the real loop rate.
 //! Stop all other UART consumers before running with the serial path as argument.
+//! Add `--wide` to compare the original 83-byte burst with the normal smaller blocks.
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).ok_or("serial path required")?;
+    let mut args = std::env::args().skip(1);
+    let path = args.next().ok_or("serial path required")?;
+    let wide = match (args.next().as_deref(), args.next()) {
+        (None, None) => false,
+        (Some("--wide"), None) => true,
+        _ => return Err("usage: check_home_bus SERIAL [--wide]".into()),
+    };
+    let blocks: &[(u8, u8)] = if wide {
+        &[(64, 83)]
+    } else {
+        &[(124, 23), (64, 7), (98, 1)]
+    };
     let serial = serialport::new(path, 1_000_000)
         .timeout(Duration::from_millis(30))
         .open()?;
@@ -23,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut longest = Duration::ZERO;
     while began.elapsed() < Duration::from_secs(10) {
         let tick = Instant::now();
-        for (a, n) in [(124, 23), (64, 7), (98, 1)] {
+        for &(a, n) in blocks {
             let first = bus.sync_read_raw_data(&ids, a, n);
             let value = if let Err(ref e) = first {
                 eprintln!("discarded read at {a}/{n}: {e}");
