@@ -211,6 +211,53 @@ The utility never reports an incomplete movement as a passed stage. Current is a
 load proxy; `joint_torque_nm` is intentionally null because XL330 has no joint torque sensor.
 A small ankle movement also does not, by itself, validate a real crossing of 0/4095.
 
+## Hand-supported HOME through robotd
+
+For a robot supported at the trunk with all joints free to move, the bounded HOME
+diagnostic uses the real `robotd init` calibration and goal writer. Stop `robotd` and
+the read-only twin first, then run on the board:
+
+```sh
+sudo python3 scripts/run_guarded_home.py --robotd /path/to/robotd --params /path/to/probe.toml --duration 10 --output /path/to/new-results-directory
+```
+
+The params file must specify `[bus] calibration` for all 15 joints. It must match
+the motor mode. Mode 3 is sufficient when the entire measured-to-HOME segment fits
+inside 0..4095; this does not validate crossing the encoder seam. HOME remains
+`DEFAULT_POSITION`, including the runtime's existing mouth convention.
+
+The launcher supplies an independent torque-off process. Direct `init --guarded`
+without its inherited watchdog pipe is refused. The probe reads and preloads the
+current pose at zero PWM, then applies P=800, I=D=0 and ramps to HOME. It checks
+actual arrival within 2 degrees for one second; sending all goals alone is not
+success. Both success and failure end with all motors OFF and original RAM tuning
+restored and read back. EEPROM, operating mode and production services are not changed
+by the launcher; the caller restores the read-only service afterwards.
+
+This diagnostic is for the XL330's 5 V rail: it requires 4.5..5.5 V, caps PWM at
+300/885 and stops above 350 mA input current on a joint or 2 A total, 40 C or a 3 C
+rise, an 8-degree tracking error, a 3-degree departure from the initial-to-HOME
+position corridor, or a telemetry gap above 150 ms. Commands move at most 6 degrees/s
+and 90 degrees total; actual servo catch-up is bounded separately at 60 degrees/s.
+The hardware bus watchdog is 300 ms. Existing hardware shutdown bits remain enabled.
+These are diagnostic limits, not measured joint-torque ratings or a walking qualification.
+
+Telemetry reads the necessary blocks at 124..146, 64..70 and 98, avoiding the unused
+registers in a large contiguous read. `cargo run --release -p duck-control --example
+check_home_bus -- /dev/serial0` is a ten-second read-only check at the same loop rate;
+it also requires both UART consumers stopped and every motor OFF. A checksum, frame,
+ID or timeout error discards that read and allows one fresh read after the transport
+drains old RX bytes. No goal or register write is repeated. A second failure stops the
+probe, and all recovered reads still count toward the 150 ms telemetry deadline.
+Recovery warnings remain in the log; success does not mean the UART is fault-free.
+The probe's JSONL
+records measured positions, input current, PWM, speed, voltage and temperature. A
+fault sample is saved after torque-off and restoration, so logging cannot delay shutdown.
+
+Standalone init does not run a policy, consume an IMU, or execute the daemon's battery
+poweroff branch. It therefore tests calibrated HOME on the real bus without claiming
+that this board's policy/IMU/power configuration is qualified for full daemon deployment.
+
 
 ## End-to-end control-path check with virtual servos
 

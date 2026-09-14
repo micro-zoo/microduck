@@ -287,6 +287,13 @@ enum Command {
     Init {
         #[arg(long, default_value = "2s", value_parser = parse_duration)]
         duration: Duration,
+        /// Hand-supported HOME probe with telemetry, bounded output and automatic relax.
+        /// Use scripts/run_guarded_home.py for the independent torque-off watchdog.
+        #[arg(long, requires = "telemetry")]
+        guarded: bool,
+        /// New JSONL file for the guarded probe's measured motion and cleanup result.
+        #[arg(long, requires = "guarded")]
+        telemetry: Option<PathBuf>,
     },
 }
 
@@ -976,7 +983,12 @@ async fn main() -> ExitCode {
         None => JointCalibration::default(),
     };
 
-    if let Some(Command::Init { duration }) = args.command {
+    if let Some(Command::Init {
+        duration,
+        guarded,
+        telemetry,
+    }) = args.command
+    {
         // init opens the motor bus itself. Keep ownership until the whole ramp returns,
         // so neither a daemon nor another init can join it partway through.
         let _instance_lock = match claim_lock(&args.socket) {
@@ -987,6 +999,9 @@ async fn main() -> ExitCode {
             }
         };
         duck_ipc_proto::log_startup_identity!("robotd");
+        if guarded {
+            return run_guarded_init(&params, &calibration, duration, telemetry.as_ref().unwrap());
+        }
         return run_init(&params, &calibration, duration);
     }
 
@@ -1066,6 +1081,65 @@ async fn main() -> ExitCode {
     let _ = control.join();
     let _ = std::fs::remove_file(&args.socket);
     code
+}
+
+/// Enable torque and ramp to the home pose.
+fn run_guarded_init(
+    params: &Params,
+    calibration: &JointCalibration,
+    duration: Duration,
+    telemetry: &Path,
+) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    {
+        // A live inherited pipe belongs to the launcher's independent torque-off child.
+        // Direct invocation without that process-death protection is refused.
+        let pipe = std::env::var("DUCK_HOME_WATCHDOG_FD")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok());
+        let connected = pipe.is_some_and(|fd| {
+            let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+            unsafe {
+                libc::fstat(fd, status.as_mut_ptr()) == 0
+                    && status.assume_init().st_mode & libc::S_IFMT == libc::S_IFIFO
+            }
+        });
+        if !connected {
+            tracing::error!(
+                "guarded init requires scripts/run_guarded_home.py and its independent watchdog"
+            );
+            return ExitCode::FAILURE;
+        }
+        let outcome = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut log = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(telemetry)?;
+            let mut io = duck_control::bus::DynamixelIo::open(&params.bus.port)?
+                .with_calibration(*calibration);
+            io.guarded_home(duration, &mut log)?;
+            log.sync_all()?;
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                tracing::warn!(
+                    "HOME measured within 2 degrees, all motors relaxed and settings restored"
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "guarded HOME stopped");
+                ExitCode::FAILURE
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (params, calibration, duration, telemetry);
+        tracing::error!("guarded init requires Linux");
+        ExitCode::FAILURE
+    }
 }
 
 /// Enable torque and ramp to the home pose.
