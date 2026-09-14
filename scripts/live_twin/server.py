@@ -3,7 +3,7 @@
 from pathlib import Path
 from http.server import ThreadingHTTPServer,SimpleHTTPRequestHandler
 from collections import deque
-import argparse,json,math,signal,subprocess,threading,time,sys
+import argparse,json,math,signal,subprocess,threading,time,sys,struct
 from bus import ReadBus,MOTORS,IDS,RAD_PER_TICK,relative_tick,protocol
 import bus as bus_module
 from control import Access,Controller,SystemdRunner,ControlError
@@ -47,6 +47,13 @@ class State:
             'hardware_error':sample['errors'][j],'watchdog':sample['watchdog'][j],'status_error':0,
             'operating_mode':4} for j,id in enumerate(IDS)}
         self.publish(frame,[],0)
+    def publish_preparation(self,id,snapshot):
+        raw=bytes.fromhex(snapshot)
+        if id not in IDS or len(raw)!=147 or raw[7]!=id or raw[64]!=0:raise ValueError('Invalid unpowered preparation sample')
+        self.publish({id:{'id':id,'raw_tick':struct.unpack_from('<i',raw,132)[0],
+            'current_ma':struct.unpack_from('<h',raw,126)[0],'velocity_raw':struct.unpack_from('<i',raw,128)[0],
+            'voltage_v':struct.unpack_from('<H',raw,144)[0]/10,'temperature_c':raw[146],
+            'torque':0,'hardware_error':raw[70],'status_error':0,'watchdog':raw[98],'operating_mode':raw[11]}},[],None)
     def mark_torque_off(self):
         with self.lock:
             # Do not refresh pose timestamps: the robot may move freely after relax.
@@ -109,13 +116,17 @@ def read_forever(state,port):
                     try:meta[id]=bus.metadata(id)
                     except Exception as e:errors.append(str(e))
                 with state.lock:state.metadata=meta
-                next_metadata=time.monotonic()+10
+                next_metadata=time.monotonic()+10;empty_reads=0
                 while not state.stop.is_set() and not state.reader_pause.is_set():
                     started=time.monotonic()
                     try:
                         frame,errors,cycle=bus.sample()
+                        empty_reads=empty_reads+1 if not frame else 0
+                        if empty_reads>=3:raise RuntimeError('总线连续无响应，正在重新连接串口')
                         state.publish(frame,errors,cycle)
-                    except Exception as error:state.publish({},[str(error)],None)
+                    except Exception as error:
+                        empty_reads+=1;state.publish({},[str(error)],None)
+                    if empty_reads>=3:break
                     if time.monotonic()>=next_metadata:
                         assert_robotd_stopped();wire.assert_free()
                         # Only retry metadata for missing devices. Known devices' critical

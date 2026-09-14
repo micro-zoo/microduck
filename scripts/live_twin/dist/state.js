@@ -3,3 +3,5 @@ export function localAngle(raw,zero){return ((((raw-zero+2048)%4096)+4096)%4096-
 export function format(value,digits=2){return finite(value)?value.toFixed(digits):'—';}
 export function motorUsable(motor,streamAge=0){return Boolean(motor?.online&&motor.calibrated&&finite(motor.angle_rad)&&streamAge<1500);}
 export function poseAngles(motors,streamAge=0){return Object.fromEntries(motors.filter(m=>motorUsable(m,streamAge)).map(m=>[m.name,m.angle_rad]));}
+
+export function samplingPaused(frame,age=0){return age<1500&&['preparing','stopping','recovering'].includes(frame?.control?.phase);}

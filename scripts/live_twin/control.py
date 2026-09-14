@@ -119,7 +119,7 @@ class Controller:
             except Exception as e:self.run=None;self.owner=None;raise ControlError('无法生成控制标定：'+str(e),400)
             (self.run/'source-calibration.json').write_text(json.dumps(cal)+'\n')
         (self.runs/'active-run.json').write_text(json.dumps({'name':self.run.name})+'\n')
-        self.status.update(phase='stopping' if pose=='relax' else 'preparing',pose=pose,owner_id=self.owner,progress=0.,mode_active=False,message='正在卸力' if pose=='relax' else '正在准备电机 · 保持躯干支撑')
+        self.status.update(phase='stopping' if pose=='relax' else 'preparing',pose=pose,owner_id=self.owner,progress=0.,prepared=None,mode_active=False,message='正在卸力' if pose=='relax' else '正在准备电机 · 保持躯干支撑')
         self._publish();self.thread=threading.Thread(target=self._work,args=(self.run,pose),daemon=True);self.thread.start()
     def relax(self):
         with self.lock:
@@ -149,7 +149,12 @@ class Controller:
                 self._update(phase='idle' if okay else 'fault',owner_id=None,mode_active=False,message=message_for(result),last_result=result)
     def _telemetry(self,event):
         kind=event.get('event')
-        if kind=='home_preflight':self._update(mode_active=True)
+        if kind=='preparation':
+            if event.get('id') is not None:self.state.publish_preparation(event['id'],event['snapshot'])
+            if not self.stop_requested:self._update(prepared=event['done'],message=f"准备电机 {event['done']} / {event['total']} · 尚未上力")
+        elif kind=='restoring':
+            self.stop_requested=True;self._update(phase='stopping',message='正在卸力并恢复电机设置')
+        elif kind=='home_preflight':self._update(mode_active=True)
         elif kind=='pose_moving':
             with self.lock:
                 self.awaiting_move=False;self._update(pose=event['pose'],duration_s=event['duration_s'])
@@ -164,13 +169,17 @@ class Controller:
                 self._publish()
         elif kind=='home_cleanup' and event.get('all_off'):self.state.mark_torque_off()
     def _work(self,run,pose):
-        process=None;cursor=0;pending='';result={}
+        process=None;cursor=0;pending='';result={};preparation_stamp=None
         try:
             self.state.pause_bus()
             if pose!='relax' and (self.stop_requested or time.monotonic()-self.last_lease>BROWSER_TIMEOUT):pose='relax'
             process=self.runner.start(run,pose)
             with self.lock:self.process=process
             while True:
+                preparation=run/'preparation.json'
+                if preparation.exists() and preparation.stat().st_mtime_ns!=preparation_stamp:
+                    preparation_stamp=preparation.stat().st_mtime_ns
+                    self._telemetry(json.loads(preparation.read_text()))
                 telemetry=run/'telemetry.jsonl'
                 if telemetry.exists():
                     with telemetry.open() as f:f.seek(cursor);chunk=f.read(262144);cursor=f.tell()
@@ -181,7 +190,7 @@ class Controller:
                         if line:self._telemetry(json.loads(line))
                 if pose!='relax':
                     with self.lock:
-                        expired=time.monotonic()-self.last_lease>BROWSER_TIMEOUT
+                        expired=not self.stop_requested and time.monotonic()-self.last_lease>BROWSER_TIMEOUT
                         self.lease_expired=self.lease_expired or expired
                         if expired or self.stop_requested:
                             self.stop_requested=True;self._send(b'S');self.status.update(phase='stopping',message='网页断联，正在卸力' if expired else '正在卸力');self._publish()

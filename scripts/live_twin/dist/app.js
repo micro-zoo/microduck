@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import {OrbitControls} from './vendor/three/OrbitControls.js';
 import {STLLoader} from './vendor/three/STLLoader.js';
 import {createPoseGraph} from './rig.js';
-import {format,finite,motorUsable,poseAngles} from './state.js';
+import {format,finite,motorUsable,poseAngles,samplingPaused} from './state.js';
 import {createControls} from './controls.js';
 const controlUI=createControls();
 const $=id=>document.getElementById(id);
@@ -60,10 +60,11 @@ function updateDetails(){
 function paintState(){
  const age=performance.now()-lastReceived,frame=lastFrame;
  const streamFresh=Boolean(frame&&age<1500),online=streamFresh?frame.motors.filter(m=>m.online).length:0;
- const status=online===15?'live':online?'partial':'offline';
+ const paused=samplingPaused(frame,age);
+ const status=paused?'partial':online===15?'live':online?'partial':'offline';
  $('connection').className=`connection ${status}`;
- $('connection').querySelector('span').textContent=status==='live'?'LIVE / 实时':status==='partial'?`PARTIAL / ${online} 在线`:frame?'OFFLINE / 遥测中断':'等待遥测';
- $('online-count').innerHTML=`${frame?online:'—'}<small>/ 15</small>`;
+ $('connection').querySelector('span').textContent=paused?(frame.control.phase==='preparing'?'PREPARING / 准备电机':'RESTORING / 恢复电机'):status==='live'?'LIVE / 实时':status==='partial'?`PARTIAL / ${online} 在线`:frame?'OFFLINE / 遥测中断':'等待遥测';
+ $('online-count').innerHTML=paused?'交接中':`${frame?online:'—'}<small>/ 15</small>`;
  $('rate').innerHTML=`${streamFresh?format(frame.read_hz,1):'—'}<small>Hz</small>`;
  const valid=streamFresh?frame.motors.filter(m=>motorUsable(m,age)):[];
  $('max-error').innerHTML=`${valid.length?format(Math.max(...valid.map(m=>Math.abs(m.angle_deg)))):'—'}<small>°</small>`;
@@ -77,12 +78,12 @@ function paintState(){
   row.classList.toggle('missing',!good);row.classList.toggle('fault',Boolean(motor?.hardware_error||motor?.single_turn_range_risk));
   row.title=motor?.single_turn_range_risk?'零位已采集；单圈运动范围待处理':motor?.online?'':'暂无当前读数';
  }
- $('model-status').textContent=valid.length===15?'已补偿位置 · 实时跟随':valid.length?`实时 ${valid.length}/15 · 缺失关节保持最后姿态`:'模型参考 / 最后姿态 · 非实时';
+ $('model-status').textContent=paused?'控制准备／恢复中 · 未更新的关节保留最后姿态':valid.length===15?'已补偿位置 · 实时跟随':valid.length?`实时 ${valid.length}/15 · 缺失关节保持最后姿态`:'模型参考 / 最后姿态 · 非实时';
  $('model-status').className=`stage-status ${valid.length===15?'live':''}`;
  const risks=frame?.motors.filter(m=>m.single_turn_range_risk).length||0;
  const mouth=frame?.motors.find(m=>m.name==='mouth');
  const marker=$('mouth-marker');if(marker)marker.textContent=`34 · ${motorUsable(mouth,age)?format(mouth.angle_deg)+'°':'—'}`;
- $('footer-status').textContent=frame?.calibration_error?'标定记录不可用':streamFresh&&online?`${format(frame.cycle_ms,1)} ms / 读取周期${risks?` · ${risks} 路单圈行程待检查`:''}`:frame?.last_error||'等待控制板连接';
+ $('footer-status').textContent=paused?'串口由控制程序使用，完成后自动恢复实时采样':frame?.calibration_error?'标定记录不可用':streamFresh&&online?`${format(frame.cycle_ms,1)} ms / 读取周期${risks?` · ${risks} 路单圈行程待检查`:''}`:frame?.last_error||'等待控制板连接';
  updateDetails();
 }
 function receive(frame){

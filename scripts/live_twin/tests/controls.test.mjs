@@ -16,3 +16,11 @@ test('only the holding owner can change poses; busy actions cannot be double sub
  assert.equal(buttonState(frame,{id:1},0,true).canMove,false);
  assert.equal(buttonState({...frame,control:{...frame.control,phase:'moving'}},{id:1},0).canMove,false);
 });
+
+import {samplingPaused} from '../dist/state.js';
+test('preparation is a UART handoff, while a stale connection remains disconnected',()=>{
+ assert.equal(samplingPaused({control:{phase:'preparing'}},0),true);
+ assert.equal(samplingPaused({control:{phase:'stopping'}},0),true);
+ assert.equal(samplingPaused({control:{phase:'preparing'}},2000),false);
+ assert.equal(samplingPaused({control:{phase:'moving'}},0),false);
+});

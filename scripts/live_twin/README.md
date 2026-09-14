@@ -9,7 +9,10 @@ The existing joint telemetry and 3D view, with three supported controls:
   returns the UART to the telemetry reader.
 
 Support the trunk with the head, neck and legs free to move. These are supported
-pose operations, without an IMU or walking policy. An unloaded neck can fall again.
+pose operations, without an IMU or walking policy. Preparation currently takes
+about 30 seconds to change modes and verify the original settings. Its progress
+is shown as `准备电机 n/15`; UART handoff is not displayed as a motor disconnection.
+Cancelling also waits for the original settings to be restored. An unloaded neck can fall again.
 Arrival requires every joint within 2 degrees for one second, with no more than
 0.5 degrees of encoder movement within that second. Motion uses the existing
 guarded recovery path at no more than 6 degrees/s, taking 5–30 seconds.
@@ -72,3 +75,5 @@ unload, browser-lease loss, control-loop stall and producer-death checks inside
 the existing unprivileged systemd sandbox. Its private PTY bus has ideal emulated
 motors; these checks establish control behavior, not physical tracking accuracy.
 Real supported motion must be verified separately with the robot supported.
+Three consecutive empty/failed telemetry reads close and reopen the UART, so a
+failed read handoff cannot leave the page indefinitely showing old samples.

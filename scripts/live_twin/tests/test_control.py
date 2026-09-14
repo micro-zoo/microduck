@@ -1,4 +1,4 @@
-import http.client,json,math,sys,tempfile,threading,time,unittest
+import http.client,json,math,sys,tempfile,threading,time,unittest,types
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
@@ -107,6 +107,38 @@ class Tests(unittest.TestCase):
         self.assertFalse((self.root/'runs'/'active-run.json').exists())
         self.assertTrue(json.loads((run/'result.json').read_text())['all_off'])
         self.assertIsNone(self.controller.owner)
+
+    def test_preparation_reports_progress_without_faking_all_motors_fresh(self):
+        self.controller.start('home',1);self.wait(lambda:self.runner.process is not None)
+        raw=bytearray(147);raw[7]=20;raw[11]=4;raw[132:136]=(2050).to_bytes(4,'little');raw[144:146]=(51).to_bytes(2,'little');raw[146]=29
+        self.controller._telemetry({'event':'preparation','id':20,'snapshot':raw.hex(),'done':1,'total':15})
+        self.assertEqual(self.state.control['phase'],'preparing')
+        self.assertEqual(self.state.control['prepared'],1)
+        self.assertEqual(self.state.latest[20][0]['raw_tick'],2050)
+        self.assertEqual(self.state.latest[21][0]['raw_tick'],2048)
+
+    def test_empty_bus_reads_reopen_uart_and_recover(self):
+        import server
+        opened=[];reads=[];state=self.state
+        class Port:
+            def __init__(self,path):pass
+            def __enter__(self):return self
+            def __exit__(self,*args):pass
+            def open_serial(self):opened.append(True)
+            def set_baud(self,baud):pass
+            def assert_free(self):pass
+        class Reader:
+            def __init__(self,wire):pass
+            def metadata(self,id):return state.metadata[id]
+            def sample(self):
+                reads.append(True)
+                if len(reads)<=3:return {},[],0
+                state.stop.set()
+                return {20:{'id':20,'raw_tick':2100,'torque':0,'hardware_error':0,'status_error':0}},[],0
+        with patch.object(server,'protocol',types.SimpleNamespace(LinuxPort=Port)),patch.object(server,'ReadBus',Reader),patch.object(server,'assert_robotd_stopped'):
+            server.read_forever(state,'unused')
+        self.assertEqual(len(opened),2)
+        self.assertEqual(state.latest[20][0]['raw_tick'],2100)
 
     def test_guardian_requires_browser_and_control_progress_independently(self):
         d=Deadlines(0);d.update(ord('T'),0);d.update(ord('P'),.4)

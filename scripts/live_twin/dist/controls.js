@@ -19,9 +19,9 @@ export function createControls(){
   $('home-button').disabled=!buttons.canMove;$('zero-button').disabled=!buttons.canMove;$('relax-button').disabled=!buttons.canRelax;
   $('control-message').textContent=age>=1500&&frame?'连接中断 · 等待自动卸力':c.message||(session?'等待电机状态':'连接控制器…');
   $('control-indicator').className='control-indicator '+(c.phase==='holding'?'holding':['preparing','moving','stopping','recovering'].includes(c.phase)?'busy':c.phase==='fault'?'fault':'');
-  $('control-progress').textContent=c.phase==='moving'&&Number.isFinite(c.progress)?`${Math.round(c.progress*100)}%`:'';
+  $('control-progress').textContent=c.phase==='preparing'&&Number.isFinite(c.prepared)?`${c.prepared} / 15`:c.phase==='moving'&&Number.isFinite(c.progress)?`${Math.round(c.progress*100)}%`:'';
   $('control-mode').textContent=c.mode_active?'● CONTROL / MODE 4':'● TELEMETRY';
-  $('control-hint').textContent=c.owner_id&&!buttons.own?'另一个页面正在控制；卸力按钮仍可停止动作。':c.phase==='holding'?'已保持姿态，可切换 HOME／回零，或点击卸力。回零为页面零位，嘴部闭合。':'请托住躯干。HOME 为默认姿态；回零为标定零位（嘴闭合）。网页断联自动卸力。';
+  $('control-hint').textContent=c.phase==='preparing'?'准备约需 30 秒，随后缓慢移动到位；请继续托住躯干。可随时点击卸力取消。':c.owner_id&&!buttons.own?'另一个页面正在控制；卸力按钮仍可停止动作。':c.phase==='holding'?'已保持姿态，可切换 HOME／回零，或点击卸力。回零为页面零位，嘴部闭合。':'请托住躯干。HOME 为默认姿态；回零为标定零位（嘴闭合）。网页断联自动卸力。';
   if(!c.enabled&&frame)$('control-message').textContent=c.message||'仅预览 · 未启用控制';
  }
  async function act(action){

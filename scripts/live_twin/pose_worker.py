@@ -98,11 +98,14 @@ def run(args):
         cal,changes=recovery_calibration(json.loads(args.calibration.read_text()),before,args.model_source,30,pose=args.pose)
         save(root/'calibration.json',cal);save(root/'recovery-intervals.json',changes)
         (root/'params.toml').write_text(f'[bus]\nport={json.dumps(args.port)}\ncalibration={json.dumps(str(root/"calibration.json"))}\n[audio]\nenabled=false\n')
+        def preparation(id=None,data=None,done=0,total=15):
+            save(root/'preparation.json',{'event':'preparation','id':id,'snapshot':data.hex() if data is not None else None,'done':done,'total':total})
+        preparation()
         journal=protocol.Journal()
         try:
             with protocol.LinuxPort(args.port) as wire:
                 wire.open_serial();wire.set_baud(1000000)
-                modes.execute(protocol,wire,protocol.ServoBus(wire),{j['id']:j for j in cal['joints']},journal,True,service_check=commands.check)
+                modes.execute(protocol,wire,protocol.ServoBus(wire),{j['id']:j for j in cal['joints']},journal,True,service_check=commands.check,progress=preparation)
         finally:journal.close()
         commands.check()
         serial_fd=os.open(args.port,os.O_WRONLY|os.O_NOCTTY|os.O_NONBLOCK);fds.append(serial_fd)
@@ -148,6 +151,7 @@ def run(args):
             try:os.close(fd)
             except OSError:pass
         if before is not None:
+            save(root/'preparation.json',{'event':'restoring'})
             try:
                 final=reconcile(protocol,args.port,before,restore_modes=True);save(root/'after.json',final)
                 result.update(all_off=True,settings_restored=True)
