@@ -508,8 +508,9 @@ enum RobotCommand {
 
     /// Point the camera at a trunk-frame point: X forward, Y left, Z up, metres.
     ///
-    /// The daemon runs the gaze IK against its own robot model and moves the head — no sign
-    /// conventions to remember. `robotctl robot look 1 0 0` looks straight ahead;
+    /// The daemon runs gaze IK against its robot model and sets the head intent. Actual
+    /// movement requires an enabled policy that consumes it; this is not direct joint control.
+    /// There are no sign conventions to remember. `robotctl robot look 1 0 0` looks straight ahead;
     /// `1 0.5 -0.1` looks ahead-left and slightly down. A point beyond the head's reach gets
     /// the closest gaze the joints allow, and says so.
     // `allow_negative_numbers`, or `look 0.3 0 -0.3` reads `-0.3` as a flag —

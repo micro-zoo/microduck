@@ -210,3 +210,48 @@ An inability to confirm torque OFF stops restoration and requires removing servo
 The utility never reports an incomplete movement as a passed stage. Current is an input-side
 load proxy; `joint_torque_nm` is intentionally null because XL330 has no joint torque sensor.
 A small ankle movement also does not, by itself, validate a real crossing of 0/4095.
+
+
+## End-to-end control-path check with virtual servos
+
+On Linux, the following uses an unprivileged systemd sandbox, real `robotd` and `robotctl` binaries, and the physical-encoder
+`DynamixelIo` code, with a private `/dev/pts/` device backed by a register-level emulator:
+
+```sh
+sudo python3 scripts/run_calibrated_control_path.py --robotd target/debug/robotd --robotctl target/debug/robotctl --calibration /path/to/joint-zero.extended.json --output /tmp/calibration-path-results
+```
+
+Omit `--calibration` for a generated synthetic fixture. The test covers configuration listing,
+calibrated startup readback, `robot init` through signed goal packets and model-angle feedback,
+reboot origin recovery, current-pose preloading before torque enable, `relax`, and refusal to
+write when actual motor mode mismatches the file. Identity files and IPC sockets are private
+as well. The sandbox has private devices, no capabilities, NoNewPrivileges and hidden host-manager sockets. The inner test refuses direct unsandboxed execution. Host power commands are recorded by inert command stubs, and shutdown paths are tested explicitly.
+
+The virtual motors respond instantly to a goal: this checks software wiring and coordinate
+consistency, not dynamics, fixture accuracy or physical tracking. `--fake` and `--sim` already
+exchange model-space angles, so this PTY check is needed to exercise encoder compensation.
+
+### Kinematic interfaces and their limits
+
+`robotctl robot look x y z --json` calls the daemon's head gaze IK in trunk-frame metres
+(+X forward, +Y left, +Z up). The result is a head-angle intent and a `clamped` flag; actual
+motion depends on the running policy. With policy disabled, the head target can change while
+motor goals remain held. `robot.head` and `robot.pose` likewise supply policy inputs.
+
+`robotctl robot init` performs an all-joint HOME interpolation without a policy. It is useful
+for the virtual-bus test, but must not be used as a single-ankle probe on a one-sided fixture.
+There is currently no general foot Cartesian IK or guarded arbitrary-joint position CLI.
+A physical calibration-path check on that fixture needs an appropriate restricted control
+interface and the matching deployed daemon; a standalone maintenance script does not prove
+that the production daemon has loaded the same calibration.
+
+
+The first PTY-only prototype did not isolate host power actions. A simulated 5.1 V reading
+met the runtime's default <=6.6 V empty-battery condition and could invoke a real host
+poweroff. PTY isolation alone must not be treated as a host sandbox. The launcher above is
+required; do not run the inner helper directly. The calibration case disables the battery
+shutdown setting only in its private synthetic config, while separate sandboxed tests
+exercise explicit and low-voltage poweroff requests as recorded events. Production battery
+protection is unchanged. The actual board's motor-rail/battery voltage relationship must be
+reviewed before deploying a new runtime; motor supply voltage is not automatically battery
+state of charge.
