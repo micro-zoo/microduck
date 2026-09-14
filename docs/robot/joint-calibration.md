@@ -226,21 +226,56 @@ the motor mode. Mode 3 is sufficient when the entire measured-to-HOME segment fi
 inside 0..4095; this does not validate crossing the encoder seam. HOME remains
 `DEFAULT_POSITION`, including the runtime's existing mouth convention.
 
+If the measured pose crosses the single-turn encoder seam, use the transactional
+extended-position path instead of asking the operator to place the robot at zero:
+
+```sh
+sudo python3 scripts/run_guarded_home.py --robotd /path/to/robotd --extended-calibration /path/to/joint-zero.extended.json --model-source /path/to/duck-control/src/model.rs --duration 10 --output /path/to/new-results-directory
+```
+
+The launcher captures the original mode and RAM settings while every motor is OFF,
+selects Mode 4, runs the same daemon HOME writer, then confirms all motors OFF before
+restoring the original mode and any tuning reset by that mode change. Partial mode
+configuration and failed HOME runs take the same restoration path.
+
+A hand-supported, slumped pose can be slightly outside the model interval. For this
+HOME-only transaction, the launcher records a temporary interval containing that
+measured pose with 3 degrees of clearance. The unpowered neck can hang below its
+normal policy interval; it may recover over a measured segment up to 175 degrees
+with a sufficiently long duration. Other joints more than 5 degrees outside the normal
+model are refused. HOME itself must be inside the normal model interval. The daemon
+still commands only the bounded current-pose-to-HOME segment, never an arbitrary
+target in the expanded interval. The original calibration is not edited. The generated
+`home-only-calibration.json` and `home-only.toml` are diagnostic records and must not be
+installed as policy configuration.
+
 The launcher supplies an independent torque-off process. Direct `init --guarded`
 without its inherited watchdog pipe is refused. The probe reads and preloads the
 current pose at zero PWM, then applies P=800, I=D=0 and ramps to HOME. It checks
-actual arrival within 2 degrees for one second; sending all goals alone is not
+actual arrival within 2 degrees for one second, with at most 0.5 degrees of measured
+position variation in that window. Instantaneous speed-register quantization does not
+decide settling; the actual-speed safety limit still applies. Sending all goals alone is not
 success. Both success and failure end with all motors OFF and original RAM tuning
 restored and read back. EEPROM, operating mode and production services are not changed
-by the launcher; the caller restores the read-only service afterwards.
+by the normal params path; the extended path restores its temporary mode changes.
+The caller restores the read-only service afterwards.
 
 This diagnostic is for the XL330's 5 V rail: it requires 4.5..5.5 V, caps PWM at
 300/885 and stops above 350 mA input current on a joint or 2 A total, 40 C or a 3 C
 rise, an 8-degree tracking error, a 3-degree departure from the initial-to-HOME
 position corridor, or a telemetry gap above 150 ms. Commands move at most 6 degrees/s
-and 90 degrees total; actual servo catch-up is bounded separately at 60 degrees/s.
+and 90 degrees total (175 degrees for supported neck recovery); actual servo catch-up
+is bounded separately at 60 degrees/s. A neck hanging around -140 degrees needs at
+least 27 seconds to reach its +20-degree HOME; use a 30-second trajectory.
 The hardware bus watchdog is 300 ms. Existing hardware shutdown bits remain enabled.
 These are diagnostic limits, not measured joint-torque ratings or a walking qualification.
+
+`--higher-effort` selects a bounded higher-output preset: PWM 600/885, 700 mA per-joint
+input current, and position D/I/P = 100/50/1600. The total-current, temperature, voltage,
+motion and telemetry limits above still apply. The integral term addresses persistent
+loaded position error and the derivative term adds damping. These settings are recorded
+in telemetry and restored on exit, like the default preset; the option does not change
+the running policy's gains.
 
 Telemetry reads the necessary blocks at 124..146, 64..70 and 98, avoiding the unused
 registers in a large contiguous read. `cargo run --release -p duck-control --example
