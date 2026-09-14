@@ -51,6 +51,8 @@ def main():
         files={
             'bin/robotd':args.robotd,'bin/robotctl':args.robotctl,
             'scripts/check_calibrated_control_path.py':ROOT/'scripts/check_calibrated_control_path.py',
+            'scripts/check_live_pose.py':ROOT/'scripts/check_live_pose.py',
+            'scripts/live_twin/guardian.py':ROOT/'scripts/live_twin/guardian.py',
             'scripts/export_joint_zero.py':ROOT/'scripts/export_joint_zero.py',
             'scripts/run_guarded_home.py':ROOT/'scripts/run_guarded_home.py',
             'scripts/configure_extended_position.py':ROOT/'scripts/configure_extended_position.py',

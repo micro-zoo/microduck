@@ -335,6 +335,8 @@ def main():
         if low.actions.exists():(args.output/'low-voltage-host-actions.log').write_text(low.actions.read_text())
         low.close()
     result['checks'].update(check_guarded_home(args))
+    from check_live_pose import check_live_pose
+    result['checks'].update(check_live_pose(args))
     result['complete']=True
     (args.output/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n')
     print(json.dumps(result,ensure_ascii=False,indent=2))

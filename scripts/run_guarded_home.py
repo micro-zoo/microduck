@@ -20,7 +20,7 @@ import configure_extended_position as modes
 from probe_ankle_position import Cutoff
 
 
-def recovery_calibration(document, before, model_source, duration):
+def recovery_calibration(document, before, model_source, duration,pose='home'):
     """Select encoder turns for this HOME-only transaction, including a slumped pose.
 
     The daemon still commands only its fixed HOME segment, at bounded speed/current.
@@ -34,6 +34,10 @@ def recovery_calibration(document, before, model_source, duration):
     ids = array('JOINT_IDS',int); home = array('DEFAULT_POSITION',float)
     if ids != list(modes.IDS) or len(home) != 15:
         raise ValueError('HOME source does not match the configured joints')
+    if pose=='zero':
+        from export_joint_zero import MOUTH_CLOSED
+        home=[MOUTH_CLOSED if id==34 else 0. for id in ids]
+    elif pose!='home':raise ValueError('Unsupported pose')
     result = copy.deepcopy(document)
     entries = result['joints']
     if result.get('position_mode') != 'extended_position' or len(entries)!=15 or {j['id'] for j in entries}!=set(ids):

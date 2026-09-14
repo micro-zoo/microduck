@@ -52,13 +52,13 @@ def goals(entry,present):
         result.append(math.trunc(raw))
     return result
 
-def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe_goals=False):
+def execute(protocol,wire,bus,entries,journal,apply,restore_original=False,probe_goals=False,service_check=None):
     before={id:snapshot(bus,id) for id in IDS}
     journal.record('extended_preflight',snapshot={id:v.hex() for id,v in before.items()},apply=apply)
     if not apply:
         print(json.dumps({'mode':4,'ids':IDS,'torque':'all off','writes':False}));return
     def write(id,address,data,verify=True):
-        stopped();wire.assert_free()
+        (service_check or stopped)();wire.assert_free()
         if bus.read(id,64,1)!=b'\x00':raise RuntimeError('Torque changed; stop immediately')
         journal.record('extended_write_intent',id=id,address=address,data=data.hex())
         frames=wire.exchange(packet(protocol,id,address,data),.12)
