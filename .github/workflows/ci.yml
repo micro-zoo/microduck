@@ -143,6 +143,9 @@ jobs:
       - name: xtask smoke test
         run: |
           cargo build --workspace --bins
+          sudo python3 scripts/run_calibrated_control_path.py \
+            --robotd target/debug/robotd --robotctl target/debug/robotctl \
+            --output /tmp/joint-calibration-path
           mkdir -p /tmp/bin
           cp target/debug/updaterd /tmp/bin/
           cp target/debug/robotd /tmp/bin/
