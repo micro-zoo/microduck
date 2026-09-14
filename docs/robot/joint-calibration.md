@@ -175,3 +175,38 @@ the journal and reconcile the actual modes before starting either controller.
 Tests sweep all 4096 installation phases, cross 4095 continuously, reject an unexpected
 counter reset, re-establish the correct origin after an explicit reset and reject ambiguous
 or out-of-range model coordinates. IMU configuration remains outside this feature.
+
+## Guarded ankle-only probe on a supported fixture
+
+`scripts/probe_ankle_position.py` is a bounded diagnostic, not a policy run. It assumes
+that the selected ankle is supported and can move toe-down: positive encoder counts for
+left ID 24 and negative counts for right ID 14 in the nominal Alpha assembly. Verify
+that actual direction while torque is OFF; a static zero capture does not establish it.
+Do not use it on an unverified mechanical stop or infer a jam merely from an early abort.
+
+With `robotd` and the twin stopped and all fifteen motors OFF, first inspect the plan:
+
+```sh
+python3 scripts/probe_ankle_position.py --id 14 --protocol-dir /root/calibration
+```
+
+`--apply` powers only that ankle in Mode 4 with zero PWM initially, seeds its current
+hold position, and limits output to 60/885 (about 6.78%). It asks for 1 degree, and only
+after that stage settles asks for 3 degrees total. It does not home or command a return
+toward the fixture. P gain defaults to 400; the only optional alternative is
+`--p-gain 800`, with the same output and current ceilings. Actual D/I/P registers are
+read back at 80/82/84 before power is applied.
+
+The probe records input current, PWM, torque-enable status, goal, internal position
+trajectory, measured position, speed, supply voltage and temperature at a nominal 50 Hz;
+the measured gaps are in the log. It stops for current above 100 mA, temperature at 40 C
+or a rise of 3 C, reverse motion, excessive excursion/speed, sustained following error
+without progress, a telemetry gap above 90 ms or a powered duration above 6 s. The bus
+watchdog is 300 ms. An independent process sends the already validated torque-OFF packet
+if the parent disappears or its 8 s deadline expires, even if the parent's logger blocks.
+
+On any exit, torque OFF is confirmed before original mode and tuning are restored.
+An inability to confirm torque OFF stops restoration and requires removing servo power.
+The utility never reports an incomplete movement as a passed stage. Current is an input-side
+load proxy; `joint_torque_nm` is intentionally null because XL330 has no joint torque sensor.
+A small ankle movement also does not, by itself, validate a real crossing of 0/4095.
