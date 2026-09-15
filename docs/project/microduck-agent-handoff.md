@@ -15,8 +15,9 @@
    0.12.0 / IPC API 28 的代码路径。不要用源码版本代替运行版本。
 4. 当前正式 `robotd` 虽然 active，但总线初始化失败，控制循环没有 tick，没有实时状态帧。
    本交接没有排除具体硬件/配置原因，也没有验证当前装配后的电机或 IMU。
-5. 现有 Live Twin 是串口诊断和独立受监护姿态控制工具。它尚不是与正式 daemon 并行的 IPC 查看器。
-   启动原来的 `microduck-twin` 服务会与 `robotd` 冲突，不要把这当成只读观察。
+5. 现有串口 Live Twin 是独立诊断和受监护姿态控制工具；新增的 IPC-only Twin 才是与正式
+   `robotd` 并行的只读查看器。默认 `microduck-twin.service` 不打开电机 UART，也没有控制 POST 接口，
+   由 `robotctl twin` 维护。
 
 ## 本次只读确认的运行状态
 
@@ -49,13 +50,14 @@
 | 15 路安装零位 | 工装零位转换为模型坐标；嘴部闭口显示 0 对应 runtime -5°；转换位于硬件 I/O 边界 | 历史工装读取已完成。重新装配后需核对适用性；当前正式 0.10.0 的标定接入未确认 |
 | 编码器跨圈恢复 | 临时 Mode 4、受限恢复区间、捕获并恢复原模式和 RAM 设置 | 受支撑的慢速 HOME 已实机通过；不等于允许任意全圈运动 |
 | UART RX DMA | 平台仓库增加 RX DMA 配置与恢复说明 | 2026-09-14 的 8,951 个普通读取周期、1,494 个宽读取周期无错误/重试；这是历史试验，不是当前总线已 ready 的证明 |
-| Live Twin 遥测与三维显示 | 15 路角度、关节选择、轨迹、模型跟随；嘴部铰链是近似模型 | 串口模式已实机验证；不能证明几何/物理精度 |
+| Live Twin 遥测与三维显示 | 串口模式与 IPC-only 模式；后者订阅 `robot.state`、显示实测/目标并不打开 UART | 串口模式已实机验证；IPC-only 后端与只读服务已实现，当前 0.10.0 板上仍无健康状态帧 |
 | HOME / 回零 / 卸力 | 固定姿态到位保持、同一持有会话切换、独立进程卸力与设置恢复 | 较慢版本的网页 HOME→保持约 21 秒→卸力→恢复在线已实机通过 |
 | 网页会话和故障处理 | Host/Origin/网段检查、页面 capability、单个姿态所有者、浏览器心跳和原生进度双监护、pidfd 停止目标生产者 | 隔离测试覆盖网页失联、控制进程卡住/被杀；浏览器不是唯一卸力保障 |
 | 串口交接显示与恢复 | 准备/恢复进度、连续空读或失败后重开 UART、取消后恢复原设置 | 实机完整准备和中途取消均验证；不再把有意的采样交接显示为全掉线 |
 | 准备提速 | 完整应答后结束等待、完整占用扫描用 `os.scandir`、读回确认后省去 RAM 空等、正确 hold goal 不重复写入 | 无加力实机准备 **3.21 秒**；缺失/延迟回复仍保留原超时，模式切换等待和写入核对保留 |
 | 交互姿态提速 | 最大 20°/s、40°/s² 的同步梯形轨迹，保留稳定到位检查 | 原生隔离测试通过；**加速后的真实 HOME/回零动作尚未验证** |
 | 普通 `robotd` 头颈和嘴部意图 | `robot.head`、`robot.look`、`robot.mouth`、`robot.subscribe` 的源码接口已有；嘴部 ID 34、向量索引 9、runtime -5°..+30° | head/look/mouth 依赖允许驱动的控制循环；嘴部会让 theremin/chorale 优先占用；不是无策略的直接伺服控制，当前板上仅验证只读 RPC |
+| 默认 IPC-only Twin | `microduck-twin.service`、`scripts/live_twin/ipc_server.py`、`robotctl twin status|enable|disable|restart` | 默认回环 HTTP 只读页面；不会打开 UART 或影响 robotd；随正式 daemon release 安装后开机启用 |
 
 加速前网页 HOME 实机记录：到位最大误差约 1.88°，保持约 21.17 秒，单电机峰值输入电流
 268 mA，最高 30°C，未发生读重试。不要把这些数字归给随后改成的 20°/s 轨迹。
@@ -127,9 +129,11 @@ ssh root@10.4.1.139 'journalctl -u robotd -n 30 --no-pager'
 不要直接用调试候选文件覆盖 `current` 并顺手启动步态。
 完整装配后，重新核对 motor ID、参考零位、模型空间解释与 IMU 适用条件。
 
-### C. 增加可与 daemon 并行的只读 Live Twin 后端
+### C. 维护可与 daemon 并行的只读 Live Twin 后端
 
-按协议说明第 5 节实施：只订阅 socket，不打开 UART、不启动姿态 worker、不修改控制模式。
+IPC-only 后端已按协议说明第 5 节实现：只订阅 socket，不打开 UART、不启动姿态 worker、不修改控制模式。
+默认服务由 `robotctl twin status|enable|disable|restart` 管理；它的 `disable` 只影响网页，
+不停止 `robotd`、`padd` 或电机功能。
 接受“旧版本缺少 robot.model / skeleton”和“订阅成功但无状态帧”这两类实际状态。
 缺失电流、温度、扭矩等字段应显示未知；不能将 command.head 当成实测头部。
 查看器退出不能卸力、停止 daemon 或切换策略。

@@ -11,9 +11,9 @@
 头颈接口是 `robot.head`，注视点接口是 `robot.look`。但目前它们是**策略输入意图**，
 不是一个“保持腿不动、无策略直接移动四个头颈舵机”的接口。
 
-现有 Live Twin 的三维界面可以复用；**当前实现不能与正式 `robotd` 同时读取电机串口**。
-正确的并行查看方式是增加只读 IPC 数据源，订阅 `robot.subscribe` 返回的 `robot.state`。
-该 Live Twin IPC 后端尚未实现，不能把设计方案当成已有功能。
+现有 Live Twin 的串口控制模式不能与正式 `robotd` 同时读取电机串口。现在新增了独立的
+**IPC-only Twin**：只订阅 `robot.subscribe` 返回的 `robot.state`，不打开 UART、不发送
+任何 robot intent。它可以作为默认 systemd 服务运行，不会停止或抢占 `robotd`。
 
 ## 1. 当前连接与实机快照
 
@@ -212,18 +212,18 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
 完整 15 路顺序以协议 `JOINT_NAMES` 为准。支持 `robot.model` 的版本可以获取模型名称顺序；
 当前板子不支持该方法，适配器应明确使用与运行版本核对过的顺序并检查向量长度，不能猜测索引。
 
-## 5. Live Twin 并行查看需要怎样改
+## 5. Live Twin 并行查看
 
-当前服务配置有 `Conflicts=robotd.service`；`server.py` 会检查 `robotd` 已停止，
-然后通过 `ReadBus` 独占 `/dev/serial0`。它的控制 worker 也与正式 daemon 互斥。
-**直接 `systemctl start microduck-twin` 可能停止当前 `robotd`，不是无影响的查看操作。**
-`--offline` 只显示模型，不是 daemon 的实时遥测。
+旧的串口诊断模式中，`server.py` 会检查 `robotd` 已停止，然后通过 `ReadBus` 独占 `/dev/serial0`；
+它的控制 worker 也与正式 daemon 互斥。默认服务现在改为 IPC-only，不再声明与 `robotd` 的冲突，
+不会打开 UART。`--offline` 只显示模型，不是 daemon 的实时遥测。
 
-建议增加一个独立、默认只读的 IPC 模式，保留现有串口诊断模式：
+IPC-only 模式已经实现为 `scripts/live_twin/ipc_server.py`，默认服务单元为
+`microduck-twin.service`。它保留现有串口诊断模式，但两者是不同的运行模式：
 
 1. 后端只连接 `/run/robotd.sock`，发送 `hello`、`robot.health` 和 `robot.subscribe`。
    初始以 10 Hz 查看，需要时再提高；使用 daemon 的服务端降采样。
-2. 用 `joints` 驱动模型，用 `targets` 绘制目标/追踪误差，浏览器沿用 HTTP/SSE。
+2. IPC-only 页面用 `joints` 显示实测模型角度，用 `targets` 显示目标/追踪误差，浏览器通过 HTTP/SSE 接收页面状态。
    该模式不创建 `ReadBus`、`Controller`、姿态 worker，也不修改电机模式。
 3. 实测角度已是 daemon 的模型坐标，不能再次应用工装零位、编码器取模或拼造 raw tick。
    如果沿用现有闭嘴为 0 的显示约定，只有嘴部需显式做
@@ -232,13 +232,31 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
 4. 状态流没有的逐电机电流、温度、原始编码器和扭矩位显示为未知。
    不可用 `gain`、`policy="held"` 或 socket 已连接来虚构这些测量值。
    单独标识连接状态、数据新鲜度与 daemon 健康状态；断流后保留最后姿态但明确标注过期。
-5. 使用不含串口互斥和控制权限的单独 viewer 服务；不要直接删除现有串口模式的互斥保护。
+5. 使用不含串口互斥和控制权限的单独 viewer 服务；不要直接删除现有串口模式的互斥保护。当前默认服务监听 `127.0.0.1:8765`，通过 SSH 转发访问。
    浏览器刷新、关闭或 viewer 崩溃只结束订阅，不能触发 `robot.relax` 或影响正式控制。
 6. 验证查看器启动、关闭、重连时 `robotd` PID 不变、无新增 UART 持有者，控制循环和数据都正常；
-   再在有支撑的运动中核对模型追踪。当前总线未就绪，因此这一项尚不能做实机通过结论。
+   再在有支撑的运动中核对模型追踪。页面可在 `robotd` 不健康时运行，但应明确显示无状态帧。
 
 新地址也不在旧 Live Twin 默认的 USB 控制 Host/网段列表中。不要为查看而放开所有写接口。
-未来只读 viewer 可监听板上 loopback，再通过 SSH 转发 HTTP 到电脑；监听范围和控制授权分别处理。
+使用 `robotctl` 维护服务：
+
+```sh
+robotctl twin status
+sudo robotctl twin enable
+sudo robotctl twin disable
+sudo robotctl twin restart
+```
+
+`enable` 会设置开机启动并立即启动，`disable` 只停止并禁用 Twin，不停止 `robotd`、
+`padd` 或任何电机功能。`status --json` 返回 unit 状态、URL 和 `read_only=true`。
+电脑访问默认页面时建立 SSH 转发：
+
+```sh
+ssh -L 8765:127.0.0.1:8765 root@10.4.1.139
+```
+
+随后打开 `http://127.0.0.1:8765/`。该页面本身没有控制 POST 接口；需要动作时使用
+正式 `robotd` RPC，并遵守本文档的控制权语义。
 
 ## 源码依据与开发入口
 

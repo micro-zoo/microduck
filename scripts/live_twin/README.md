@@ -2,7 +2,8 @@
 
 For normal daemon head/neck control and a viewer that can coexist with `robotd`,
 see [the protocol and coexistence note](../../docs/robot/robotd-head-control-and-live-twin.md).
-The existing UART mode described here is exclusive. The current board connection,
+The default `microduck-twin.service` is the read-only IPC viewer and is safe to run
+beside `robotd`; the UART mode described below is exclusive. The current board connection,
 deployment differences and completed work are in the
 [agent handoff](../../docs/project/microduck-agent-handoff.md).
 
@@ -13,6 +14,24 @@ The existing joint telemetry and 3D view, with three supported controls:
   its runtime coordinate is -5 degrees, corresponding to zero on this page.
 - **卸力** disables torque, restores the original operating modes and tuning, and
   returns the UART to the telemetry reader.
+
+The default packaged page is maintained with `robotctl twin`:
+
+```sh
+robotctl twin status
+sudo robotctl twin enable
+sudo robotctl twin disable
+sudo robotctl twin restart
+```
+
+It listens on `127.0.0.1:8765`, subscribes to `/run/robotd.sock`, and has no control
+endpoint. It does not stop `robotd`, `padd`, or any motor operation. Enablement is
+part of the shipped service unit, so a fresh install starts it at boot; `disable` is
+available for a board that does not need the page. Reach it from a development machine
+with `ssh -L 8765:127.0.0.1:8765 root@10.4.1.139`.
+
+The existing HOME/回零/卸力 controls remain a separate hardware diagnostic mode. They
+must not be enabled by the IPC-only service and should only be used with the robot supported.
 
 嘴部开合在正式 `robotd` 协议中是独立的 `robot.mouth` 意图：`open=0` 为闭合（runtime
 -5°），`open=1` 为完全打开（runtime +30°），对应 ID 34。它不属于四轴 `robot.head`，
