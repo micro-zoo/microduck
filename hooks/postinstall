@@ -62,6 +62,16 @@ if [ -f "$script" ]; then
         || echo "postinstall: the login-shell files did not install; they are cosmetic" >&2
 fi
 
+# The default Live Twin is a read-only IPC viewer. Copy its entry point to the base system because
+# the service must keep running across a release swap while its unit resolves through `current`.
+# It never opens the motor UART, so enabling it cannot compete with robotd.
+script=scripts/microduck-twin
+if [ -f "$script" ]; then
+    mkdir -p "$SBIN_DIR"
+    install -m 755 "$script" "${SBIN_DIR}/microduck-twin" \
+        || echo "postinstall: could not install the read-only Live Twin; it remains disabled" >&2
+fi
+
 # Apt off the boot path: Armbian's `@reboot` simulated upgrade and the stock apt-daily timers. Here
 # rather than in setup-board.sh alone because every board in the field was provisioned with them
 # running, and this hook is what reaches those boards. Never fatal — a slower boot is not worth a

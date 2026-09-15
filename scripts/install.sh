@@ -721,6 +721,14 @@ install_units() {
         fi
     done
 
+    # The read-only Live Twin entry point is copied to the base for the same reason: its unit is
+    # installed in /etc/systemd/system and must remain executable while `current` changes.
+    src="${INSTALL_DIR}/current/scripts/microduck-twin"
+    if [ -f "$src" ]; then
+        mkdir -p /usr/local/sbin
+        install -m 755 "$src" "/usr/local/sbin/microduck-twin"
+    fi
+
     # The login-shell files: the `robotctl` completions, the motd banner, and the robot's name in
     # the prompt.
     #
