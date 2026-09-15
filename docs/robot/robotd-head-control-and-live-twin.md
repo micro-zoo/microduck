@@ -249,3 +249,38 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
 - [模型关节与嘴部约定](../../duck-control/src/model.rs)、[注视 IK](../../kinematics/src/head.rs)。
 - [现有 Live Twin 维护说明](../../scripts/live_twin/README.md)。
 - [Agent 开发交接](../project/microduck-agent-handoff.md)：完成项、部署差异、后续工作与边界。
+
+## 6. 嘴部开合
+
+嘴部不放在四轴 `HeadParams` 里，使用独立的连续意图 `robot.mouth`：
+
+```json
+{"jsonrpc":"2.0","method":"robot.mouth","params":{"open":0.75}}
+```
+
+`open` 是 0 到 1 的归一化值：0 表示闭合，1 表示完全打开。它是 notification，通常随其他
+连续意图通过长连接按 20–50 Hz 发送；不需要每帧等待响应。
+
+| 项目 | 值 |
+|---|---|
+| 电机 | ID 34 (`mouth`) |
+| `RobotState.joints` / `targets` 索引 | 9 |
+| `open=0` | runtime `-5°`，闭合 |
+| `open=1` | runtime `+30°`，完全打开 |
+| 模型转换 | `q = -5° + open × 35°` |
+
+模型层的 `mouth_target(open)` 会把输入限制在 0–1，再转换为弧度目标；它不会写 EEPROM 的
+Homing Offset。嘴部不属于 14 维步态 action，策略不会从 action 向量直接控制它。
+
+当前 `robotd` 只有在允许驱动的控制循环中，且没有 theremin 或 chorale 正在占用嘴部时，
+才把该意图写入 ID 34 的最终 targets。策略未启用、传感器未 ready、控制循环未进入
+`driving` 时，RPC 可以被接受，但不会让嘴部单独运动。theremin 和 chorale 的音符开合
+优先级更高；它们结束后才回到普通嘴部意图。
+
+如果需求是“策略不运行、腿保持、只开合嘴”，目前没有现成的普通 RPC。应在 `robotd` 内
+增加明确的嘴部直接控制分支，复用标定、行程、速度/加速度、过载、断联和串口所有权约束；
+不能从客户端绕过 daemon 直接给 ID 34 发 Dynamixel 包。
+
+`robotctl` 当前没有 `robot mouth` 子命令。CLI 的 `robotctl quack` 播放声音，但不是任意
+开合比例接口。只读查看时，以 `robot.state.joints[9]` 看实测模型角度，以
+`robot.state.targets[9]` 看 daemon 目标；`head` 字段不包含嘴部。

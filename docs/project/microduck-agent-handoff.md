@@ -55,7 +55,7 @@
 | 串口交接显示与恢复 | 准备/恢复进度、连续空读或失败后重开 UART、取消后恢复原设置 | 实机完整准备和中途取消均验证；不再把有意的采样交接显示为全掉线 |
 | 准备提速 | 完整应答后结束等待、完整占用扫描用 `os.scandir`、读回确认后省去 RAM 空等、正确 hold goal 不重复写入 | 无加力实机准备 **3.21 秒**；缺失/延迟回复仍保留原超时，模式切换等待和写入核对保留 |
 | 交互姿态提速 | 最大 20°/s、40°/s² 的同步梯形轨迹，保留稳定到位检查 | 原生隔离测试通过；**加速后的真实 HOME/回零动作尚未验证** |
-| 普通 `robotd` 头颈意图 | `robot.head`、`robot.look`、`robot.subscribe` 的源码接口已有 | head/look 依赖策略消费；不是无策略四轴直接伺服控制，当前板上仅验证只读 RPC |
+| 普通 `robotd` 头颈和嘴部意图 | `robot.head`、`robot.look`、`robot.mouth`、`robot.subscribe` 的源码接口已有；嘴部 ID 34、向量索引 9、runtime -5°..+30° | head/look/mouth 依赖允许驱动的控制循环；嘴部会让 theremin/chorale 优先占用；不是无策略的直接伺服控制，当前板上仅验证只读 RPC |
 
 加速前网页 HOME 实机记录：到位最大误差约 1.88°，保持约 21.17 秒，单电机峰值输入电流
 268 mA，最高 30°C，未发生读重试。不要把这些数字归给随后改成的 20°/s 轨迹。
@@ -81,7 +81,7 @@
 | 查 JSON-RPC 方法和字段 | [duck-ipc-proto/src/lib.rs](../../duck-ipc-proto/src/lib.rs)：`Call`、`HeadParams`、`LookParams`、`RobotState` |
 | 查意图如何成为电机目标 | [robotd/src/main.rs](../../robotd/src/main.rs)：`apply_intent`、`dispatch`、`driving`、targets 分支；[control.rs](../../robotd/src/control.rs) |
 | 查控制权与断联语义 | [intents.rs](../../robotd/src/intents.rs) 与 [safety.rs](../../duck-control/src/safety.rs)：head 最后写入者生效，deadman 只归零 twist |
-| 查头颈顺序、HOME、嘴部 | [model.rs](../../duck-control/src/model.rs)、[obs.rs](../../duck-control/src/obs.rs)、[head.rs](../../kinematics/src/head.rs) |
+| 查头颈顺序、HOME、嘴部 | [model.rs](../../duck-control/src/model.rs)、[obs.rs](../../duck-control/src/obs.rs)、[head.rs](../../kinematics/src/head.rs)；嘴部协议见 [robotd 头颈控制与 Live Twin](../robot/robotd-head-control-and-live-twin.md) §6 |
 | 查安装零位 | [calibration.rs](../../duck-control/src/calibration.rs)、[export_joint_zero.py](../../scripts/export_joint_zero.py)、[标定文档](../robot/joint-calibration.md) |
 | 查网页固定姿态控制 | [homing.rs](../../duck-control/src/bus/homing.rs)、[pose_session.rs](../../robotd/src/pose_session.rs) |
 | 查网页后端和监护 | [Live Twin](../../scripts/live_twin/README.md) 中的模块职责表 |
@@ -143,6 +143,9 @@ ssh root@10.4.1.139 'journalctl -u robotd -n 30 --no-pager'
 若要腿固定、只动头颈，则在 `robotd` 内增加有明确进入/退出条件的控制分支。
 先定义断联后保持、回姿态或停止的具体行为，再实现；不能把网页诊断模式的断联全卸力
 无条件复制给正在站立的机器人。该分支必须复用模型标定、行程/速度限制和总线所有权。
+
+嘴部也遵循同一边界：`robot.mouth` 是模型空间的 `open` 意图，不能当成无策略的 ID 34
+直接控制；普通策略、theremin、chorale 的优先级和退出行为必须先定义清楚。
 
 ### E. 完成加速版的实际动作验证
 

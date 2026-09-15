@@ -14,6 +14,12 @@ The existing joint telemetry and 3D view, with three supported controls:
 - **卸力** disables torque, restores the original operating modes and tuning, and
   returns the UART to the telemetry reader.
 
+嘴部开合在正式 `robotd` 协议中是独立的 `robot.mouth` 意图：`open=0` 为闭合（runtime
+-5°），`open=1` 为完全打开（runtime +30°），对应 ID 34。它不属于四轴 `robot.head`，
+也不属于步态的 14 维 action。策略未进入允许驱动状态时，接受该意图不保证嘴部单独运动；
+theremin 和 chorale 正在运行时会优先驱动嘴部。完整字段和优先级见
+[协议说明](../../docs/robot/robotd-head-control-and-live-twin.md)。
+
 Support the trunk with the head, neck and legs free to move. These are supported
 pose operations, without an IMU or walking policy. Preparation currently takes
 less than 5 seconds on the tested board to change modes and verify the original
