@@ -14,6 +14,7 @@ docs give the reasoning and point at it.
 | [`cheatsheet.md`](robot/cheatsheet.md) | Every `robotctl` command. |
 | [`joint-calibration.md`](robot/joint-calibration.md) | Per-robot motor zeroes, the configuration path, and closed-mouth reference conversion. |
 | [Live Twin](../scripts/live_twin/README.md) | Live joint telemetry, supported HOME/zero holds, unload, and maintenance of the USB debug page. |
+| [robotd 头颈控制与 Live Twin](robot/robotd-head-control-and-live-twin.md) | JSON-RPC head/gaze semantics, current board status, and how a concurrent viewer should consume daemon telemetry. |
 | [`pair-a-gamepad.md`](robot/pair-a-gamepad.md) | Once per pad: pairing mode, `pad pair`, and what to do when it will not bond. |
 | [`cheatsheet-dev.md`](robot/cheatsheet-dev.md) | The commands that need a dev board: branch builds, candidates, dev pushes. |
 | [`dev-push.md`](robot/dev-push.md) | Build on your machine and install on the board over ssh, with no CI run. |
@@ -56,6 +57,7 @@ Dated records rather than reference. They describe a moment, and go stale on pur
 | | |
 |---|---|
 | [`roadmap.md`](project/roadmap.md) | Milestones, and what works today versus what is designed. |
+| [Microduck agent 交接](project/microduck-agent-handoff.md) | Completed motor/Live Twin work, current deployment differences, and scoped next steps (2026-09-15). |
 | [`ci-setup.md`](project/ci-setup.md) | One-time setup for the release pipeline: keys, secrets, rotation. |
 | [`install-path-gap.md`](project/install-path-gap.md) | Why four install-path bugs reached a board, and what closed it. Closed — the rule it taught is [`updater-design.md`](design/updater-design.md) §9.1. |
 | [`slice-2-bringup.md`](project/slice-2-bringup.md) | What a real Radxa Zero 3W did with slice 2. |

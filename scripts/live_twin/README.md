@@ -1,5 +1,11 @@
 # Microduck Live Twin
 
+For normal daemon head/neck control and a viewer that can coexist with `robotd`,
+see [the protocol and coexistence note](../../docs/robot/robotd-head-control-and-live-twin.md).
+The existing UART mode described here is exclusive. The current board connection,
+deployment differences and completed work are in the
+[agent handoff](../../docs/project/microduck-agent-handoff.md).
+
 The existing joint telemetry and 3D view, with three supported controls:
 
 - **HOME** moves to the model's default pose and holds it.
