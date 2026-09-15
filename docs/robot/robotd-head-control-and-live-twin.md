@@ -37,7 +37,7 @@ ssh root@10.4.1.139
 | `hello` | `api_version=16`、`daemon_version=0.10.0`、`revision=null` |
 | 本仓库协议常量 | `API_VERSION=28`，与板上不同 |
 | Live Twin 使用的候选程序 | `/root/calibration/control-path/bin/robotd-ui-fast`，自报 `0.12.0`；不是正式服务当前运行的程序 |
-| 服务状态 | `padd` active；`microduck-twin` inactive、disabled |
+| 服务状态 | `padd` active；IPC-only `microduck-twin` active、enabled（已部署到 139） |
 | socket 权限 | `/run/robotd.sock` 为 `root:robot`、`0660` |
 | 当前总线配置 | `/etc/robot/robotd.toml` 的 `[bus]` 只有 `port="/dev/serial0"`，未显式配置安装零位文件 |
 
@@ -211,6 +211,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
 
 完整 15 路顺序以协议 `JOINT_NAMES` 为准。支持 `robot.model` 的版本可以获取模型名称顺序；
 当前板子不支持该方法，适配器应明确使用与运行版本核对过的顺序并检查向量长度，不能猜测索引。
+IPC-only Twin 已在 139 上运行，但由于正式 `robotd` 尚未产生健康状态帧，页面会显示无实时数据。
 
 ## 5. Live Twin 并行查看
 

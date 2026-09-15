@@ -26,7 +26,7 @@
 | SSH / 平台 | 新地址连通，`orangepizero3w`，AArch64 |
 | 正式 daemon | `/opt/robot/daemon/current` → `/opt/robot/daemon/releases/0.10.0` |
 | 正式执行参数 | `/opt/robot/daemon/current/bin/robotd --socket /run/robotd.sock` |
-| 服务 | `robotd` active/enabled，`padd` active/enabled，`microduck-twin` inactive/disabled |
+| 服务 | `robotd` active/enabled，`padd` active/enabled，`microduck-twin` active/enabled（IPC-only） |
 | `hello` | API 16，daemon 0.10.0，revision 未提供 |
 | `robot.health` | healthy=false，degraded=true；startup_failures=341，ticks=0，IMU 未 ready |
 | 日志 | `combined imu+motor sync_read: Operation timed out`，尚未开始正常控制循环 |
@@ -42,6 +42,26 @@
 本机只读证据保存在
 `/Users/homalozoax/micro_duck/calibration/robotd-handoff/2026-09-15/board-readonly.json`。
 该目录不在主仓库 Git 中；其他开发者应重新采集当前状态。
+
+### 2026-09-15 部署更新
+
+已将 IPC-only Twin 手工部署到 `root@10.4.1.139`，直到下一次正式 release 安装前由以下文件提供：
+
+- `microduck-twin.service`：active/enabled，监听 `127.0.0.1:8765`，只读 `/run/robotd.sock`。
+- `/opt/robot/daemon/current/scripts/live_twin/ipc_server.py`：IPC bridge；不打开 `/dev/serial0`。
+- `/usr/local/sbin/microduck-twin`：服务入口 wrapper。
+- `/usr/local/bin/robotctl`：本仓库 0.12.0 候选 CLI；`robotctl twin` 可维护服务。
+
+部署前的旧 unit 保存在 `/root/calibration/live-twin-deploy-20260915-1/microduck-twin.service.before`。
+正式 `robotd` 仍是 0.10.0，PID 932；`padd` PID 1224；两者均未被重启。
+部署后的 `/api/state` 返回 `source=robotd-ipc`、`read_only=true`、15 个关节槽；由于正式
+`robotd` 当前仍然没有健康状态帧，页面显示 offline/stale 是诚实状态，不是 viewer 故障。
+`robotctl twin restart --json` 已执行并在等待 HTTP 绑定后确认成功。
+
+这是设备上的手工 overlay，不等同于正式 release 已切换；下一次兼容 release 应通过打包的
+`robotctl/systemd/microduck-twin.service`、`scripts/microduck-twin` 和
+`scripts/live_twin/ipc_server.py` 重装同一内容。升级或回滚前保留上述备份并检查 unit 的
+`ExecStart`，避免旧 release 缺少 viewer 脚本。
 
 ## 已完成的功能，以及完成到哪一层
 
