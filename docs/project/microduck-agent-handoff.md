@@ -73,6 +73,8 @@
 | `d2d2bd0`、`154b733` | 设置读取与串口交接/恢复修正 |
 | `3fbae1e`、`ed27589` | 轨迹和准备提速 |
 | `c261bee` | Live Twin 维护说明与文档入口 |
+| `819e015` | 默认只读 IPC-only Twin、systemd unit、`robotctl twin` 生命周期命令和 release 打包 |
+| `919af95` | 默认 Twin 服务的协议、维护和交接文档 |
 
 平台仓库的 `d4efe45`、`41d910b` 对应 UART RX DMA 和恢复文档。
 
