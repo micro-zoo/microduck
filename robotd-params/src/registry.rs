@@ -107,6 +107,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::OptionalPath,
         "Joint zero JSON; restart robotd after changes; absent uses encoder 2048",
     ),
+    feature(
+        "bus.imu_to_dxl_enabled",
+        Kind::Bool,
+        "Read the optional IMU on the Dynamixel bus; motor telemetry continues when off; restart robotd after changes",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(
@@ -663,6 +668,7 @@ mod tests {
         assert_eq!(
             features,
             vec![
+                "bus.imu_to_dxl_enabled",
                 "policy.enabled",
                 "policy.mode",
                 "policy.voltage_adapt",

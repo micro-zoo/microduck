@@ -1823,6 +1823,9 @@ pub struct Bus {
     pub port: String,
     /// Per-robot motor zeroes, loaded once before hardware I/O.
     pub calibration: Option<PathBuf>,
+    /// Read the optional `imu_to_dxl` board on the same Dynamixel bus. When false, motor
+    /// telemetry continues and policy driving remains gated because no orientation is ready.
+    pub imu_to_dxl_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1879,6 +1882,7 @@ impl Default for Bus {
         Self {
             port: "/dev/ttyS2".into(),
             calibration: None,
+            imu_to_dxl_enabled: true,
         }
     }
 }
@@ -2894,6 +2898,7 @@ mod tests {
         let path = write(dir.path(), "[bus]\nport = \"/dev/ttyUSB0\"\n");
         let p = Params::load(&path, true).unwrap();
         assert_eq!(p.bus.port, "/dev/ttyUSB0");
+        assert!(p.bus.imu_to_dxl_enabled);
         assert_eq!(p.control.hz, 50);
         assert_eq!(p.update_gate.stall_periods, 25);
     }

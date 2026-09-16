@@ -1146,7 +1146,8 @@ fn run_guarded_init(
                 None
             };
             let mut io = duck_control::bus::DynamixelIo::open(&params.bus.port)?
-                .with_calibration(*calibration);
+                .with_calibration(*calibration)
+                .with_imu_to_dxl_enabled(params.bus.imu_to_dxl_enabled);
             let pose = if pose == "zero" {
                 duck_control::bus::SupportedPose::Zero
             } else {
@@ -1199,7 +1200,12 @@ fn run_init(params: &Params, calibration: &JointCalibration, duration: Duration)
     // The same open as the daemon's, replacement adoption included: `init` is what someone
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
-    let Some(mut io) = open_bus(&params.bus.port, 0, calibration) else {
+    let Some(mut io) = open_bus(
+        &params.bus.port,
+        0,
+        calibration,
+        params.bus.imu_to_dxl_enabled,
+    ) else {
         return ExitCode::FAILURE;
     };
     if let Err(e) = io.set_torque(true) {
@@ -1313,7 +1319,10 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
-                if let Some(io) = open_bus_waiting(&port, &state, &calibration).await {
+                if let Some(io) =
+                    open_bus_waiting(&port, &state, &calibration, params.bus.imu_to_dxl_enabled)
+                        .await
+                {
                     control_loop(io, state, intents, params, params_path, period, poweroff).await;
                 }
             });
@@ -1337,13 +1346,14 @@ async fn open_bus_waiting(
     port: &str,
     state: &RobotState,
     calibration: &JointCalibration,
+    imu_to_dxl_enabled: bool,
 ) -> Option<BusIo> {
     let mut attempt = 0u32;
 
     while !state.shutdown.load(Ordering::Relaxed) {
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
-        if let Some(io) = open_bus(port, attempt, calibration) {
+        if let Some(io) = open_bus(port, attempt, calibration, imu_to_dxl_enabled) {
             state.startup_bus_failures.store(0, Ordering::Relaxed);
             return Some(io);
         }
@@ -1363,12 +1373,19 @@ async fn open_bus_waiting(
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(port: &str, attempt: u32, calibration: &JointCalibration) -> Option<BusIo> {
+fn open_bus(
+    port: &str,
+    attempt: u32,
+    calibration: &JointCalibration,
+    imu_to_dxl_enabled: bool,
+) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
 
     let mut io = match duck_control::bus::DynamixelIo::open(port) {
-        Ok(io) => io.with_calibration(*calibration),
+        Ok(io) => io
+            .with_calibration(*calibration)
+            .with_imu_to_dxl_enabled(imu_to_dxl_enabled),
         Err(e) => {
             if loud {
                 tracing::error!(error = %e, port, attempt, "cannot open the bus; waiting");
@@ -1458,7 +1475,12 @@ fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_port: &str, _attempt: u32, _calibration: &JointCalibration) -> Option<BusIo> {
+fn open_bus(
+    _port: &str,
+    _attempt: u32,
+    _calibration: &JointCalibration,
+    _imu_to_dxl_enabled: bool,
+) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -7287,6 +7309,7 @@ mod tests {
                 "/dev/definitely-not-a-bus",
                 &waiter_state,
                 &JointCalibration::default(),
+                true,
             )
             .await
             .is_none()

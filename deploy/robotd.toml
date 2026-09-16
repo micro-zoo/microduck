@@ -24,6 +24,10 @@ port = "/dev/ttyS2"
 # Apply through robotctl configure; changing this file also requires a robotd restart.
 # See docs/robot/joint-calibration.md. Unset (or "none") preserves encoder-2048 zeroes.
 # calibration = "/etc/robot/joint-zero.json"
+# The optional `imu_to_dxl` board shares this Dynamixel bus. Set false on a duck without
+# that board: motor telemetry remains available while policy driving stays gated on IMU data.
+# Restart robotd after changing this setting.
+# imu_to_dxl_enabled = true
 
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to

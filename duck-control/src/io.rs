@@ -11,7 +11,8 @@
 use crate::imu::ImuData;
 use crate::model::NUM_JOINTS;
 
-/// One atomic sample of the robot.
+/// One control tick's readings. A combined bus read does not guarantee that the
+/// IMU and servo measurements were sampled at exactly the same instant.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sensors {
     /// Joint angles in radians, indexed as [`crate::model::JOINT_NAMES`].
@@ -111,7 +112,10 @@ pub struct ImuStale {
 }
 
 pub trait RobotIo {
-    /// One transaction: joints and IMU together.
+    /// Read the joints and, when configured, the optional `imu_to_dxl` board.
+    ///
+    /// With the IMU explicitly disabled, motor telemetry remains available and the default
+    /// IMU keeps `imu_ready()` false. An enabled device that fails to answer fails the read.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 

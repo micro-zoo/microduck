@@ -1,8 +1,10 @@
 //! The Dynamixel bus.
 //!
-//! One combined `sync_read` per tick covering the IMU board and all 15 servos, and one
-//! `sync_write` of goal positions. The IMU is listed first so it answers before the servo
-//! burst.
+//! One combined `sync_read` per tick covers the IMU board and all 15 servos. The IMU is
+//! listed first so it answers before the servo burst. With the optional IMU disabled,
+//! only the servos are read and policy driving remains gated on orientation readiness.
+//! One `sync_write` sends goal positions. A shared read groups a control tick's data;
+//! it does not synchronize the devices' internal sampling clocks.
 //!
 //! Battery and thermals are the one thing that does not fit that shape: they live at registers
 //! outside the block the tick fetches, so [`RobotIo::slow_sensors`] is a transaction of its
@@ -110,8 +112,8 @@ pub struct DynamixelIo {
     /// Kept so the port can be reopened at the factory baud rate: `rustypot` owns the serial
     /// handle outright and offers no way to change its speed in place.
     port: String,
-    /// IMU first, then the servos in [`JOINT_IDS`] order — the order blocks come back in.
-    ids: Vec<u8>,
+    /// Whether the optional `imu_to_dxl` board is present on this motor bus.
+    imu_to_dxl_enabled: bool,
     imu: SflpDecoder,
     /// Blocks identical to their predecessor. The read succeeded but the board handed back
     /// the same sample, which means the policy is being fed dead orientation data — a
@@ -123,16 +125,12 @@ impl DynamixelIo {
     pub fn open(port: &str) -> Result<Self> {
         let controller = open_controller(port, BAUD_RATE)?;
 
-        let mut ids = Vec::with_capacity(NUM_JOINTS + 1);
-        ids.push(IMU_DXL_ID);
-        ids.extend_from_slice(&JOINT_IDS);
-
         Ok(Self {
             controller,
             calibration: JointCalibration::default(),
             origin_after: [None; NUM_JOINTS],
             port: port.to_owned(),
-            ids,
+            imu_to_dxl_enabled: true,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
         })
@@ -157,6 +155,19 @@ impl DynamixelIo {
         for id in JOINT_IDS {
             self.calibration.invalidate_origin(id);
         }
+        self
+    }
+
+    /// Enable or disable the optional `imu_to_dxl` board without changing motor I/O.
+    ///
+    /// When disabled, the 15 XL330s are still sampled through the same Protocol 2 SDK path,
+    /// while the orientation filter remains not ready and policy driving stays gated.
+    pub fn with_imu_to_dxl_enabled(mut self, enabled: bool) -> Self {
+        if self.imu_to_dxl_enabled != enabled {
+            self.imu = SflpDecoder::default();
+            self.stale_imu = StaleImuTracker::default();
+        }
+        self.imu_to_dxl_enabled = enabled;
         self
     }
 
@@ -508,25 +519,39 @@ pub fn replacement_target(missing: &[u8]) -> Option<u8> {
 impl RobotIo for DynamixelIo {
     fn read(&mut self) -> Result<Sensors> {
         self.check_origin_settle()?;
+        let mut ids = [IMU_DXL_ID; NUM_JOINTS + 1];
+        ids[1..].copy_from_slice(&JOINT_IDS);
+        let ids = if self.imu_to_dxl_enabled {
+            &ids[..]
+        } else {
+            &ids[1..]
+        };
         let blocks = self
             .controller
-            .sync_read_raw_data(&self.ids, READ_ADDR, READ_LEN)
-            .map_err(|e| IoError::Bus(format!("combined imu+motor sync_read: {e}")))?;
+            .sync_read_raw_data(ids, READ_ADDR, READ_LEN)
+            .map_err(|e| IoError::Bus(format!("sync_read: {e}")))?;
 
-        if blocks.len() != self.ids.len() {
+        if blocks.len() != ids.len() {
             return Err(IoError::ShortRead {
                 what: "sync_read blocks",
-                expected: self.ids.len(),
+                expected: ids.len(),
                 got: blocks.len(),
             });
         }
 
         let mut sensors = Sensors::default();
 
-        // Slot 0 is the IMU board.
-        if blocks[0].len() == IMU_BLOCK_LEN {
+        if self.imu_to_dxl_enabled {
+            let raw_block = &blocks[0];
+            if raw_block.len() != IMU_BLOCK_LEN {
+                return Err(IoError::ShortRead {
+                    what: "imu_to_dxl block",
+                    expected: IMU_BLOCK_LEN,
+                    got: raw_block.len(),
+                });
+            }
             let mut raw = [0u8; IMU_BLOCK_LEN];
-            raw.copy_from_slice(&blocks[0]);
+            raw.copy_from_slice(raw_block);
             // Say so, or the counters are numbers nobody ever reads — but only once the run
             // is long enough to mean something. Rate-limited past that because a board which
             // has stopped refreshing produces one of these every single tick, and 50 Hz of
@@ -540,15 +565,10 @@ impl RobotIo for DynamixelIo {
                 );
             }
             sensors.imu = self.imu.decode(&raw);
-        } else {
-            return Err(IoError::ShortRead {
-                what: "imu block",
-                expected: IMU_BLOCK_LEN,
-                got: blocks[0].len(),
-            });
         }
 
-        for (joint, block) in blocks[1..].iter().enumerate() {
+        let motor_start = usize::from(self.imu_to_dxl_enabled);
+        for (joint, block) in blocks[motor_start..].iter().enumerate() {
             if block.len() != READ_LEN as usize {
                 return Err(IoError::ShortRead {
                     what: "motor block",
@@ -690,6 +710,134 @@ impl RobotIo for DynamixelIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Exercise the real serial SDK: an IMU reply must not shift the joint array,
+    // and an enabled but missing IMU must not become a successful partial sample.
+    #[cfg(unix)]
+    #[test]
+    fn sync_read_groups_devices_and_rejects_incomplete_or_corrupt_samples() {
+        use serialport::SerialPort;
+        use std::io::{Read, Write};
+
+        for (enabled, fault) in [
+            (true, "none"),
+            (false, "none"),
+            (true, "missing_imu"),
+            (true, "missing_motor"),
+            (true, "bad_crc"),
+            (true, "short_imu"),
+        ] {
+            let (mut device, mut host) = serialport::TTYPort::pair().unwrap();
+            device.set_timeout(Duration::from_secs(2)).unwrap();
+            host.set_timeout(Duration::from_millis(200)).unwrap();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut header = [0u8; 7];
+                device.read_exact(&mut header).unwrap();
+                assert_eq!(&header[..5], &[255, 255, 253, 0, 254]);
+                let mut body = vec![0; u16::from_le_bytes([header[5], header[6]]) as usize];
+                device.read_exact(&mut body).unwrap();
+                assert_eq!(&body[..5], &[0x82, 124, 0, 12, 0]);
+                let mut expected = Vec::new();
+                if enabled {
+                    expected.push(IMU_DXL_ID);
+                }
+                expected.extend_from_slice(&JOINT_IDS);
+                assert_eq!(&body[5..body.len() - 2], expected.as_slice());
+
+                for id in expected {
+                    if (id == IMU_DXL_ID && fault == "missing_imu")
+                        || (Some(&id) == JOINT_IDS.last() && fault == "missing_motor")
+                    {
+                        continue;
+                    }
+                    let mut data = [0u8; 12];
+                    if id == IMU_DXL_ID {
+                        data[6..8].copy_from_slice(&0x3800u16.to_le_bytes());
+                    } else {
+                        data[2..4].copy_from_slice(&(id as i16).to_le_bytes());
+                        data[8..12].copy_from_slice(&(2048 + id as i32).to_le_bytes());
+                    }
+                    // These fixed payloads contain no byte-stuffing sequence.
+                    let mut reply = vec![255, 255, 253, 0, id, 16, 0, 0x55, 0];
+                    reply.extend_from_slice(&data);
+                    if id == IMU_DXL_ID && fault == "short_imu" {
+                        reply.pop();
+                        reply[5] -= 1;
+                    }
+                    let mut crc = 0u16;
+                    for byte in &reply {
+                        crc ^= (*byte as u16) << 8;
+                        for _ in 0..8 {
+                            crc = if crc & 0x8000 != 0 {
+                                (crc << 1) ^ 0x8005
+                            } else {
+                                crc << 1
+                            };
+                        }
+                    }
+                    if id == IMU_DXL_ID && fault == "bad_crc" {
+                        crc ^= 1;
+                    }
+                    reply.extend_from_slice(&crc.to_le_bytes());
+                    device.write_all(&reply).unwrap();
+                }
+                // Keep the PTY alive while the SDK consumes its replies.
+                done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                if fault == "none" {
+                    assert_eq!(
+                        device.bytes_to_read().unwrap(),
+                        0,
+                        "unexpected second request"
+                    );
+                }
+            });
+            let mut bus = DynamixelIo {
+                controller: Xl330Controller::new()
+                    .with_protocol_v2()
+                    .with_serial_port(Box::new(host)),
+                calibration: JointCalibration::default(),
+                origin_after: [None; NUM_JOINTS],
+                port: String::new(),
+                imu_to_dxl_enabled: enabled,
+                imu: SflpDecoder::default(),
+                stale_imu: StaleImuTracker::default(),
+            };
+            let result = bus.read();
+            done_tx.send(()).unwrap();
+            worker.join().unwrap();
+            if fault != "none" {
+                assert!(result.is_err(), "{fault} must fail the whole read");
+            } else {
+                let sensors = result.unwrap();
+                for (joint, id) in JOINT_IDS.iter().enumerate() {
+                    assert_eq!(sensors.currents_ma[joint], *id as f64);
+                    assert!(
+                        (sensors.positions[joint] - *id as f64 * 2.0 * PI / 4096.0).abs() < 1e-12
+                    );
+                }
+                assert_eq!(bus.stale_imu.last.is_some(), enabled);
+                if !enabled {
+                    assert!(!bus.imu_ready());
+                } else {
+                    let mut sample = [0u8; IMU_BLOCK_LEN];
+                    sample[6..8].copy_from_slice(&0x3800u16.to_le_bytes());
+                    for _ in 0..25 {
+                        bus.imu.decode(&sample);
+                    }
+                    assert!(bus.imu_ready());
+                    bus = bus.with_imu_to_dxl_enabled(false);
+                    assert!(!bus.imu_ready());
+                    assert_eq!(bus.imu_stale(), ImuStale::default());
+                    bus = bus.with_imu_to_dxl_enabled(true);
+                    assert!(
+                        !bus.imu_ready(),
+                        "re-enabled IMU must collect fresh samples"
+                    );
+                }
+            }
+        }
+    }
 
     /// One silent servo is the only case a swap can be inferred from. With two silent there is
     /// no telling which the fresh servo replaces, and guessing would flash a leg joint as a neck
