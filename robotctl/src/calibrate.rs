@@ -259,6 +259,9 @@ pub fn capture_zero(socket: &Path, output: &Path, fixture_q0: bool) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn loaded_offsets_are_inverted_before_recapturing_fixture_zero() {
@@ -312,5 +315,128 @@ mod tests {
         frames[FRAMES - 1].joints[0] = 0.0;
         frames[0].joints[0] = 4096.0 / TICKS_PER_RADIAN;
         assert!(candidate(&info, &frames).is_err());
+    }
+
+    #[test]
+    fn capture_uses_the_robotd_socket_and_never_overwrites_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("robotd.sock");
+        let output = dir.path().join("candidate.json");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            fn answer<T: serde::Serialize>(
+                reader: &mut BufReader<std::os::unix::net::UnixStream>,
+                stream: &mut std::os::unix::net::UnixStream,
+                expected: &str,
+                result: &T,
+            ) {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: proto::Request = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.method, expected);
+                let response = proto::Response::ok(request.id, result);
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            answer(
+                &mut reader,
+                &mut stream,
+                proto::method::HELLO,
+                &proto::HelloResult {
+                    api_version: proto::API_VERSION,
+                    daemon_version: None,
+                    revision: None,
+                },
+            );
+            answer(
+                &mut reader,
+                &mut stream,
+                proto::method::ROBOT_CALIBRATION_INFO,
+                &proto::CalibrationInfo {
+                    zero_ticks: [2048.0; 15],
+                    homing_offset_ticks: [0; 15],
+                    single_turn_compatible: [true; 15],
+                    policy_enabled: false,
+                    homed: false,
+                },
+            );
+            answer(
+                &mut reader,
+                &mut stream,
+                proto::method::ROBOT_SUBSCRIBE,
+                &proto::SubscribeResult {
+                    accepted: true,
+                    ..Default::default()
+                },
+            );
+            for tick in 1..=FRAMES {
+                let state = proto::RobotState {
+                    t: tick as f64 / 10.0,
+                    movement: proto::MoveState {
+                        requested: [0.0; 3],
+                        applied: [0.0; 3],
+                        limited_by: Vec::new(),
+                    },
+                    head: [0.0; 4],
+                    policy: "held".into(),
+                    safety: proto::SafetyState {
+                        fallen: false,
+                        limp: false,
+                        gravity: [0.0, 0.0, -1.0],
+                        gain: None,
+                    },
+                    control_loop: proto::LoopState {
+                        hz: 50.0,
+                        missed: 0,
+                    },
+                    joints: vec![0.0; 15],
+                    targets: vec![0.0; 15],
+                    velocities: Vec::new(),
+                    currents_ma: Vec::new(),
+                    odom: proto::OdomState::default(),
+                    theremin: None,
+                    chorale: None,
+                    t_ns: tick as u64,
+                    imu: None,
+                    frames: None,
+                    skeleton: Vec::new(),
+                };
+                writeln!(
+                    stream,
+                    "{}",
+                    serde_json::to_string(&proto::Request::notify_state(&state)).unwrap()
+                )
+                .unwrap();
+            }
+            answer(
+                &mut reader,
+                &mut stream,
+                proto::method::ROBOT_CALIBRATION_INFO,
+                &proto::CalibrationInfo {
+                    zero_ticks: [2048.0; 15],
+                    homing_offset_ticks: [0; 15],
+                    single_turn_compatible: [true; 15],
+                    policy_enabled: false,
+                    homed: false,
+                },
+            );
+        });
+        capture_zero(&socket, &output, true).unwrap_or_else(|e| panic!("{}", e.message));
+        server.join().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();
+        assert_eq!(saved["joints"].as_array().unwrap().len(), 15);
+        assert!(
+            (saved["joints"][9]["zero_tick"].as_f64().unwrap() - 2104.888888888889).abs() < 1e-9
+        );
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            capture_zero(&socket, &output, true).unwrap_err().code,
+            exit::REFUSED
+        );
     }
 }
