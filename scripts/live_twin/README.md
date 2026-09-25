@@ -1,20 +1,23 @@
 # Read-only Live Twin
 
-`robotctl twin` manages a local web viewer for the joint state published by
+`robotctl twin` manages a web viewer for the joint state published by
 `robotd`. The Python bridge connects to `/run/robotd.sock`, requests `hello`,
 `robot.health`, and `robot.subscribe`, and serves the bundled Three.js model and
-state events at `127.0.0.1:8765`. It never opens the motor serial port or sends a
-robot intent. HTTP write requests return 405.
+state events on port 8765 of the robot's network interfaces. It never opens the
+motor serial port or sends a robot intent. HTTP write requests return 405.
 
 ```sh
+robotctl twin
 robotctl twin status
 sudo robotctl twin enable
 sudo robotctl twin restart
 sudo robotctl twin disable
-ssh -L 8765:127.0.0.1:8765 USER@ROBOT
 ```
 
-Open `http://127.0.0.1:8765/` through the SSH tunnel. The viewer can start while
+`robotctl twin` and `robotctl twin status` list the robot's current IPv4 URLs;
+open one directly from the same network, such as `http://ROBOT_IP:8765/`.
+The HTTP viewer has no login and exposes read-only telemetry to hosts that can
+reach that port, so use it on a trusted network. The viewer can start while
 `robotd` is stopped; it reports offline until `robotd` supplies state. Enabling
 the viewer does not start `robotd` because its service has only `After=robotd`.
 
