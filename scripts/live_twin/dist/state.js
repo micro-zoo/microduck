@@ -23,3 +23,13 @@ export function quaternionEuler(quat){
   yaw:Math.atan2(2*(w*z+x*y),1-2*(y*y+z*z))*degree,
  };
 }
+export function trunkOrientation(quat, referenceYaw=null){
+ const angles=quaternionEuler(quat);
+ if(!angles)return null;
+ const yaw0=referenceYaw??angles.yaw;
+ const norm=Math.hypot(...quat),[w,x,y,z]=quat.map(v=>v/norm);
+ // Game-rotation yaw has no absolute north. Anchor the viewer's first heading,
+ // while retaining subsequent relative yaw and the measured trunk tilt.
+ const half=-yaw0*Math.PI/360,c=Math.cos(half),s=Math.sin(half);
+ return {referenceYaw:yaw0,quat:[c*w-s*z,c*x-s*y,c*y+s*x,c*z+s*w]};
+}
