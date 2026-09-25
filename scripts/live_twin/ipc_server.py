@@ -35,8 +35,9 @@ def finite(value):
 
 
 class Bridge:
-    def __init__(self, socket_path, hz):
+    def __init__(self, socket_path, hz, tof_socket="/run/tofd/tof.sock"):
         self.socket_path = str(socket_path)
+        self.tof_socket = str(tof_socket)
         self.hz = hz
         self.lock = threading.Condition()
         self.sequence = 0
@@ -46,10 +47,18 @@ class Bridge:
         self.received_times = deque(maxlen=100)
         self.hello = None
         self.health = None
+        self.health_at = None
         self.robot_state = None
+        self.head_imu_result = None
+        self.head_imu_frame = None
+        self.head_imu_at = None
+        self.head_imu_connection = "connecting"
+        self.head_imu_error = None
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.run, name="robotd-ipc", daemon=True)
+        self.head_thread = threading.Thread(target=self.run_head_imu, name="tofd-head-imu", daemon=True)
         self.thread.start()
+        self.head_thread.start()
 
     def publish(self, **values):
         with self.lock:
@@ -105,18 +114,51 @@ class Bridge:
                     sock.settimeout(3)
                     sock.connect(self.socket_path)
                     buffer = b""
-                    buffer, self.hello = self.request(sock, buffer, 1, "hello", {"api_version": 38})
-                    buffer, self.health = self.request(sock, buffer, 2, "robot.health", {})
+                    buffer, hello = self.request(sock, buffer, 1, "hello", {"api_version": 39})
+                    buffer, health = self.request(sock, buffer, 2, "robot.health", {})
+                    self.publish(hello=hello, health=health, health_at=time.monotonic())
                     buffer, _ = self.request(sock, buffer, 3, "robot.subscribe", {"hz": self.hz})
                     sock.settimeout(None)
                     self.publish(connection="live", last_error=None)
+                    next_health = time.monotonic() + 1
+                    number = 4
                     while not self.stop.is_set():
-                        buffer, values = self.messages(sock, buffer, 1.0)
+                        if time.monotonic() >= next_health:
+                            buffer, health = self.request(sock, buffer, number, "robot.health", {})
+                            self.publish(health=health, health_at=time.monotonic())
+                            number += 1
+                            next_health = time.monotonic() + 1
+                            continue
+                        buffer, values = self.messages(sock, buffer, min(1.0, next_health - time.monotonic()))
                         for value in values:
                             if value.get("method") == "robot.state":
                                 self.publish(robot_state=value.get("params"), last_state_at=time.monotonic(), connection="live", last_error=None)
             except Exception as error:
                 self.publish(connection="stale" if self.robot_state else "offline", last_error=str(error))
+                self.stop.wait(1)
+
+    def run_head_imu(self):
+        while not self.stop.is_set():
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(3)
+                    sock.connect(self.tof_socket)
+                    buffer, result = self.request(sock, b"", 1, "head_imu.stream", {})
+                    self.publish(head_imu_result=result, head_imu_connection="live",
+                                 head_imu_error=None)
+                    if not result.get("sensor"):
+                        self.stop.wait(5)
+                        continue
+                    sock.settimeout(None)
+                    while not self.stop.is_set():
+                        buffer, values = self.messages(sock, buffer, 1.0)
+                        for value in values:
+                            if value.get("method") == "head_imu.frame":
+                                self.publish(head_imu_frame=value.get("params"),
+                                             head_imu_at=time.monotonic(),
+                                             head_imu_connection="live", head_imu_error=None)
+            except Exception as error:
+                self.publish(head_imu_connection="offline", head_imu_error=str(error))
                 self.stop.wait(1)
 
     def snapshot(self):
@@ -134,16 +176,29 @@ class Bridge:
                        if connection == "live" and len(times) > 1 and times[-1] > times[0] else 0)
             measured = state.get("joints", []) if state else []
             targets = state.get("targets", []) if state else []
+            health_age = None if self.health_at is None else (time.monotonic() - self.health_at) * 1000
+            thermal = (self.health or {}).get("motors") or {}
+            temps = thermal.get("temps_c", []) if connection == "live" and health_age is not None and health_age < 3000 else []
             motors = []
             for index, (motor_id, name, label) in enumerate(MOTORS):
                 q = measured[index] if index < len(measured) and finite(measured[index]) else None
                 target = targets[index] if index < len(targets) and finite(targets[index]) else None
-                motors.append({"id": motor_id, "name": name, "label": label, "group": "head" if 5 <= index <= 9 else ("left" if index < 5 else "right"), "online": connection == "live" and q is not None and age is not None and age < 1500, "calibrated": q is not None, "angle_rad": q, "angle_deg": math.degrees(q) if q is not None else None, "target_rad": target, "torque": None, "torque_known": False, "current_ma": None, "temperature_c": None, "voltage_v": None, "hardware_error": None, "status_error": None})
-            return {"sequence": self.sequence, "source": "robotd-ipc", "connection": connection, "age_ms": age, "motors": motors, "read_hz": read_hz, "last_error": self.last_error, "health": self.health, "hello": self.hello, "robot_state": state, "read_only": True}
+                temp = temps[index] if index < len(temps) and finite(temps[index]) else None
+                motors.append({"id": motor_id, "name": name, "label": label, "group": "head" if 5 <= index <= 9 else ("left" if index < 5 else "right"), "online": connection == "live" and q is not None and age is not None and age < 1500, "calibrated": q is not None, "angle_rad": q, "angle_deg": math.degrees(q) if q is not None else None, "target_rad": target, "torque": None, "torque_known": False, "current_ma": None, "temperature_c": temp, "voltage_v": None, "hardware_error": None, "status_error": None})
+            head_age = None if self.head_imu_at is None else (time.monotonic() - self.head_imu_at) * 1000
+            head_status = ("offline" if self.head_imu_connection == "offline" else
+                           "unavailable" if self.head_imu_result and not self.head_imu_result.get("sensor") else
+                           "live" if self.head_imu_connection == "live" and head_age is not None and head_age < 1500 else
+                           "stale" if self.head_imu_frame else "connecting")
+            head_imu = {"status": head_status, "sensor": (self.head_imu_result or {}).get("sensor"),
+                        "unavailable": (self.head_imu_result or {}).get("unavailable") or self.head_imu_error,
+                        "age_ms": head_age, "frame": self.head_imu_frame if head_status == "live" else None}
+            return {"sequence": self.sequence, "source": "robotd-ipc", "connection": connection, "age_ms": age, "health_age_ms": health_age, "motors": motors, "read_hz": read_hz, "last_error": self.last_error, "health": self.health, "hello": self.hello, "robot_state": state, "head_imu": head_imu, "read_only": True}
 
     def close(self):
         self.stop.set()
         self.thread.join(2)
+        self.head_thread.join(2)
 
 
 def handler_for(bridge, static_dir=None):
@@ -198,13 +253,14 @@ def handler_for(bridge, static_dir=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--robot-socket", default="/run/robotd.sock")
+    parser.add_argument("--tof-socket", default="/run/tofd/tof.sock")
     parser.add_argument("--listen", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--hz", type=int, default=10)
     parser.add_argument("--static-dir", type=Path, default=STATIC_DIR,
                         help="Live Twin static files (default: dist beside this script)")
     args = parser.parse_args()
-    bridge = Bridge(args.robot_socket, max(1, min(args.hz, 50)))
+    bridge = Bridge(args.robot_socket, max(1, min(args.hz, 50)), args.tof_socket)
     server = ThreadingHTTPServer((args.listen, args.port), handler_for(bridge, args.static_dir))
     try:
         server.serve_forever(poll_interval=.2)

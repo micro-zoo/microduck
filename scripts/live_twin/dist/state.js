@@ -12,4 +12,14 @@ export function torqueStatus(motor,streamAge=0){
  if(motor.torque===false||motor.torque===0)return 'OFF';
  return '—';
 }
-
+export function quaternionEuler(quat){
+ if(!Array.isArray(quat)||quat.length!==4||!quat.every(finite))return null;
+ const norm=Math.hypot(...quat);
+ if(norm<.5||norm>1.5)return null;
+ const [w,x,y,z]=quat.map(v=>v/norm),degree=180/Math.PI;
+ return {
+  roll:Math.atan2(2*(w*x+y*z),1-2*(x*x+y*y))*degree,
+  pitch:Math.asin(Math.max(-1,Math.min(1,2*(w*y-z*x))))*degree,
+  yaw:Math.atan2(2*(w*z+x*y),1-2*(y*y+z*z))*degree,
+ };
+}
