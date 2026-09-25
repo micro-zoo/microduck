@@ -1,0 +1,23 @@
+[Unit]
+Description=Microduck read-only Live Twin (robotd IPC)
+After=robotd.service
+
+[Service]
+Type=simple
+User=root
+Group=robot
+ExecStart=/usr/local/sbin/microduck-twin --robot-socket /run/robotd.sock --listen 127.0.0.1 --port 8765 --hz 10
+Restart=always
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

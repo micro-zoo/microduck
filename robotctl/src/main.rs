@@ -151,6 +151,13 @@ enum Namespace {
         command: RobotCommand,
     },
 
+    /// Read-only 3D Live Twin served from robotd telemetry.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Twin {
+        #[command(subcommand)]
+        command: TwinCommand,
+    },
+
     /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
     /// its own — is the one you're SSH'd into.
@@ -539,6 +546,30 @@ enum RobotCommand {
         /// Neck posture to aim around, radians. The IK holds it rather than solving it.
         #[arg(long, default_value_t = 0.0)]
         neck_pitch: f64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum TwinCommand {
+    /// Show whether the default read-only Live Twin service is installed, enabled and running.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable the service at boot and start it now.
+    Enable {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the service and disable it at boot. This never stops robotd.
+    Disable {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restart only the read-only Live Twin service.
+    Restart {
         #[arg(long)]
         json: bool,
     },
@@ -3179,6 +3210,161 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
 }
 
 /// The unit paused while a pad bonds. See [`BtdPaused`].
+const TWIN_UNIT: &str = "microduck-twin.service";
+const TWIN_URL: &str = "http://127.0.0.1:8765/";
+
+fn twin_systemctl(args: &[&str]) -> Result<String, Failure> {
+    let output = std::process::Command::new("systemctl")
+        .args(args)
+        .output()
+        .map_err(|error| Failure::new(exit::FAILED, format!("could not run systemctl: {error}")))?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(Failure::new(
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied {
+                exit::DENIED
+            } else {
+                exit::FAILED
+            },
+            if detail.is_empty() {
+                format!(
+                    "systemd could not {} {TWIN_UNIT}",
+                    args.first().copied().unwrap_or("inspect")
+                )
+            } else {
+                detail
+            },
+        ));
+    }
+    Ok(text)
+}
+
+fn twin_properties(text: &str) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            object.insert(key.to_owned(), serde_json::Value::String(value.to_owned()));
+        }
+    }
+    serde_json::Value::Object(object)
+}
+
+/// Maintain the default read-only viewer without touching robotd, padd or the motor bus.
+fn run_twin(command: TwinCommand) -> Result<(), Failure> {
+    let json = match &command {
+        TwinCommand::Status { json }
+        | TwinCommand::Enable { json }
+        | TwinCommand::Disable { json }
+        | TwinCommand::Restart { json } => *json,
+    };
+    match command {
+        TwinCommand::Status { .. } => {
+            let properties = twin_systemctl(&[
+                "show",
+                TWIN_UNIT,
+                "--no-pager",
+                "--property=LoadState,ActiveState,SubState,UnitFileState,MainPID",
+            ])?;
+            let mut value = twin_properties(&properties);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("unit".into(), TWIN_UNIT.into());
+                object.insert("url".into(), TWIN_URL.into());
+                object.insert("read_only".into(), true.into());
+            }
+            if value.get("LoadState").and_then(|state| state.as_str()) == Some("not-found") {
+                return Err(Failure::new(
+                    exit::REFUSED,
+                    format!(
+                        "{TWIN_UNIT} is not installed; update the robot before enabling the default Twin"
+                    ),
+                ));
+            }
+            if json {
+                println!("{}", compact(&value));
+            } else {
+                let object = value.as_object().expect("properties are an object");
+                println!("unit    {}", TWIN_UNIT);
+                println!(
+                    "state   {} / {}",
+                    object
+                        .get("ActiveState")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown"),
+                    object
+                        .get("UnitFileState")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                );
+                println!("url     {}", TWIN_URL);
+                println!("mode    read-only robotd IPC; no UART access");
+                println!("open    ssh -L 8765:127.0.0.1:8765 <user>@<robot-address>");
+            }
+            Ok(())
+        }
+        TwinCommand::Enable { .. } => {
+            if unsafe { libc::geteuid() } != 0 {
+                return Err(Failure::new(
+                    exit::DENIED,
+                    "enabling the default Twin requires root".into(),
+                ));
+            }
+            twin_systemctl(&["enable", "--now", TWIN_UNIT])?;
+            if json {
+                println!(
+                    "{}",
+                    compact(
+                        &serde_json::json!({"unit": TWIN_UNIT, "enabled": true, "active": true, "url": TWIN_URL, "read_only": true})
+                    )
+                );
+            } else {
+                println!("read-only Live Twin enabled and started at {TWIN_URL}");
+            }
+            Ok(())
+        }
+        TwinCommand::Disable { .. } => {
+            if unsafe { libc::geteuid() } != 0 {
+                return Err(Failure::new(
+                    exit::DENIED,
+                    "disabling the default Twin requires root".into(),
+                ));
+            }
+            twin_systemctl(&["disable", "--now", TWIN_UNIT])?;
+            if json {
+                println!(
+                    "{}",
+                    compact(
+                        &serde_json::json!({"unit": TWIN_UNIT, "enabled": false, "active": false, "url": TWIN_URL, "read_only": true})
+                    )
+                );
+            } else {
+                println!("read-only Live Twin stopped and disabled; robotd was not changed");
+            }
+            Ok(())
+        }
+        TwinCommand::Restart { .. } => {
+            if unsafe { libc::geteuid() } != 0 {
+                return Err(Failure::new(
+                    exit::DENIED,
+                    "restarting the default Twin requires root".into(),
+                ));
+            }
+            twin_systemctl(&["restart", TWIN_UNIT])?;
+            if json {
+                println!(
+                    "{}",
+                    compact(
+                        &serde_json::json!({"unit": TWIN_UNIT, "restarted": true, "url": TWIN_URL, "read_only": true})
+                    )
+                );
+            } else {
+                println!("read-only Live Twin restarted; robotd was not changed");
+            }
+            Ok(())
+        }
+    }
+}
+
 const BTD_UNIT: &str = "btd.service";
 
 /// Where a board provisioned with `--weird-ble` says so. Written by `scripts/setup-board.sh`.
@@ -4993,6 +5179,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
         }
+        Namespace::Twin { command } => return run_twin(command),
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
         }
@@ -5739,6 +5926,28 @@ mod tests {
 
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn twin_commands_are_service_operations() {
+        let status = Cli::try_parse_from(["robotctl", "twin", "status", "--json"])
+            .expect("twin status parses");
+        assert!(matches!(
+            status.namespace,
+            Namespace::Twin {
+                command: TwinCommand::Status { json: true }
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["robotctl", "twin", "enable"])
+                .expect("twin enable parses")
+                .namespace,
+            Namespace::Twin {
+                command: TwinCommand::Enable { .. }
+            }
+        ));
+        let properties = twin_properties("LoadState=loaded\nActiveState=inactive\n");
+        assert_eq!(properties["ActiveState"], "inactive");
+    }
 
     /// clap's own invariant check — catches conflicting flags/arg definitions at
     /// test time rather than on first run.
