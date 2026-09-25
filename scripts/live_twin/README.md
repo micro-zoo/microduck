@@ -25,8 +25,10 @@ Joint values are the coordinates reported by `robotd`. They are not a fresh
 calibration of a physical fixture at q=0. On a robot without installed joint
 zeroes, the 3D pose may differ from its physical fixture pose. Load physical
 zeroes through [`robotd`'s calibration setting](../../docs/robot/joint-calibration.md),
-not in this viewer. The visual mouth
-hinge alone adds 5 degrees to match the mesh's closed-mouth reference. Values
+not in this viewer. The visual mouth hinge alone adds 5 degrees to match the
+mesh's closed-mouth reference. The summary shows the largest visual deviation
+from model q=0; the joint list retains raw `robotd` model angles, including the
+closed mouth's −5°. Values
 that `robotd` does not publish, including torque and raw encoder ticks, display
 as unknown. A stale stream loses its live indication and holds its last pose.
 

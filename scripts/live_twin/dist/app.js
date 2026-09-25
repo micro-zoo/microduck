@@ -65,7 +65,8 @@ function paintState(){
  $('online-count').innerHTML=`${frame?online:'—'}<small>/ 15</small>`;
  $('rate').innerHTML=`${streamFresh?format(frame.read_hz,1):'—'}<small>Hz</small>`;
  const valid=streamFresh?frame.motors.filter(m=>motorUsable(m,age)):[];
- $('max-error').innerHTML=`${valid.length?format(Math.max(...valid.map(m=>Math.abs(m.angle_deg)))):'—'}<small>°</small>`;
+ const visualAngles=Object.values(poseAngles(valid,age,frame?.source));
+ $('max-error').innerHTML=`${visualAngles.length?format(Math.max(...visualAngles.map(angle=>Math.abs(angle*180/Math.PI)))):'—'}<small>°</small>`;
  for(const [id,row]of rows){
   const motor=frame?.motors.find(m=>m.id===id),good=motorUsable(motor,age);
   row.querySelector('.motor-angle').textContent=good?format(motor.angle_deg):'—';
@@ -75,7 +76,7 @@ function paintState(){
  $('model-status').textContent=valid.length===15?'robotd 模型角 · 实时跟随':valid.length?`实时 ${valid.length}/15 · 缺失关节保持最后姿态`:'模型参考 / 最后姿态 · 非实时';
  $('model-status').className=`stage-status ${valid.length===15?'live':''}`;
  const mouth=frame?.motors.find(m=>m.name==='mouth');
- const marker=$('mouth-marker');if(marker)marker.textContent=`34 · ${motorUsable(mouth,age)?format(mouth.angle_deg)+'°':'—'}`;
+ const marker=$('mouth-marker');if(marker){const visual=poseAngles(mouth?[mouth]:[],age,frame?.source).mouth;marker.textContent=`34 · ${finite(visual)?format(visual*180/Math.PI)+'°':'—'}`;}
  $('footer-status').textContent=streamFresh&&online?`robotd 只读订阅 · 状态年龄 ${format((frame.age_ms||0)+age,0)} ms`:frame?.connection==='offline'?'等待 robotd 连接':frame?.last_error||'等待 robotd 状态';
  updateDetails();
 }
@@ -112,7 +113,7 @@ async function buildModel(definition){
   let mouthAnchor=null,mouthLabel=null;
   function locateMouth(body){for(const site of body.sites||[])if(site.name==='mouth_tip'){
     mouthAnchor=new THREE.Object3D();mouthAnchor.position.fromArray(site.position);poseGraph.geometryParents.get(body.name).add(mouthAnchor);
-    mouthLabel=document.createElement('button');mouthLabel.id='mouth-marker';mouthLabel.className='mouth-marker';mouthLabel.type='button';mouthLabel.textContent='34 · —';mouthLabel.title='嘴部实时角度；近似铰链，传动比例待核对';mouthLabel.addEventListener('click',()=>selectMotor(34));container.append(mouthLabel);
+    mouthLabel=document.createElement('button');mouthLabel.id='mouth-marker';mouthLabel.className='mouth-marker';mouthLabel.type='button';mouthLabel.textContent='34 · —';mouthLabel.title='嘴部视觉铰链角；robotd 模型闭口为 −5°';mouthLabel.addEventListener('click',()=>selectMotor(34));container.append(mouthLabel);
   }for(const child of body.children)locateMouth(child);}locateMouth(definition.root);
   const projectedMouth=new THREE.Vector3();
   const loader=new STLLoader(),cache=new Map(),pickable=[];let loaded=0;
