@@ -166,6 +166,10 @@ jobs:
             --include "updater/systemd/updaterd.service=systemd/updaterd.service" \
             --include "updater/systemd/sysusers.d/robot.conf=systemd/sysusers.d/robot.conf" \
             --include "robotd/systemd/robotd.service=systemd/robotd.service" \
+            --include "robotctl/systemd/microduck-twin.service=systemd/microduck-twin.service" \
+            --include "scripts/live_twin/ipc_server.py=scripts/live_twin/ipc_server.py" \
+            --include "scripts/live_twin/dist=scripts/live_twin/dist" \
+            --include "scripts/microduck-twin=scripts/microduck-twin" \
             --include "hooks/postinstall=hooks/postinstall" \
             --include "scripts/setup-gstreamer.sh=scripts/setup-gstreamer.sh" \
             --include "scripts/setup-npu.sh=scripts/setup-npu.sh" \
