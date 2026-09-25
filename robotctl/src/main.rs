@@ -152,10 +152,9 @@ enum Namespace {
     },
 
     /// Read-only 3D Live Twin served from robotd telemetry.
-    #[command(subcommand_required = true, arg_required_else_help = true)]
     Twin {
         #[command(subcommand)]
-        command: TwinCommand,
+        command: Option<TwinCommand>,
     },
 
     /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
@@ -3288,7 +3287,33 @@ fn run_robot(socket: &Path, command: RobotCommand) -> Result<(), Failure> {
 
 /// The unit paused while a pad bonds. See [`BtdPaused`].
 const TWIN_UNIT: &str = "microduck-twin.service";
-const TWIN_URL: &str = "http://127.0.0.1:8765/";
+
+fn twin_urls_from(addresses: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for address in addresses.split_whitespace() {
+        let Ok(ip) = address.parse::<std::net::Ipv4Addr>() else {
+            continue;
+        };
+        if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+            continue;
+        }
+        let url = format!("http://{ip}:8765/");
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    urls
+}
+
+fn twin_urls() -> Vec<String> {
+    let Ok(output) = std::process::Command::new("hostname").arg("-I").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    twin_urls_from(&String::from_utf8_lossy(&output.stdout))
+}
 
 fn twin_systemctl(args: &[&str]) -> Result<String, Failure> {
     let output = std::process::Command::new("systemctl")
@@ -3329,6 +3354,8 @@ fn twin_properties(text: &str) -> serde_json::Value {
 
 /// Maintain the default read-only viewer without touching robotd, padd or the motor bus.
 fn run_twin(command: TwinCommand) -> Result<(), Failure> {
+    let urls = twin_urls();
+    let url = urls.first().cloned();
     let json = match &command {
         TwinCommand::Status { json }
         | TwinCommand::Enable { json }
@@ -3346,7 +3373,8 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
             let mut value = twin_properties(&properties);
             if let Some(object) = value.as_object_mut() {
                 object.insert("unit".into(), TWIN_UNIT.into());
-                object.insert("url".into(), TWIN_URL.into());
+                object.insert("url".into(), serde_json::json!(url));
+                object.insert("urls".into(), serde_json::json!(urls));
                 object.insert("read_only".into(), true.into());
             }
             if value.get("LoadState").and_then(|state| state.as_str()) == Some("not-found") {
@@ -3373,9 +3401,14 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                 );
-                println!("url     {}", TWIN_URL);
+                if urls.is_empty() {
+                    println!("url     unavailable (no network IPv4 address)");
+                } else {
+                    for address in &urls {
+                        println!("url     {address}");
+                    }
+                }
                 println!("mode    read-only robotd IPC; no UART access");
-                println!("open    ssh -L 8765:127.0.0.1:8765 <user>@<robot-address>");
             }
             Ok(())
         }
@@ -3391,11 +3424,14 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
                 println!(
                     "{}",
                     compact(
-                        &serde_json::json!({"unit": TWIN_UNIT, "enabled": true, "active": true, "url": TWIN_URL, "read_only": true})
+                        &serde_json::json!({"unit": TWIN_UNIT, "enabled": true, "active": true, "url": url, "urls": urls, "read_only": true})
                     )
                 );
             } else {
-                println!("read-only Live Twin enabled and started at {TWIN_URL}");
+                println!(
+                    "read-only Live Twin enabled and started at {}",
+                    url.as_deref().unwrap_or("no network IPv4 address yet")
+                );
             }
             Ok(())
         }
@@ -3411,7 +3447,7 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
                 println!(
                     "{}",
                     compact(
-                        &serde_json::json!({"unit": TWIN_UNIT, "enabled": false, "active": false, "url": TWIN_URL, "read_only": true})
+                        &serde_json::json!({"unit": TWIN_UNIT, "enabled": false, "active": false, "url": url, "urls": urls, "read_only": true})
                     )
                 );
             } else {
@@ -3431,11 +3467,14 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
                 println!(
                     "{}",
                     compact(
-                        &serde_json::json!({"unit": TWIN_UNIT, "restarted": true, "url": TWIN_URL, "read_only": true})
+                        &serde_json::json!({"unit": TWIN_UNIT, "restarted": true, "url": url, "urls": urls, "read_only": true})
                     )
                 );
             } else {
-                println!("read-only Live Twin restarted; robotd was not changed");
+                println!(
+                    "read-only Live Twin restarted at {}; robotd was not changed",
+                    url.as_deref().unwrap_or("no network IPv4 address yet")
+                );
             }
             Ok(())
         }
@@ -5264,7 +5303,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
         }
-        Namespace::Twin { command } => return run_twin(command),
+        Namespace::Twin { command } => {
+            return run_twin(command.unwrap_or(TwinCommand::Status { json: false }));
+        }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
         }
@@ -6064,12 +6105,17 @@ mod tests {
 
     #[test]
     fn twin_commands_are_service_operations() {
+        let default = Cli::try_parse_from(["robotctl", "twin"]).expect("bare twin shows status");
+        assert!(matches!(
+            default.namespace,
+            Namespace::Twin { command: None }
+        ));
         let status = Cli::try_parse_from(["robotctl", "twin", "status", "--json"])
             .expect("twin status parses");
         assert!(matches!(
             status.namespace,
             Namespace::Twin {
-                command: TwinCommand::Status { json: true }
+                command: Some(TwinCommand::Status { json: true })
             }
         ));
         assert!(matches!(
@@ -6077,11 +6123,20 @@ mod tests {
                 .expect("twin enable parses")
                 .namespace,
             Namespace::Twin {
-                command: TwinCommand::Enable { .. }
+                command: Some(TwinCommand::Enable { .. })
             }
         ));
         let properties = twin_properties("LoadState=loaded\nActiveState=inactive\n");
         assert_eq!(properties["ActiveState"], "inactive");
+    }
+
+    #[test]
+    fn twin_urls_show_routable_ipv4_addresses() {
+        assert_eq!(
+            twin_urls_from("127.0.0.1 192.168.1.42 fe80::1 169.254.4.2 192.168.1.42"),
+            ["http://192.168.1.42:8765/"]
+        );
+        assert!(twin_urls_from("127.0.0.1 ::1").is_empty());
     }
 
     /// clap's own invariant check — catches conflicting flags/arg definitions at
