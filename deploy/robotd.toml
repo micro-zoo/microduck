@@ -20,6 +20,9 @@
 # Zero 3W's wiring; a board wired differently can also be overridden per-invocation with
 # `robotd --port`, which is the dev escape hatch rather than the thing to edit here.
 port = "/dev/ttyS2"
+# Optional per-robot joint zeroes. A named file must exist and pass validation
+# before robotd opens the motor bus. Changing this value needs a robotd restart.
+# calibration = "/etc/robot/joint-zero.json"
 
 # Read the bus with fast sync read (protocol 2.0 instruction 0x8A) instead of a plain sync
 # read. The 16 devices append their answers to one status packet rather than each sending

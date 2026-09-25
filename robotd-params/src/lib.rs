@@ -1788,6 +1788,8 @@ pub struct Bus {
     /// Serial port the servos and the IMU board share. The Radxa Zero 3W wires them to
     /// `/dev/ttyS2`.
     pub port: String,
+    /// Per-robot joint zero JSON, loaded before hardware I/O. Unset uses encoder 2048.
+    pub calibration: Option<PathBuf>,
     /// Read the bus with fast sync read (protocol 2.0 instruction 0x8A) rather than a plain
     /// sync read: the sixteen devices append their blocks to one status packet instead of
     /// each sending its own, which is fifteen packet headers and fifteen bus turnarounds off
@@ -1874,8 +1876,17 @@ impl Default for Bus {
     fn default() -> Self {
         Self {
             port: "/dev/ttyS2".into(),
+            calibration: None,
             fast_sync_read: true,
         }
+    }
+}
+
+impl Bus {
+    pub fn calibration_path(&self) -> Option<&Path> {
+        self.calibration
+            .as_deref()
+            .filter(|path| !is_none_sentinel(path))
     }
 }
 
@@ -2095,6 +2106,18 @@ fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn joint_calibration_path_is_optional_and_none_can_clear_it() {
+        let params: super::Params =
+            toml::from_str("[bus]\ncalibration = '/etc/robot/joint-zero.json'\n").unwrap();
+        assert_eq!(
+            params.bus.calibration_path(),
+            Some(std::path::Path::new("/etc/robot/joint-zero.json"))
+        );
+        let params: super::Params = toml::from_str("[bus]\ncalibration = 'None'\n").unwrap();
+        assert!(params.bus.calibration_path().is_none());
+        assert!(super::Params::default().bus.calibration_path().is_none());
+    }
     /// [`Slot::as_str`] must be the *serde key*, because `robotctl policy load` writes
     /// `policy.<slot>` into `robotd.toml` with it. A display name that merely reads well —
     /// `sit_stand`, `groundPick` — would write a key `Params` then ignores as unknown, and the
