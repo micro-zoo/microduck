@@ -2,7 +2,12 @@
 
 `robotctl twin` manages a web viewer for the joint state published by
 `robotd`. The Python bridge connects to `/run/robotd.sock`, requests `hello`,
-`robot.health`, and `robot.subscribe`, and serves the bundled Three.js model and
+`robot.health` once a second, and `robot.subscribe`. It also subscribes to
+`head_imu.stream` on `/run/tofd/tof.sock`. The page shows the SoC temperature,
+all 15 servo case temperatures from `robotd`'s existing slow sample, the trunk
+IMU attitude, and the head BMI088 attitude when enabled. The two IMUs retain
+their own reference frames and arbitrary yaw origins; no mount correction is
+applied in the viewer. The bridge serves the bundled Three.js model and
 state events on port 8765 of the robot's network interfaces. It never opens the
 motor serial port or sends a robot intent. HTTP write requests return 405.
 
@@ -31,6 +36,9 @@ from model q=0; the joint list retains raw `robotd` model angles, including the
 closed mouth's −5°. Values
 that `robotd` does not publish, including torque and raw encoder ticks, display
 as unknown. A stale stream loses its live indication and holds its last pose.
+The head IMU is off by default; enable `[head_imu] enabled = true` in
+`/etc/robot/robotd.toml` and restart `tofd` to make its attitude live. When it
+is off or unavailable, the card shows that state rather than a zero angle.
 
 The page is limited to telemetry and model rotation. It has no HOME, zero,
 relax, WBC, or other control route. The old experimental control page remains

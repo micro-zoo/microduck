@@ -2,10 +2,10 @@ import * as THREE from 'three';
 import {OrbitControls} from './vendor/three/OrbitControls.js';
 import {STLLoader} from './vendor/three/STLLoader.js';
 import {createPoseGraph} from './rig.js';
-import {format,finite,motorUsable,poseAngles,torqueStatus} from './state.js';
+import {format,finite,motorUsable,poseAngles,quaternionEuler,torqueStatus} from './state.js';
 const $=id=>document.getElementById(id);
 let catalog=[],selectedId=20,lastFrame=null,lastReceived=0,poseGraph=null,selectedMeshes=[];
-const rows=new Map(),histories=new Map(),meshByMotor=new Map();
+const rows=new Map(),thermalRows=new Map(),histories=new Map(),meshByMotor=new Map();
 const groupNames={left:'01 / LEFT LEG',head:'02 / HEAD + MOUTH',right:'03 / RIGHT LEG'};
 function selectMotor(id){selectedId=id;for(const [key,row]of rows)row.classList.toggle('selected',key===id);highlight();updateDetails();}
 function buildList(){
@@ -22,6 +22,45 @@ function buildList(){
   $('joint-list').append(section);
  }
  selectMotor(selectedId);
+}
+function buildThermals(){
+ for(const item of catalog){
+  const cell=document.createElement('div');cell.className='thermal-cell';
+  const name=document.createElement('span');name.textContent=`${item.id} / ${item.label}`;
+  const value=document.createElement('strong');value.textContent='—';
+  cell.append(name,value);$('thermal-grid').append(cell);thermalRows.set(item.id,{cell,value});
+ }
+}
+function paintSensors(frame,age,streamFresh){
+ const healthFresh=streamFresh&&finite(frame?.health_age_ms)&&frame.health_age_ms+age<3000;
+ const health=healthFresh?frame.health:null;
+ const soc=health?.cpu_temp_c;
+ $('soc-temp').textContent=format(soc,0);
+ $('soc-state').textContent=finite(soc)?'实时':'暂无读数';
+ $('soc-state').className=`sensor-state ${finite(soc)?'live':''}`;
+ $('soc-meter').style.width=finite(soc)?`${Math.max(0,Math.min(100,soc/110*100))}%`:'0%';
+ const throttle=health?.cpu_throttle;
+ $('soc-throttle').textContent=throttle&&finite(throttle.khz)?`${format(throttle.khz/1000,0)} / ${format(throttle.max_khz/1000,0)} MHz${throttle.level>0?` · 节流 ${throttle.level}/${throttle.max_level}`:''}`:'频率状态 —';
+ const temperatures=frame?.motors?.filter(m=>streamFresh&&finite(m.temperature_c))||[];
+ $('thermal-state').textContent=temperatures.length===15?'15 / 15 实时':temperatures.length?`${temperatures.length} / 15 有读数`:'暂无读数';
+ $('thermal-state').className=`sensor-state ${temperatures.length===15?'live':''}`;
+ $('thermal-max').textContent=temperatures.length?`最高 ${format(Math.max(...temperatures.map(m=>m.temperature_c)),0)} °C · ${health?.motors?.hottest||'—'}`:'最高 —';
+ for(const [id,{cell,value}] of thermalRows){
+  const motor=streamFresh?frame.motors.find(m=>m.id===id):null;
+  value.textContent=finite(motor?.temperature_c)?`${format(motor.temperature_c,0)}°`:'—';
+  cell.classList.toggle('hottest',Boolean(temperatures.length&&motor?.name===health?.motors?.hottest));
+ }
+ const showAttitude=(prefix,quat,live,caption)=>{
+  const euler=live?quaternionEuler(quat):null;
+  for(const axis of ['roll','pitch','yaw'])$(`${prefix}-${axis}`).textContent=euler?format(euler[axis],1):'—';
+  $(`${prefix}-imu-state`).textContent=euler?'实时':caption;
+  $(`${prefix}-imu-state`).className=`sensor-state ${euler?'live':''}`;
+ };
+ showAttitude('body',frame?.robot_state?.imu?.quat,streamFresh,streamFresh?'姿态不可用':'等待遥测');
+ $('body-imu-age').textContent=streamFresh?`${format((frame.age_ms||0)+age,0)} ms`:'—';
+ const head=frame?.head_imu,headFresh=age<1500&&head?.status==='live'&&finite(head.age_ms)&&head.age_ms+age<1500;
+ showAttitude('head',head?.frame?.quat,headFresh,head?.status==='unavailable'?'未启用 / 不可用':head?.status==='stale'?'数据过期':'等待 tofd');
+ $('head-imu-age').textContent=headFresh?`${format(head.age_ms+age,0)} ms`:head?.unavailable||'—';
 }
 function highlight(){
  for(const mesh of selectedMeshes){mesh.material.color.copy(mesh.userData.baseColor);mesh.material.emissive?.setHex(0x000000);}
@@ -78,6 +117,7 @@ function paintState(){
  const mouth=frame?.motors.find(m=>m.name==='mouth');
  const marker=$('mouth-marker');if(marker){const visual=poseAngles(mouth?[mouth]:[],age,frame?.source).mouth;marker.textContent=`34 · ${finite(visual)?format(visual*180/Math.PI)+'°':'—'}`;}
  $('footer-status').textContent=streamFresh&&online?`robotd 只读订阅 · 状态年龄 ${format((frame.age_ms||0)+age,0)} ms`:frame?.connection==='offline'?'等待 robotd 连接':frame?.last_error||'等待 robotd 状态';
+ paintSensors(frame,age,streamFresh);
  updateDetails();
 }
 function receive(frame){
@@ -141,4 +181,4 @@ async function buildModel(definition){
   await populate(definition.root);$('model-loading').remove();highlight();if(lastFrame)poseGraph.setAngles(poseAngles(lastFrame.motors,performance.now()-lastReceived,lastFrame.source));
  }catch(error){const loading=$('model-loading');if(loading){loading.classList.add('error');loading.textContent='三维模型无法加载，位置读数仍可使用。';}console.error(error);}
 }
-fetch('/assets/model.json').then(r=>{if(!r.ok)throw Error('model data missing');return r.json();}).then(definition=>{catalog=definition.motors;buildList();connect();buildModel(definition);setInterval(paintState,250);}).catch(error=>{$('model-loading').textContent='模型定义加载失败';console.error(error);});
+fetch('/assets/model.json').then(r=>{if(!r.ok)throw Error('model data missing');return r.json();}).then(definition=>{catalog=definition.motors;buildList();buildThermals();connect();buildModel(definition);setInterval(paintState,250);}).catch(error=>{$('model-loading').textContent='模型定义加载失败';console.error(error);});
