@@ -39,6 +39,12 @@ as unknown. A stale stream loses its live indication and holds its last pose.
 The head IMU is off by default; enable `[head_imu] enabled = true` in
 `/etc/robot/robotd.toml` and restart `tofd` to make its attitude live. When it
 is off or unavailable, the card shows that state rather than a zero angle.
+On the Orange Pi Zero 3W bench robot, BMI088 is on `/dev/i2c-0`, while the
+generic `tofd` defaults look for the HAT bus at `/dev/i2c-pihat` or
+`/dev/i2c-3`. A board-specific systemd drop-in sets `tofd --bus /dev/i2c-0
+--imu-hz 25`; the experimental full HAT device-tree overlay is not needed.
+Keep that bus override specific to boards whose physical I²C wiring has been
+verified.
 
 The page is limited to telemetry and model rotation. It has no HOME, zero,
 relax, WBC, or other control route. The old experimental control page remains
