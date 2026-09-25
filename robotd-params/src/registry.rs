@@ -102,6 +102,11 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 pub const REGISTRY: &[Entry] = &[
     // ── [bus] ────────────────────────────────────────────────────────────────
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
+    entry(
+        "bus.calibration",
+        Kind::OptionalPath,
+        "Per-robot joint zero JSON; restart robotd after changes",
+    ),
     // Not a feature switch, though it is a `Bool`: the front page is "what does this robot
     // do", and this is "what does this robot's firmware understand". It belongs beside the
     // serial port, with the other thing you set once per board and then forget.

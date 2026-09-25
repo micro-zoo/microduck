@@ -28,6 +28,9 @@ struct JointZero {
     /// Effective encoder count corresponding to zero model radians. Fractional counts
     /// allow calibration at a nonzero reference angle without throwing precision away.
     zero_tick: f64,
+    /// Existing servo EEPROM value. It is checked at startup, never written here.
+    #[serde(default)]
+    homing_offset_tick: i32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +51,7 @@ pub enum CalibrationError {
 pub struct JointCalibration {
     offsets: [f64; NUM_JOINTS],
     configured: [bool; NUM_JOINTS],
+    homing_offsets: [i32; NUM_JOINTS],
 }
 
 impl JointCalibration {
@@ -86,6 +90,7 @@ impl JointCalibration {
             }
             calibration.offsets[index] = (joint.zero_tick - 2048.0) * RADIANS_PER_TICK;
             calibration.configured[index] = true;
+            calibration.homing_offsets[index] = joint.homing_offset_tick;
         }
         Ok(calibration)
     }
@@ -100,6 +105,10 @@ impl JointCalibration {
 
     pub fn is_configured(&self, joint: usize) -> bool {
         self.configured[joint]
+    }
+
+    pub fn expected_homing_offset(&self, joint: usize) -> i32 {
+        self.homing_offsets[joint]
     }
 
     /// A replacement has a different installation zero even if its model and ID match.
@@ -273,6 +282,16 @@ mod tests {
         assert!(c.check_replacement(20).is_err());
         assert!(c.check_replacement(21).is_ok());
         assert!(JointCalibration::default().check_replacement(20).is_ok());
+    }
+
+    #[test]
+    fn a_saved_zero_checks_the_existing_homing_offset() {
+        let calibration = JointCalibration::from_json(
+            r#"{"joints":[{"name":"left_knee","id":23,"zero_tick":1976,"homing_offset_tick":-585}]}"#,
+        )
+        .unwrap();
+        assert_eq!(calibration.expected_homing_offset(3), -585);
+        assert_eq!(calibration.expected_homing_offset(4), 0);
     }
 
     #[test]

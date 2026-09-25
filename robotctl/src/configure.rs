@@ -951,6 +951,24 @@ fn draw(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn joint_calibration_change_restarts_robotd() {
+        assert_eq!(apply_for("bus.calibration"), Some(Apply::Restart("robotd")));
+        let mut config = model("# keep\n[bus]\nport = '/dev/serial0'\n");
+        let entry = robotd_params::registry::REGISTRY
+            .iter()
+            .find(|entry| entry.key == "bus.calibration")
+            .unwrap();
+        config.edit(entry, "/etc/robot/joint-zero.json").unwrap();
+        let rendered = config.rendered();
+        let params: robotd_params::Params = toml::from_str(&rendered).unwrap();
+        assert_eq!(
+            params.bus.calibration_path(),
+            Some(std::path::Path::new("/etc/robot/joint-zero.json"))
+        );
+        assert_eq!(params.bus.port, "/dev/serial0");
+        assert!(rendered.contains("# keep"));
+    }
     /// And a robot mid-experiment names every leftover. This is the set a flamingo trial leaves
     /// behind, which is what the command exists for: `cmd_alpha` at pass-through, a slot pointed
     /// at somebody's file, another switched off, and a fall gate widened.

@@ -191,12 +191,12 @@ impl DynamixelIo {
             if model.as_slice() != [1200]
                 || mode.as_slice() != [3]
                 || drive.as_slice() != [0]
-                || offset.as_slice() != [0]
+                || offset.as_slice() != [self.calibration.expected_homing_offset(joint)]
                 || !matches!(min.as_slice(), [value] if (*value + PI).abs() < 1e-9)
                 || !matches!(max.as_slice(), [value] if (*value - (PI - crate::calibration::RADIANS_PER_TICK)).abs() < 1e-9)
             {
                 return Err(IoError::Bus(format!(
-                    "calibrated ID {id} requires XL330-M288, drive mode 0, mode 3, homing offset 0 and position limits 0..4095"
+                    "calibrated ID {id} requires XL330-M288, drive mode 0, mode 3, the recorded homing offset and position limits 0..4095"
                 )));
             }
         }
