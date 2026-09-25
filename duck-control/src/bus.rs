@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
 
+use crate::calibration::JointCalibration;
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
@@ -107,6 +108,7 @@ impl StaleImuTracker {
 
 pub struct DynamixelIo {
     controller: Xl330Controller,
+    calibration: JointCalibration,
     /// Kept so the port can be reopened at the factory baud rate: `rustypot` owns the serial
     /// handle outright and offers no way to change its speed in place.
     port: String,
@@ -135,12 +137,18 @@ impl DynamixelIo {
 
         Ok(Self {
             controller,
+            calibration: JointCalibration::default(),
             port: port.to_owned(),
             ids,
             fast_sync_read,
             imu: SflpDecoder::default(),
             stale_imu: StaleImuTracker::default(),
         })
+    }
+
+    pub fn with_calibration(mut self, calibration: JointCalibration) -> Self {
+        self.calibration = calibration;
+        self
     }
 
     /// Assert — and correct — the EEPROM registers the control loop depends on.
@@ -150,6 +158,48 @@ impl DynamixelIo {
     /// budget across the bus. Checking costs one read per register at startup and removes
     /// a whole class of "why is it slow on this robot".
     pub fn check_registers(&mut self) -> Result<usize> {
+        // A saved zero belongs to this motor and encoder mode. Refuse a mismatched
+        // installation before changing any startup EEPROM register.
+        for (joint, &id) in JOINT_IDS.iter().enumerate() {
+            if !self.calibration.is_configured(joint) {
+                continue;
+            }
+            let model = self
+                .controller
+                .read_model_number(id)
+                .map_err(|e| IoError::Bus(format!("read model on {id}: {e}")))?;
+            let mode = self
+                .controller
+                .read_operating_mode(id)
+                .map_err(|e| IoError::Bus(format!("read mode on {id}: {e}")))?;
+            let drive = self
+                .controller
+                .read_drive_mode(id)
+                .map_err(|e| IoError::Bus(format!("read drive mode on {id}: {e}")))?;
+            let offset = self
+                .controller
+                .read_homing_offset(id)
+                .map_err(|e| IoError::Bus(format!("read homing offset on {id}: {e}")))?;
+            let min = self
+                .controller
+                .read_min_position_limit(id)
+                .map_err(|e| IoError::Bus(format!("read min position on {id}: {e}")))?;
+            let max = self
+                .controller
+                .read_max_position_limit(id)
+                .map_err(|e| IoError::Bus(format!("read max position on {id}: {e}")))?;
+            if model.as_slice() != [1200]
+                || mode.as_slice() != [3]
+                || drive.as_slice() != [0]
+                || offset.as_slice() != [0]
+                || !matches!(min.as_slice(), [value] if (*value + PI).abs() < 1e-9)
+                || !matches!(max.as_slice(), [value] if (*value - (PI - crate::calibration::RADIANS_PER_TICK)).abs() < 1e-9)
+            {
+                return Err(IoError::Bus(format!(
+                    "calibrated ID {id} requires XL330-M288, drive mode 0, mode 3, homing offset 0 and position limits 0..4095"
+                )));
+            }
+        }
         let mut fixed = 0;
         for &id in &JOINT_IDS {
             fixed += self.check_registers_of(id)?;
@@ -232,6 +282,7 @@ impl DynamixelIo {
     /// missing, or was replaced by one that is not fresh. The bus is back at [`BAUD_RATE`]
     /// either way, so the caller can keep waiting on it.
     pub fn adopt_replacement(&mut self, id: u8) -> Result<bool> {
+        self.calibration.check_replacement(id)?;
         let name = JOINT_IDS
             .iter()
             .position(|&j| j == id)
@@ -351,7 +402,9 @@ impl DynamixelIo {
             });
         }
         let mut out = [0.0; NUM_JOINTS];
-        out.copy_from_slice(&values);
+        for (joint, value) in values.iter().enumerate() {
+            out[joint] = self.calibration.model_position(joint, *value)?;
+        }
         Ok(out)
     }
 
@@ -512,15 +565,18 @@ impl RobotIo for DynamixelIo {
             let velocity = i32::from_le_bytes([block[4], block[5], block[6], block[7]]);
             sensors.velocities[joint] = velocity as f64 * RAD_PER_SEC_PER_COUNT;
             let position = i32::from_le_bytes([block[8], block[9], block[10], block[11]]);
-            sensors.positions[joint] = (2.0 * PI * position as f64 / 4096.0) - PI;
+            sensors.positions[joint] = self
+                .calibration
+                .model_position(joint, (2.0 * PI * position as f64 / 4096.0) - PI)?;
         }
 
         Ok(sensors)
     }
 
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
+        let servo_positions = self.calibration.servo_targets(&targets.positions)?;
         self.controller
-            .sync_write_goal_position(&JOINT_IDS, &targets.positions)
+            .sync_write_goal_position(&JOINT_IDS, &servo_positions)
             .map_err(|e| IoError::Bus(format!("sync_write goal positions: {e}")))
     }
 
