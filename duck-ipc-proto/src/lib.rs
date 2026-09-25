@@ -423,7 +423,8 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// an `updaterd` that has not run its first check yet — every board for the minute after it
 /// starts, including the one right after the update that brought v35 in. Both warned. The attempt
 /// tells them apart, and its error is what the warning was pointing at the journal for.
-pub const API_VERSION: u32 = 38;
+/// v39 adds the complete once-per-second servo temperature sample to `robot.health`.
+pub const API_VERSION: u32 = 39;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3668,6 +3669,10 @@ pub struct MotorThermal {
     pub hottest: String,
     pub max_c: f64,
     pub mean_c: f64,
+    /// Servo case temperatures in [`JOINT_NAMES`] order, sampled with max/mean.
+    /// Empty before the first sample or from a daemon predating v39.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub temps_c: Vec<f64>,
 }
 
 /// Motor-bus voltage, and what fraction of a pack that is.
