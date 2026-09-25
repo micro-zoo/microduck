@@ -21,9 +21,11 @@ reach that port, so use it on a trusted network. The viewer can start while
 `robotd` is stopped; it reports offline until `robotd` supplies state. Enabling
 the viewer does not start `robotd` because its service has only `After=robotd`.
 
-Joint values are the coordinates reported by `robotd`. They are **not** a fresh
+Joint values are the coordinates reported by `robotd`. They are not a fresh
 calibration of a physical fixture at q=0. On a robot without installed joint
-zeroes, the 3D pose may differ from its physical fixture pose. The visual mouth
+zeroes, the 3D pose may differ from its physical fixture pose. Load physical
+zeroes through [`robotd`'s calibration setting](../../docs/robot/joint-calibration.md),
+not in this viewer. The visual mouth
 hinge alone adds 5 degrees to match the mesh's closed-mouth reference. Values
 that `robotd` does not publish, including torque and raw encoder ticks, display
 as unknown. A stale stream loses its live indication and holds its last pose.
