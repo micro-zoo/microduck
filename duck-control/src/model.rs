@@ -12,11 +12,7 @@
 pub const NUM_JOINTS: usize = 15;
 
 /// Dynamixel IDs, indexed as [`JOINT_NAMES`].
-pub const JOINT_IDS: [u8; NUM_JOINTS] = [
-    20, 21, 22, 23, 24, // left leg
-    30, 31, 32, 33, 34, // neck, head, mouth
-    10, 11, 12, 13, 14, // right leg
-];
+pub use duck_ipc_proto::JOINT_IDS;
 
 /// Joint names, from the protocol crate — the wire indexes `joints` and `targets`
 /// positionally, so that order and this one cannot be allowed to drift apart. The

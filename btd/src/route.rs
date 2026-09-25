@@ -226,7 +226,9 @@ fn permits(call: &proto::Call) -> bool {
         // model API is this, is a telepresence session live. Internal plumbing of the update
         // decision, of no use to a client and misleading if exposed: a phone reading
         // `safeToRestart` would learn nothing it could act on.
-        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
+        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive | RobotCalibrationInfo => {
+            false
+        }
 
         // Teleop. **Never over BLE**, which is what §4.1 means by a subset: BLE is too slow and
         // too constrained for the full surface, and teleop belongs on WebRTC's datachannel
@@ -690,6 +692,7 @@ mod tests {
             proto::Call::RobotSafeToRestart,
             proto::Call::RobotModelApi,
             proto::Call::RobotRemoteSessionActive,
+            proto::Call::RobotCalibrationInfo,
         ] {
             assert_eq!(upstream_for(&call), None, "{}", call.method());
         }
