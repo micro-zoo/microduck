@@ -40,6 +40,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 use robotd_params::Slot;
 
+mod calibrate;
 mod camera;
 mod cells;
 mod configure;
@@ -149,6 +150,13 @@ enum Namespace {
     Robot {
         #[command(subcommand)]
         command: RobotCommand,
+    },
+
+    /// Generate a per-robot joint-zero candidate from robotd's read-only state.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Calibrate {
+        #[command(subcommand)]
+        command: CalibrateCommand,
     },
 
     /// Read-only 3D Live Twin served from robotd telemetry.
@@ -547,6 +555,19 @@ enum RobotCommand {
         neck_pitch: f64,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CalibrateCommand {
+    /// Capture 15 motor zeroes while the robot is held in its q=0 fixture.
+    Zero {
+        /// Confirm the physical robot is held at q=0; no motor command is sent.
+        #[arg(long)]
+        fixture_q0: bool,
+        /// New candidate JSON path. Existing files are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -1332,6 +1353,36 @@ impl Client {
             next_id: 1,
             service,
         })
+    }
+
+    fn set_read_timeout(&self, timeout: Duration) -> Result<(), Failure> {
+        self.reader
+            .get_ref()
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| Failure::new(exit::FAILED, format!("could not set socket timeout: {e}")))
+    }
+
+    fn next_robot_state(&mut self) -> Result<proto::RobotState, Failure> {
+        loop {
+            let mut line = String::new();
+            let read = self.reader.read_line(&mut line).map_err(|e| {
+                Failure::new(
+                    exit::UNREACHABLE,
+                    format!("robotd state stream stopped: {e}"),
+                )
+            })?;
+            if read == 0 {
+                return Err(Failure::new(
+                    exit::UNREACHABLE,
+                    "robotd closed the state stream".into(),
+                ));
+            }
+            if let Ok(note) = serde_json::from_str::<proto::Request>(line.trim())
+                && let Some(state) = note.as_state()
+            {
+                return Ok(state);
+            }
+        }
     }
 
     /// Write one request. Used by [`Self::call`] and by `watch`, which reads replies
@@ -5218,6 +5269,10 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Robot { command } => {
             return run_robot(&cli.robot_socket, command);
         }
+        Namespace::Calibrate { command } => {
+            let CalibrateCommand::Zero { fixture_q0, output } = command;
+            return calibrate::capture_zero(&cli.robot_socket, &output, fixture_q0);
+        }
         Namespace::Twin { command } => {
             return run_twin(command.unwrap_or(TwinCommand::Status { json: false }));
         }
@@ -5993,6 +6048,28 @@ mod tests {
         ));
         let properties = twin_properties("LoadState=loaded\nActiveState=inactive\n");
         assert_eq!(properties["ActiveState"], "inactive");
+    }
+
+    #[test]
+    fn calibration_capture_is_an_explicit_file_generation_command() {
+        let cli = Cli::try_parse_from([
+            "robotctl",
+            "calibrate",
+            "zero",
+            "--fixture-q0",
+            "--output",
+            "/tmp/joint-zero-candidate.json",
+        ])
+        .expect("calibration capture parses");
+        assert!(matches!(
+            cli.namespace,
+            Namespace::Calibrate {
+                command: CalibrateCommand::Zero {
+                    fixture_q0: true,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
