@@ -35,6 +35,8 @@ function paintSensors(frame,age,streamFresh){
  const healthFresh=streamFresh&&finite(frame?.health_age_ms)&&frame.health_age_ms+age<3000;
  const health=healthFresh?frame.health:null;
  const soc=health?.cpu_temp_c;
+ $('top-soc').textContent=format(soc,0);
+ $('top-motor').textContent=format(health?.motors?.max_c,0);
  $('soc-temp').textContent=format(soc,0);
  $('soc-state').textContent=finite(soc)?'实时':'暂无读数';
  $('soc-state').className=`sensor-state ${finite(soc)?'live':''}`;
