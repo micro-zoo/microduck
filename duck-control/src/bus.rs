@@ -131,7 +131,7 @@ pub struct DynamixelIo {
 impl DynamixelIo {
     /// Open the bus. `fast_sync_read` is `bus.fast_sync_read` from `robotd.toml` — see
     /// [`open_controller`] for what it costs to have wrong.
-    pub fn open(port: &str, fast_sync_read: bool) -> Result<Self> {
+    pub fn open(port: &str, fast_sync_read: bool, imu_mount: [f64; 4]) -> Result<Self> {
         let controller = open_controller(port, BAUD_RATE, fast_sync_read)?;
 
         let mut ids = Vec::with_capacity(NUM_JOINTS + 1);
@@ -147,7 +147,7 @@ impl DynamixelIo {
             port: port.to_owned(),
             ids,
             fast_sync_read,
-            imu: SflpDecoder::default(),
+            imu: SflpDecoder::new(imu_mount),
             stale_imu: StaleImuTracker::default(),
         })
     }

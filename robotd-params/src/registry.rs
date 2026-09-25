@@ -115,6 +115,27 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Read the bus with fast sync read — needs XL330 firmware v46+",
     ),
+    // ── [body_imu] ───────────────────────────────────────────────────────────
+    entry(
+        "body_imu.mount_w",
+        Kind::Float,
+        "Body IMU sensor-to-trunk quaternion W",
+    ),
+    entry(
+        "body_imu.mount_x",
+        Kind::Float,
+        "Body IMU sensor-to-trunk quaternion X",
+    ),
+    entry(
+        "body_imu.mount_y",
+        Kind::Float,
+        "Body IMU sensor-to-trunk quaternion Y",
+    ),
+    entry(
+        "body_imu.mount_z",
+        Kind::Float,
+        "Body IMU sensor-to-trunk quaternion Z",
+    ),
     // ── [control] ────────────────────────────────────────────────────────────
     entry("control.hz", Kind::Integer, "Control loop rate"),
     entry(

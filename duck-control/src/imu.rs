@@ -352,4 +352,18 @@ mod tests {
             "expected |gyro| {expected}, got {magnitude}"
         );
     }
+
+    #[test]
+    fn configured_mount_rotates_gyro_and_projected_gravity_together() {
+        let mut decoder = SflpDecoder::new([0.0, 0.0, 0.0, 1.0]);
+        let mut block = [0u8; IMU_BLOCK_LEN];
+        block[0..2].copy_from_slice(&1000i16.to_le_bytes());
+        block[6..8].copy_from_slice(&0x3000u16.to_le_bytes());
+        decoder.decode(&block);
+        decoder.decode(&block);
+        let out = decoder.decode(&block);
+        assert!((out.gyro[0] + 1000.0 * GYRO_RAD_PER_LSB).abs() < 1e-9);
+        assert!(out.gravity[0].abs().max(out.gravity[1].abs()) > 0.1);
+        assert!((out.gravity.iter().map(|v| v * v).sum::<f64>() - 1.0).abs() < 1e-9);
+    }
 }
