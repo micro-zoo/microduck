@@ -549,6 +549,8 @@ struct RobotState {
     /// joint it was. Zero means *not read yet*, same as the battery.
     motor_max_c: AtomicU64,
     motor_mean_c: AtomicU64,
+    /// The same slow bus sample as max/mean, kept together for read-only clients.
+    motor_temps_c: ArcSwapOption<[f64; duck_control::model::NUM_JOINTS]>,
     /// Index into [`duck_control::JOINT_NAMES`] of the hottest joint.
     motor_hottest: AtomicU32,
     /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
@@ -702,6 +704,7 @@ impl RobotState {
             battery_v: AtomicU64::new(0),
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
+            motor_temps_c: ArcSwapOption::empty(),
             motor_hottest: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
             cpu_throttle: ArcSwapOption::empty(),
@@ -884,6 +887,10 @@ impl RobotState {
                 .to_string(),
             max_c,
             mean_c: f64::from_bits(self.motor_mean_c.load(Ordering::Relaxed)),
+            temps_c: self
+                .motor_temps_c
+                .load_full()
+                .map_or_else(Vec::new, |t| t.to_vec()),
         })
     }
 
@@ -3490,6 +3497,9 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
                 .motor_mean_c
                 .store(mean_c.to_bits(), Ordering::Relaxed);
             state.motor_hottest.store(hottest as u32, Ordering::Relaxed);
+            state
+                .motor_temps_c
+                .store(Some(std::sync::Arc::new(slow.temps_c)));
         }
         // Keep the last sample. A single failed transaction is ordinary on a serial bus, and
         // dropping to "unknown" over one would make the reported battery flicker. A bus that
@@ -7097,11 +7107,17 @@ mod tests {
         s.motor_max_c.store(48.0f64.to_bits(), Ordering::Relaxed);
         s.motor_mean_c.store(36.0f64.to_bits(), Ordering::Relaxed);
         s.motor_hottest.store(knee as u32, Ordering::Relaxed);
+        let mut temperatures = [35.0; duck_control::model::NUM_JOINTS];
+        temperatures[knee] = 48.0;
+        s.motor_temps_c
+            .store(Some(std::sync::Arc::new(temperatures)));
 
         let motors = s.health().motors.expect("thermals");
         assert_eq!(motors.hottest, "left_knee");
         assert_eq!(motors.max_c, 48.0);
         assert_eq!(motors.mean_c, 36.0);
+        assert_eq!(motors.temps_c[knee], 48.0);
+        assert_eq!(motors.temps_c.len(), duck_control::model::NUM_JOINTS);
 
         // A servo cooking must not change the verdict, for the same reason a flat pack must
         // not: it is a fact about the robot, not evidence about the release.

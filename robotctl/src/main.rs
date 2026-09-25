@@ -6699,6 +6699,7 @@ mod tests {
                     hottest: "left_knee".into(),
                     max_c: 48.0,
                     mean_c: 36.0,
+                    temps_c: vec![36.0; 15],
                 }),
                 cpu_temp_c: Some(52.0),
                 control_loop: Some(proto::LoopHealth {
