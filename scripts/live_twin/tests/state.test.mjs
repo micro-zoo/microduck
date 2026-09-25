@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {poseAngles,torqueStatus} from '../dist/state.js';
+import {poseAngles,quaternionEuler,torqueStatus} from '../dist/state.js';
 
 test('IPC mouth conversion affects the visual hinge only',()=>{
  const motors=[
@@ -21,4 +21,13 @@ test('unknown or stale torque never appears as OFF',()=>{
  assert.equal(torqueStatus({online:true,torque:0}),'OFF');
  assert.equal(torqueStatus({online:true,torque:1}),'ON');
  assert.equal(torqueStatus({online:true,torque:0},2000),'—');
+});
+
+test('IMU quaternion is reported as roll pitch yaw without invented orientation',()=>{
+ const roll=quaternionEuler([Math.SQRT1_2,Math.SQRT1_2,0,0]);
+ assert.ok(Math.abs(roll.roll-90)<1e-9);
+ assert.ok(Math.abs(roll.pitch)<1e-9);
+ assert.ok(Math.abs(roll.yaw)<1e-9);
+ assert.equal(quaternionEuler([0,0,0,0]),null);
+ assert.equal(quaternionEuler(null),null);
 });
