@@ -373,6 +373,7 @@ cargo run -p xtask -- package \
     --include "robotctl/systemd/microduck-twin.service=systemd/microduck-twin.service" \
     --include "hooks/postinstall=hooks/postinstall" \
     --include "scripts/live_twin/ipc_server.py=scripts/live_twin/ipc_server.py" \
+    --include "scripts/live_twin/dist=scripts/live_twin/dist" \
     --include "scripts/microduck-twin=scripts/microduck-twin" \
     --include "scripts/setup-gstreamer.sh=scripts/setup-gstreamer.sh" \
     --include "scripts/setup-npu.sh=scripts/setup-npu.sh" \
