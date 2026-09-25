@@ -423,7 +423,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// an `updaterd` that has not run its first check yet — every board for the minute after it
 /// starts, including the one right after the update that brought v35 in. Both warned. The attempt
 /// tells them apart, and its error is what the warning was pointing at the journal for.
-pub const API_VERSION: u32 = 37;
+pub const API_VERSION: u32 = 38;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -536,6 +536,23 @@ pub const JOINT_NAMES: [&str; 15] = [
     "right_knee",
     "right_ankle",
 ];
+
+/// Physical servo IDs in the same order as [`JOINT_NAMES`]. Fixture capture
+/// writes both name and ID so a swapped motor cannot inherit another zero.
+pub const JOINT_IDS: [u8; JOINT_NAMES.len()] =
+    [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14];
+
+/// The calibration actually loaded by this robotd, with the hardware setup
+/// read on the same motor bus at startup. A client can reconstruct effective
+/// encoder ticks from model angles without opening the serial port itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationInfo {
+    pub zero_ticks: [f64; JOINT_NAMES.len()],
+    pub homing_offset_ticks: [i32; JOINT_NAMES.len()],
+    pub single_turn_compatible: [bool; JOINT_NAMES.len()],
+    pub policy_enabled: bool,
+    pub homed: bool,
+}
 
 /// Method names, as they go on the wire. Namespaced so a new namespace cannot collide
 /// with `update.*`. [`Call`] is the typed form.
@@ -716,6 +733,8 @@ pub mod method {
     /// The static geometry [`RobotState::frames`] and [`TofFrame`] are stated in — see
     /// [`ModelResult`]. A read; asked once per session.
     pub const ROBOT_MODEL: &str = "robot.model";
+    /// Read-only hardware and loaded-zero metadata for `robotctl calibrate`.
+    pub const ROBOT_CALIBRATION_INFO: &str = "robot.calibrationInfo";
 
     /// Put a different `.onnx` in one slot, or drop an override and go back to the default.
     ///
@@ -1030,6 +1049,8 @@ pub enum Call {
     RobotPolicies,
     /// Static robot geometry for a mapper; see [`method::ROBOT_MODEL`].
     RobotModel,
+    /// Loaded joint zeroes and startup hardware readback; no motor operation.
+    RobotCalibrationInfo,
     /// Load one slot, or reset it; see [`method::ROBOT_LOAD_POLICY`].
     RobotLoadPolicy(LoadPolicyParams),
     /// Re-read every slot from disk; see [`method::ROBOT_RELOAD_POLICIES`].
@@ -1196,6 +1217,7 @@ impl Call {
             Call::RobotSetMode(_) => method::ROBOT_SET_MODE,
             Call::RobotPolicies => method::ROBOT_POLICIES,
             Call::RobotModel => method::ROBOT_MODEL,
+            Call::RobotCalibrationInfo => method::ROBOT_CALIBRATION_INFO,
             Call::RobotLoadPolicy(_) => method::ROBOT_LOAD_POLICY,
             Call::RobotReloadPolicies => method::ROBOT_RELOAD_POLICIES,
             Call::PolicyCheck => method::POLICY_CHECK,
@@ -1354,6 +1376,7 @@ impl Call {
             | Call::RobotRemoteSessionActive
             | Call::RobotPolicies
             | Call::RobotModel
+            | Call::RobotCalibrationInfo
             | Call::RobotMode => (Robot, Prompt),
             // Intents and one-shot skills. All fast: they store a value the control loop reads on
             // its next tick, and none of them waits for the robot to finish anything.
@@ -1513,6 +1536,7 @@ impl Call {
             | Call::RobotShutdown
             | Call::RobotPolicies
             | Call::RobotModel
+            | Call::RobotCalibrationInfo
             | Call::RobotReloadPolicies
             | Call::PolicyCheck
             | Call::DetectorCheck
@@ -1585,6 +1609,7 @@ impl Call {
             method::ROBOT_SET_MODE => Call::RobotSetMode(decode(params)?),
             method::ROBOT_POLICIES => Call::RobotPolicies,
             method::ROBOT_MODEL => Call::RobotModel,
+            method::ROBOT_CALIBRATION_INFO => Call::RobotCalibrationInfo,
             method::ROBOT_LOAD_POLICY => Call::RobotLoadPolicy(decode(params)?),
             method::ROBOT_RELOAD_POLICIES => Call::RobotReloadPolicies,
             method::POLICY_CHECK => Call::PolicyCheck,
@@ -1742,6 +1767,7 @@ pub mod test_support {
             Call::RobotMode,
             Call::RobotPolicies,
             Call::RobotModel,
+            Call::RobotCalibrationInfo,
             Call::RobotReloadPolicies,
             Call::PolicyCheck,
             Call::PolicyInstall(PolicyInstallParams {
@@ -5560,7 +5586,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            67,
+            68,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }

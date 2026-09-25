@@ -36,7 +36,7 @@ class FakeBridge:
             "read_hz": 10,
             "last_error": None,
             "health": {"healthy": True},
-            "hello": {"api_version": 37},
+            "hello": {"api_version": 38},
             "robot_state": {"joints": joints, "targets": targets},
             "read_only": True,
             "control": {"enabled": False},
@@ -145,7 +145,7 @@ class IpcServerTests(unittest.TestCase):
                         request = json.loads(line)
                         method = request["method"]
                         result = {
-                            "hello": {"api_version": 37, "daemon_version": "test"},
+                            "hello": {"api_version": 38, "daemon_version": "test"},
                             "robot.health": {"healthy": True},
                             "robot.subscribe": {"accepted": True},
                         }[method]

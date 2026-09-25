@@ -571,6 +571,9 @@ struct RobotState {
     shutdown: AtomicBool,
     /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
     state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
+    /// One startup readback from the real motor bus. Fake and simulated bodies
+    /// have no encoder or EEPROM coordinates to offer a fixture capture.
+    hardware_calibration: ArcSwapOption<duck_control::calibration::HardwareCalibrationInfo>,
     /// What `btd` should be advertising, published when it changes.
     ///
     /// A broadcast channel like the state stream, and for the same reason: `btd` subscribes, and a
@@ -707,6 +710,7 @@ impl RobotState {
             imu_ready: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
+            hardware_calibration: ArcSwapOption::empty(),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
             policy_change_error: ArcSwapOption::empty(),
@@ -1791,6 +1795,9 @@ async fn control_loop<T: RobotIo>(
     period: Duration,
     poweroff: PowerOff,
 ) {
+    state
+        .hardware_calibration
+        .store(io.hardware_calibration_info().map(Arc::new));
     // Owned rather than borrowed from `params`, because neither the mode nor the slots stay
     // what the file said: `robot.setMode` replaces the mode, `robot.loadPolicy` replaces one
     // slot, and the line below drops any override this board cannot actually load.
@@ -4500,6 +4507,28 @@ fn dispatch(
         // life of the process, read from the same asset the FK runs on.
         proto::Call::RobotModel => proto::Response::ok(Some(id), &mapping::model()),
 
+        proto::Call::RobotCalibrationInfo => {
+            let Some(info) = state.hardware_calibration.load_full() else {
+                return proto::Response::err(
+                    Some(id),
+                    proto::Error::new(
+                        proto::code::BUSY,
+                        "real motor-bus calibration readback is not ready",
+                    ),
+                );
+            };
+            proto::Response::ok(
+                Some(id),
+                &proto::CalibrationInfo {
+                    zero_ticks: info.zero_ticks,
+                    homing_offset_ticks: info.homing_offset_ticks,
+                    single_turn_compatible: info.single_turn_compatible,
+                    policy_enabled: state.policy_enabled,
+                    homed: state.homed.load(Ordering::Relaxed),
+                },
+            )
+        }
+
         proto::Call::RobotPolicies => proto::Response::ok(
             Some(id),
             &proto::PoliciesResult {
@@ -4955,6 +4984,34 @@ mod tests {
         let params = Params::load(&path, true).expect("valid config");
         let state = Arc::new(RobotState::new(&params, &path, false, false));
         (dir, state)
+    }
+
+    #[test]
+    fn calibration_info_comes_from_the_loaded_bus_not_a_config_file_read() {
+        let (_dir, state) = state_over("[policy]\nenabled = false\n");
+        let intents = Intents::new();
+        let call = proto::Call::RobotCalibrationInfo;
+        let missing = dispatch(&state, &intents, proto::Id::Number(1), &call);
+        assert_eq!(missing.error.unwrap().code, proto::code::BUSY);
+
+        let mut zero_ticks = [2048.0; NUM_JOINTS];
+        zero_ticks[3] = 1976.0;
+        let mut homing_offset_ticks = [0; NUM_JOINTS];
+        homing_offset_ticks[3] = -585;
+        state.hardware_calibration.store(Some(Arc::new(
+            duck_control::calibration::HardwareCalibrationInfo {
+                zero_ticks,
+                homing_offset_ticks,
+                single_turn_compatible: [true; NUM_JOINTS],
+            },
+        )));
+        let response = dispatch(&state, &intents, proto::Id::Number(2), &call);
+        let info: proto::CalibrationInfo =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert_eq!(info.zero_ticks[3], 1976.0);
+        assert_eq!(info.homing_offset_ticks[3], -585);
+        assert!(!info.policy_enabled);
+        assert!(!info.homed);
     }
 
     /// **A new skill needs a duration and an existing one does not**, so a client may send one

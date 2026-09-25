@@ -281,7 +281,9 @@ fn permits(call: &proto::Call) -> bool {
         //
         // `updaterd`'s private queries to `robotd`. Internal plumbing of the update decision, of
         // no use to a client and misleading if exposed.
-        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive => false,
+        RobotSafeToRestart | RobotModelApi | RobotRemoteSessionActive | RobotCalibrationInfo => {
+            false
+        }
 
         // ── refused: this transport does not authenticate ────────────────────
         //
@@ -422,7 +424,7 @@ mod tests {
     /// of the subset must not quietly grow past, and a test that says "some things are refused"
     /// would not notice.
     #[test]
-    fn the_pin_and_the_factory_reset_are_never_available() {
+    fn private_calls_and_factory_reset_are_never_available() {
         for call in proto::test_support::every_call() {
             if matches!(
                 call,
@@ -430,6 +432,7 @@ mod tests {
                     | proto::Call::SystemSetPairingPin(_)
                     | proto::Call::ResetToGolden(_)
                     | proto::Call::Pin(_)
+                    | proto::Call::RobotCalibrationInfo
             ) {
                 assert_eq!(route_for(&call), Route::Refused, "{}", call.method());
             }

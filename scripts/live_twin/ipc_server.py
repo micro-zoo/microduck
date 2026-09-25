@@ -105,7 +105,7 @@ class Bridge:
                     sock.settimeout(3)
                     sock.connect(self.socket_path)
                     buffer = b""
-                    buffer, self.hello = self.request(sock, buffer, 1, "hello", {"api_version": 37})
+                    buffer, self.hello = self.request(sock, buffer, 1, "hello", {"api_version": 38})
                     buffer, self.health = self.request(sock, buffer, 2, "robot.health", {})
                     buffer, _ = self.request(sock, buffer, 3, "robot.subscribe", {"hz": self.hz})
                     sock.settimeout(None)
