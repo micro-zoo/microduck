@@ -2,10 +2,24 @@ import * as THREE from 'three';
 import {OrbitControls} from './vendor/three/OrbitControls.js';
 import {STLLoader} from './vendor/three/STLLoader.js';
 import {createPoseGraph} from './rig.js';
-import {format,finite,motorUsable,poseAngles,samplingPaused} from './state.js';
+import {format,finite,motorUsable,poseAngles,samplingPaused,torqueStatus} from './state.js';
 import {createControls} from './controls.js';
-const controlUI=createControls();
+const readOnly=document.body.dataset.readOnly==='true';
+const controlUI=readOnly?{update(){},disconnected(){}}:createControls();
 const $=id=>document.getElementById(id);
+if(readOnly){
+ document.querySelector('.actionbar').remove();
+ $('cal-reference').textContent='robotd 模型坐标';
+ $('cal-time').textContent='只读订阅 · 不控制电机';
+ $('cal-heading').textContent='姿态来源';
+ $('angle-heading').textContent='最大关节角';
+ $('joint-angle-heading').textContent='模型角 °';
+ $('angle-reference').textContent='模型空间角度';
+ $('telemetry-label').textContent='模型角度 · 实时反馈';
+ $('control-mode').textContent='● READ ONLY';
+ document.querySelector('.detail-grid').insertAdjacentHTML('afterbegin','<div><span>目标角 / °</span><strong id="target-angle">—</strong></div><div><span>目标 − 实测 / °</span><strong id="tracking-error">—</strong></div>');
+ const link=$('calibration-link');link.href='/api/state';link.textContent='查看实时状态 ↗';
+}
 let catalog=[],selectedId=20,lastFrame=null,lastReceived=0,poseGraph=null,selectedMeshes=[];
 const rows=new Map(),histories=new Map(),meshByMotor=new Map();
 const groupNames={left:'01 / LEFT LEG',head:'02 / HEAD + MOUTH',right:'03 / RIGHT LEG'};
@@ -36,17 +50,24 @@ function updateDetails(){
  const live=motorUsable(motor,age);
  $('selected-id').textContent=String(selectedId);$('selected-label').textContent=definition.label;$('selected-name').textContent=definition.name;
  $('selected-angle').textContent=live?format(motor.angle_deg):'—';
- $('selected-freshness').textContent=live?`${Math.round((motor.age_ms||0)+age)} ms`:'数据不可用';
- $('raw-tick').textContent=motor?.online&&age<1500?String(motor.raw_tick):'—';
+ $('selected-freshness').textContent=live?`${Math.round((motor.age_ms??lastFrame?.age_ms??0)+age)} ms`:'数据不可用';
+ $('raw-tick').textContent=motor?.online&&age<1500&&finite(motor.raw_tick)?String(motor.raw_tick):'—';
  $('zero-tick').textContent=finite(motor?.zero_tick)?format(motor.zero_tick,Number.isInteger(motor.zero_tick)?0:1):'—';
+ if(readOnly){
+  const target=live&&finite(motor.target_rad)?motor.target_rad*180/Math.PI:null;
+  $('target-angle').textContent=format(target);
+  $('tracking-error').textContent=finite(target)?format(target-motor.angle_deg):'—';
+ }
  for(const [element,key,digits]of [['velocity','velocity_rad_s',3],['temperature','temperature_c',0],['voltage','voltage_v',1],['current','current_ma',0]])$(element).textContent=motor?.online&&age<1500?format(motor[key],digits):'—';
- $('torque').textContent=motor?.online&&age<1500?(motor.torque?'ON':'OFF'):'—';
- $('torque').className=motor?.online&&age<1500?(motor.torque?'on':'off'):'';
+ const torque=torqueStatus(motor,age);
+ $('torque').textContent=torque;
+ $('torque').className=torque==='—'?'':torque.toLowerCase();
  const alert=$('motor-alert');let message='等待当前电机状态',fault=false;
  if(motor?.online&&age<1500){
   if(motor.hardware_error||motor.status_error){message=`硬件状态 0x${(motor.hardware_error||motor.status_error).toString(16).padStart(2,'0')}`;fault=true;}
   else if(motor.calibration_mismatch){message='电机设置已改变，请重新核对标定';fault=true;}
   else if(motor.single_turn_range_risk){message=`单圈余量 +${format(motor.positive_margin_deg,1)}° / −${format(motor.negative_margin_deg,1)}°，未覆盖模型范围`;fault=true;}
+  else if(readOnly)message=definition.name==='mouth'?'模型闭口 = −5° · 三维铰链以闭口为 0°':'robotd 模型角 · 未提供的电机数据以 — 显示';
   else if(definition.name==='mouth')message='闭口 = 0° · 嘴部近似铰链，电机角按 1:1 显示';
   else message=motor.calibrated?'读数正常 · 已应用工装零位':'读数可用，尚无零位标定';
  }
@@ -78,12 +99,13 @@ function paintState(){
   row.classList.toggle('missing',!good);row.classList.toggle('fault',Boolean(motor?.hardware_error||motor?.single_turn_range_risk));
   row.title=motor?.single_turn_range_risk?'零位已采集；单圈运动范围待处理':motor?.online?'':'暂无当前读数';
  }
- $('model-status').textContent=paused?'控制准备／恢复中 · 未更新的关节保留最后姿态':valid.length===15?'已补偿位置 · 实时跟随':valid.length?`实时 ${valid.length}/15 · 缺失关节保持最后姿态`:'模型参考 / 最后姿态 · 非实时';
+ $('model-status').textContent=paused?'控制准备／恢复中 · 未更新的关节保留最后姿态':valid.length===15?(readOnly?'robotd 模型角 · 实时跟随':'已补偿位置 · 实时跟随'):valid.length?`实时 ${valid.length}/15 · 缺失关节保持最后姿态`:'模型参考 / 最后姿态 · 非实时';
  $('model-status').className=`stage-status ${valid.length===15?'live':''}`;
  const risks=frame?.motors.filter(m=>m.single_turn_range_risk).length||0;
  const mouth=frame?.motors.find(m=>m.name==='mouth');
  const marker=$('mouth-marker');if(marker)marker.textContent=`34 · ${motorUsable(mouth,age)?format(mouth.angle_deg)+'°':'—'}`;
  $('footer-status').textContent=paused?'串口由控制程序使用，完成后自动恢复实时采样':frame?.calibration_error?'标定记录不可用':streamFresh&&online?`${format(frame.cycle_ms,1)} ms / 读取周期${risks?` · ${risks} 路单圈行程待检查`:''}`:frame?.last_error||'等待控制板连接';
+ if(readOnly)$('footer-status').textContent=streamFresh&&online?`robotd 只读订阅 · 状态年龄 ${format((frame.age_ms||0)+age,0)} ms`:frame?.last_error||'等待 robotd 状态';
  updateDetails();
 }
 function receive(frame){
@@ -91,11 +113,13 @@ function receive(frame){
  lastFrame=frame;lastReceived=performance.now();
  controlUI.update(frame);
  for(const motor of frame.motors){if(motorUsable(motor)){const h=histories.get(motor.id)||[];h.push({t:lastReceived,v:motor.angle_deg});while(h.length&&lastReceived-h[0].t>30000)h.shift();histories.set(motor.id,h);}}
- poseGraph?.setAngles(poseAngles(frame.motors));paintState();
+ poseGraph?.setAngles(poseAngles(frame.motors,0,frame.source));paintState();
 }
 function connect(){
  const source=new EventSource('/api/events');
- source.addEventListener('telemetry',event=>{try{receive(JSON.parse(event.data));}catch(error){console.error('Telemetry payload',error);}});
+ const onTelemetry=event=>{try{receive(JSON.parse(event.data));}catch(error){console.error('Telemetry payload',error);}};
+ source.addEventListener('telemetry',onTelemetry);
+ source.addEventListener('message',onTelemetry);
  source.onerror=()=>{lastReceived=0;paintState();controlUI.disconnected();};
  fetch('/api/state',{cache:'no-store'}).then(r=>r.json()).then(receive).catch(()=>paintState());
 }
@@ -143,7 +167,7 @@ async function buildModel(definition){
   renderer.setAnimationLoop(()=>{controls.update();renderer.render(scene,camera);
     if(mouthAnchor&&mouthLabel){mouthAnchor.getWorldPosition(projectedMouth);projectedMouth.project(camera);mouthLabel.style.display=projectedMouth.z<1&&projectedMouth.z>-1?'block':'none';mouthLabel.style.left=`${(projectedMouth.x*.5+.5)*container.clientWidth}px`;mouthLabel.style.top=`${(-projectedMouth.y*.5+.5)*container.clientHeight}px`;}
   });
-  await populate(definition.root);$('model-loading').remove();highlight();if(lastFrame)poseGraph.setAngles(poseAngles(lastFrame.motors));
+  await populate(definition.root);$('model-loading').remove();highlight();if(lastFrame)poseGraph.setAngles(poseAngles(lastFrame.motors,performance.now()-lastReceived,lastFrame.source));
  }catch(error){const loading=$('model-loading');if(loading){loading.classList.add('error');loading.textContent='三维模型无法加载，位置读数仍可使用。';}console.error(error);}
 }
 fetch('/assets/model.json').then(r=>{if(!r.ok)throw Error('model data missing');return r.json();}).then(definition=>{catalog=definition.motors;buildList();connect();buildModel(definition);setInterval(paintState,250);}).catch(error=>{$('model-loading').textContent='模型定义加载失败';console.error(error);});

@@ -14,8 +14,8 @@ import ipc_server
 
 
 class FakeBridge:
-    stop = threading.Event()
     def __init__(self):
+        self.stop = threading.Event()
         self.sequence = 1
         self.lock = threading.Condition()
 
@@ -81,7 +81,8 @@ class IpcServerTests(unittest.TestCase):
     def test_page_and_post_are_safe_viewer_operations(self):
         status, body = self.request("GET", "/")
         self.assertEqual(status, 200)
-        self.assertIn("只读".encode(), body)
+        self.assertIn(b'data-read-only="true"', body)
+        self.assertIn(b'src="/app.js"', body)
         status, body = self.request("POST", "/api/control/home")
         self.assertEqual(status, 405)
         self.assertIn(b"read-only", body)
@@ -89,6 +90,42 @@ class IpcServerTests(unittest.TestCase):
     def test_unknown_route_is_not_a_control_fallback(self):
         status, _ = self.request("GET", "/api/control/home")
         self.assertEqual(status, 404)
+
+    def test_three_modules_and_every_model_mesh_are_available_offline(self):
+        for path in ("/app.js", "/rig.js", "/state.js", "/controls.js",
+                     "/vendor/three/three.module.js", "/vendor/three/OrbitControls.js",
+                     "/vendor/three/STLLoader.js"):
+            connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+            connection.request("GET", path)
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200, path)
+            self.assertIn("javascript", response.getheader("Content-Type"), path)
+            self.assertTrue(response.read(), path)
+            connection.close()
+        status, body = self.request("GET", "/assets/model.json")
+        self.assertEqual(status, 200)
+        def check_meshes(node):
+            for geom in node["geoms"]:
+                status, body = self.request("GET", "/assets/meshes/" + geom["mesh"])
+                self.assertEqual(status, 200, geom["mesh"])
+                self.assertGreater(len(body), 84)
+            for child in node["children"]:
+                check_meshes(child)
+        check_meshes(json.loads(body)["root"])
+
+    def test_static_paths_cannot_escape_the_web_root(self):
+        for path in ("/../ipc_server.py", "/%2e%2e/ipc_server.py", "/assets/%2e%2e/%2e%2e/ipc_server.py", "/%00", "/assets/"):
+            self.assertEqual(self.request("GET", path)[0], 404, path)
+
+    def test_sse_messages_carry_viewer_state(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
+        connection.request("GET", "/api/events")
+        response = connection.getresponse()
+        self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
+        line = response.readline()
+        self.assertTrue(line.startswith(b"data: "))
+        self.assertTrue(json.loads(line[6:])["read_only"])
+        connection.close()
 
     def test_bridge_subscribes_without_opening_a_uart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,16 +162,22 @@ class IpcServerTests(unittest.TestCase):
             bridge = ipc_server.Bridge(path, 10)
             try:
                 deadline = time.monotonic() + 2
-                while bridge.robot_state is None and time.monotonic() < deadline:
+                while len(bridge.received_times) < 2 and time.monotonic() < deadline:
                     time.sleep(.01)
                 self.assertIsNotNone(bridge.robot_state)
                 snapshot = bridge.snapshot()
                 self.assertEqual(snapshot["connection"], "live")
-                self.assertEqual(snapshot["read_hz"], 50)
+                self.assertGreater(snapshot["read_hz"], 0)
+                self.assertEqual(snapshot["robot_state"]["loop"]["hz"], 50)
                 self.assertEqual(snapshot["motors"][5]["angle_rad"], 0.0)
                 self.assertIsNone(snapshot["motors"][5]["torque"])
             finally:
                 bridge.close(); stop.set(); thread.join(1)
+            bridge.publish(last_state_at=time.monotonic() - 2)
+            snapshot = bridge.snapshot()
+            self.assertEqual(snapshot["connection"], "stale")
+            self.assertTrue(all(not motor["online"] for motor in snapshot["motors"]))
+            self.assertEqual(snapshot["read_hz"], 0)
 
 
 if __name__ == "__main__":

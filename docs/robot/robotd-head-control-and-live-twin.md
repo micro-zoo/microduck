@@ -222,6 +222,11 @@ IPC-only Twin 已在 139 上运行，但由于正式 `robotd` 尚未产生健康
 IPC-only 模式已经实现为 `scripts/live_twin/ipc_server.py`，默认服务单元为
 `microduck-twin.service`。它保留现有串口诊断模式，但两者是不同的运行模式：
 
+2026-09-21 源码更新：默认 IPC 服务现在提供 `scripts/live_twin/dist/` 中的 Three.js
+页面，模型和 Three.js 资源随发布包一起安装。默认页面隐藏动作工具栏，不请求控制会话。
+`robotctl twin` 命令、服务名与端口不变。此处描述源码行为，不代表本次已经更新实机；
+本地预览、已有安装的更新与回滚步骤见 [Live Twin README](../../scripts/live_twin/README.md)。
+
 1. 后端只连接 `/run/robotd.sock`，发送 `hello`、`robot.health` 和 `robot.subscribe`。
    初始以 10 Hz 查看，需要时再提高；使用 daemon 的服务端降采样。
 2. IPC-only 页面用 `joints` 显示实测模型角度，用 `targets` 显示目标/追踪误差，浏览器通过 HTTP/SSE 接收页面状态。

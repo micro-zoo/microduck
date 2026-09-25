@@ -7,7 +7,7 @@ beside `robotd`; the UART mode described below is exclusive. The current board c
 deployment differences and completed work are in the
 [agent handoff](../../docs/project/microduck-agent-handoff.md).
 
-The existing joint telemetry and 3D view, with three supported controls:
+The separate UART diagnostic mode provides joint telemetry, the 3D view and three controls:
 
 - **HOME** moves to the model's default pose and holds it.
 - **回零** moves to the captured fixture zero and holds it. The mouth stays closed;
@@ -29,6 +29,35 @@ endpoint. It does not stop `robotd`, `padd`, or any motor operation. Enablement 
 part of the shipped service unit, so a fresh install starts it at boot; `disable` is
 available for a board that does not need the page. Reach it from a development machine
 with `ssh -L 8765:127.0.0.1:8765 root@10.4.1.139`.
+
+The default IPC service serves the Three.js page in `dist/`. Its meshes and vendored
+Three.js modules are included in release, dev-CI and `dev-push` packages, so a fresh
+installation needs no CDN or files from an older calibration deployment. `--static-dir`
+can select another complete static directory; the default is `dist` beside
+`ipc_server.py`. The service name, wrapper and port do not change.
+
+In this read-only page the HOME/zero/unload toolbar is absent and no control session
+is requested. The selected joint also shows its target angle and target-minus-measured
+error. Both IPC `message` events and diagnostic `telemetry` events are accepted
+by the shared frontend. Joint values remain in robotd model coordinates. Only the
+visual mouth hinge adds 5 degrees, mapping model closed-mouth -5 degrees to visual
+zero. Missing encoder, torque, voltage, current and temperature data display as `—`;
+an absent torque value is never interpreted as OFF. The update rate measures received
+state frames, not robotd's control-loop rate. Stale joints keep their last visible
+pose and lose their live indication.
+
+Preview locally without a robot (the model loads and telemetry stays offline):
+
+```sh
+python3 scripts/live_twin/ipc_server.py --port 8876
+# Open http://127.0.0.1:8876/
+```
+
+To update an existing IPC installation, back up its `scripts/live_twin/ipc_server.py`
+and `scripts/live_twin/dist/`, install both from the same checkout, then run
+`sudo robotctl twin restart`. Copying only the Python file is insufficient. Rollback
+restores both paths and restarts only the Twin service. This does not require
+restarting robotd, changing its calibration or opening the motor UART.
 
 The existing HOME/回零/卸力 controls remain a separate hardware diagnostic mode. They
 must not be enabled by the IPC-only service and should only be used with the robot supported.
@@ -77,16 +106,19 @@ journaling. The sibling `export_joint_zero.py`, `configure_extended_position.py`
 The captured `calibration.json` belongs to the particular robot and stays outside
 Git. Original settings and operation records are saved in `--control-runs`.
 
-The existing STL assets and Three.js distribution are reused from the original
-Live Twin deployment; they are not duplicated here. `--assets-dir` must contain
-the existing `assets/` and `vendor/` directories. `dist/assets/model.json` and the
-model license describe the view. Its mouth hinge remains a visual approximation.
+The STL assets and Three.js distribution from the original Live Twin are now in
+`dist/assets/meshes/` and `dist/vendor/three/`. Meshes use the existing Alpha MJCF
+model source recorded in `dist/assets/model.json` and the Apache-2.0 license in
+`dist/assets/MODEL-LICENSE.txt`. Three.js r164 and its unchanged OrbitControls and
+STLLoader modules retain `dist/vendor/three/LICENSE.txt` (MIT). The mouth hinge
+remains a visual approximation. The diagnostic server's `--assets-dir` may point
+to this bundled `dist/` or another directory containing `assets/` and `vendor/`.
 
 For a local, unpowered preview:
 
 ```sh
 python3 scripts/live_twin/server.py --offline --http-port 8876 \
-  --assets-dir /absolute/path/to/existing/dist \
+  --assets-dir scripts/live_twin/dist \
   --calibration /absolute/path/to/captured/calibration.json
 ```
 
