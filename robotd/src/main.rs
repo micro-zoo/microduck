@@ -1079,7 +1079,7 @@ fn run_init(params: &Params, calibration: &JointCalibration, duration: Duration)
     // The same open as the daemon's, replacement adoption included: `init` is what someone
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
-    let Some(mut io) = open_bus(&params.bus, 0, calibration) else {
+    let Some(mut io) = open_bus(&params.bus, params.body_imu.mount(), 0, calibration) else {
         return ExitCode::FAILURE;
     };
     if let Err(e) = io.set_torque(true) {
@@ -1131,6 +1131,7 @@ fn spawn_control_thread(
     let fake = args.fake;
     let sim = args.sim.clone();
     let bus = params.bus.clone();
+    let imu_mount = params.body_imu.mount();
     let calibration = *calibration;
     let params = params.clone();
     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
@@ -1193,7 +1194,7 @@ fn spawn_control_thread(
             // loop has not completed a cycle yet", forever, whatever happened to the robot
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
-                if let Some(io) = open_bus_waiting(&bus, &state, &calibration).await {
+                if let Some(io) = open_bus_waiting(&bus, imu_mount, &state, &calibration).await {
                     control_loop(io, state, intents, params, params_path, period, poweroff).await;
                 }
             });
@@ -1215,6 +1216,7 @@ type BusIo = FakeIo;
 /// Returns `None` only if shutdown is requested while waiting.
 async fn open_bus_waiting(
     bus: &params::Bus,
+    imu_mount: [f64; 4],
     state: &RobotState,
     calibration: &JointCalibration,
 ) -> Option<BusIo> {
@@ -1223,7 +1225,7 @@ async fn open_bus_waiting(
     while !state.shutdown.load(Ordering::Relaxed) {
         // Logging lives in `open_bus`, which is chatty by design on the first attempt and
         // quiet thereafter — a board waiting overnight must not fill the journal.
-        if let Some(io) = open_bus(bus, attempt, calibration) {
+        if let Some(io) = open_bus(bus, imu_mount, attempt, calibration) {
             state.startup_bus_failures.store(0, Ordering::Relaxed);
             return Some(io);
         }
@@ -1243,12 +1245,17 @@ async fn open_bus_waiting(
 
 /// Open and verify the bus, or explain why not.
 #[cfg(target_os = "linux")]
-fn open_bus(bus: &params::Bus, attempt: u32, calibration: &JointCalibration) -> Option<BusIo> {
+fn open_bus(
+    bus: &params::Bus,
+    imu_mount: [f64; 4],
+    attempt: u32,
+    calibration: &JointCalibration,
+) -> Option<BusIo> {
     // First attempt and every thirtieth — about one line per 30 s while waiting.
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
     let port = bus.port.as_str();
 
-    let mut io = match duck_control::bus::DynamixelIo::open(port, bus.fast_sync_read) {
+    let mut io = match duck_control::bus::DynamixelIo::open(port, bus.fast_sync_read, imu_mount) {
         Ok(io) => io.with_calibration(*calibration),
         Err(e) => {
             if loud {
@@ -1345,7 +1352,12 @@ fn adopt_missing_servo(io: &mut BusIo, loud: bool) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_bus(_bus: &params::Bus, _attempt: u32, _calibration: &JointCalibration) -> Option<BusIo> {
+fn open_bus(
+    _bus: &params::Bus,
+    _imu_mount: [f64; 4],
+    _attempt: u32,
+    _calibration: &JointCalibration,
+) -> Option<BusIo> {
     tracing::error!("no bus on this platform; use --fake");
     None
 }
@@ -7218,9 +7230,14 @@ mod tests {
             ..Default::default()
         };
         let handle = tokio::spawn(async move {
-            open_bus_waiting(&nowhere, &waiter_state, &JointCalibration::default())
-                .await
-                .is_none()
+            open_bus_waiting(
+                &nowhere,
+                params::BodyImuParams::default().mount(),
+                &waiter_state,
+                &JointCalibration::default(),
+            )
+            .await
+            .is_none()
         });
 
         // Bounded, so a regression fails rather than hanging CI.

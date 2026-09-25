@@ -64,6 +64,7 @@ pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
 #[serde(deny_unknown_fields, default)]
 pub struct Params {
     pub bus: Bus,
+    pub body_imu: BodyImuParams,
     pub control: Control,
     pub update_gate: UpdateGate,
     pub policy: PolicyParams,
@@ -1809,6 +1810,37 @@ pub struct Bus {
     pub fast_sync_read: bool,
 }
 
+/// Fixed sensor-to-trunk mounting of the IMU on the Dynamixel bus.
+/// The default matches the original board; a differently mounted board records
+/// its measured transform in its own `robotd.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BodyImuParams {
+    pub mount_w: f64,
+    pub mount_x: f64,
+    pub mount_y: f64,
+    pub mount_z: f64,
+}
+
+impl BodyImuParams {
+    pub fn mount(&self) -> [f64; 4] {
+        let q = [self.mount_w, self.mount_x, self.mount_y, self.mount_z];
+        let norm = q.iter().map(|v| v * v).sum::<f64>().sqrt();
+        q.map(|v| v / norm)
+    }
+}
+
+impl Default for BodyImuParams {
+    fn default() -> Self {
+        Self {
+            mount_w: std::f64::consts::FRAC_1_SQRT_2,
+            mount_x: 0.0,
+            mount_y: std::f64::consts::FRAC_1_SQRT_2,
+            mount_z: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Control {
@@ -1942,6 +1974,8 @@ pub enum ParamsError {
         min: u32,
         max: u32,
     },
+    #[error("{path}: body_imu mount must be a finite unit quaternion, got norm {got}")]
+    BodyImuMount { path: String, got: f64 },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -2030,6 +2064,22 @@ impl Params {
                 max: BITRATE_MAX,
             });
         }
+        let mount = [
+            self.body_imu.mount_w,
+            self.body_imu.mount_x,
+            self.body_imu.mount_y,
+            self.body_imu.mount_z,
+        ];
+        let norm = mount.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if mount.iter().any(|v| !v.is_finite())
+            || !norm.is_finite()
+            || !(0.99..=1.01).contains(&norm)
+        {
+            return Err(ParamsError::BodyImuMount {
+                path: path.display().to_string(),
+                got: norm,
+            });
+        }
         Ok(())
     }
 
@@ -2106,6 +2156,49 @@ fn without_unknown_keys(text: &str) -> Option<(Result<Params, toml::de::Error>, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn per_robot_imu_mount_survives_an_older_config_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(
+            &path,
+            "[body_imu]\nmount_w = 0.5\nmount_x = -0.5\nmount_y = 0.5\nmount_z = -0.5\n[battery]\nempty_voltage = 4.5\n",
+        )
+        .unwrap();
+        let params = super::Params::load(&path, true).unwrap();
+        assert_eq!(params.body_imu.mount(), [0.5, -0.5, 0.5, -0.5]);
+        assert_eq!(
+            super::Params::default().body_imu.mount(),
+            [
+                std::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+                std::f64::consts::FRAC_1_SQRT_2,
+                0.0
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_imu_mount_is_refused_before_hardware_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        for values in [
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [f64::NAN, 0.0, 1.0, 0.0],
+        ] {
+            std::fs::write(
+                &path,
+                format!(
+                    "[body_imu]\nmount_w = {}\nmount_x = {}\nmount_y = {}\nmount_z = {}\n",
+                    values[0], values[1], values[2], values[3]
+                ),
+            )
+            .unwrap();
+            assert!(super::Params::load(&path, true).is_err());
+        }
+    }
+
     #[test]
     fn joint_calibration_path_is_optional_and_none_can_clear_it() {
         let params: super::Params =

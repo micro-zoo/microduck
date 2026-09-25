@@ -35,6 +35,16 @@ port = "/dev/ttyS2"
 # this line. Needs a robotd restart.
 # fast_sync_read = true
 
+[body_imu]
+# Sensor-to-trunk rotation for the IMU at Dynamixel ID 200. The default is the
+# original board's +90° Y mount. A different physical installation may set its
+# measured unit quaternion here; robotd applies it before publishing gravity,
+# gyro and orientation to policies, health and robot.state. Restart robotd.
+# mount_w = 0.7071067811865476
+# mount_x = 0.0
+# mount_y = 0.7071067811865476
+# mount_z = 0.0
+
 # Every value below that is commented out shows the built-in default. LEAVE IT COMMENTED
 # unless this robot genuinely needs a different value: install.sh copies this file to
 # /etc/robot/robotd.toml once and never overwrites it, so an uncommented value is frozen on
