@@ -46,6 +46,9 @@ joint is checked for the expected servo mode before startup register correction,
 and a shifted goal outside the single-turn range is refused instead of wrapped.
 See [the operator procedure](../robot/joint-calibration.md) for capturing and
 loading this robot's zeroes.
+`robot.calibrationInfo` serves the in-memory zeroes and the bus's startup
+readback to `robotctl` over the existing Unix socket; the client reconstructs
+encoder counts from the ordinary state stream and never opens the UART itself.
 
 The IMU is `id 200` and is read in the *same* `sync_read` as the servos, because that is what
 the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip SFLP

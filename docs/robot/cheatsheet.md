@@ -34,6 +34,11 @@ the line about it says whether it answers now.
 
 ### Watching the loop
 
+To generate a joint-zero **candidate** while the robot is physically held in its
+q=0 fixture, run `robotctl calibrate zero --fixture-q0 --output PATH`. It reads
+through `robotd` and does not activate the result; see
+[joint calibration](joint-calibration.md).
+
 ```
 robotctl monitor
 ```
@@ -1175,4 +1180,3 @@ eval "$(robotctl completions bash)"
 ```
 
 `zsh`, `fish`, `elvish` and `powershell` work in place of `bash`.
-
