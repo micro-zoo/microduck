@@ -17,7 +17,11 @@ export function createPoseGraph(definition) {
     return base;
   }
   const root=visit(definition.root);
-  return {root,joints,bodies,geometryParents,setAngles(angles) {
+  const restRootQuaternion=root.quaternion.clone();
+  return {root,joints,bodies,geometryParents,setTrunkOrientation(quat) {
+    root.quaternion.set(quat[1],quat[2],quat[3],quat[0]).normalize().multiply(restRootQuaternion);
+    root.updateMatrixWorld(true);
+  },setAngles(angles) {
     for(const [name,joint] of joints) {const angle=angles[name];if(Number.isFinite(angle)) joint.pivot.quaternion.setFromAxisAngle(joint.axis,angle);}
     root.updateMatrixWorld(true);
   }};

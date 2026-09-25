@@ -8,7 +8,12 @@ all 15 servo case temperatures from `robotd`'s existing slow sample, the trunk
 IMU attitude, and the head BMI088 attitude when enabled. The two IMUs retain
 their own reference frames and arbitrary yaw origins; no mount correction is
 applied in the viewer. The bridge serves the bundled Three.js model and
-state events on port 8765 of the robot's network interfaces. It never opens the
+state events on port 8765 of the robot's network interfaces. The 3D trunk follows
+`robot.state.imu.quat` after `robotd` applies the per-robot `[body_imu]` mount.
+The viewer anchors the first yaw to its initial heading because game-rotation
+yaw has no absolute north; subsequent relative yaw and measured tilt remain
+live. No IMU mount transform is kept in the viewer, and trunk translation stays
+fixed. It never opens the
 motor serial port or sends a robot intent. HTTP write requests return 405.
 
 ```sh

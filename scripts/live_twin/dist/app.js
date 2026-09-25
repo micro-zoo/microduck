@@ -2,9 +2,9 @@ import * as THREE from 'three';
 import {OrbitControls} from './vendor/three/OrbitControls.js';
 import {STLLoader} from './vendor/three/STLLoader.js';
 import {createPoseGraph} from './rig.js';
-import {format,finite,motorUsable,poseAngles,quaternionEuler,torqueStatus} from './state.js';
+import {format,finite,motorUsable,poseAngles,quaternionEuler,trunkOrientation,torqueStatus} from './state.js';
 const $=id=>document.getElementById(id);
-let catalog=[],selectedId=20,lastFrame=null,lastReceived=0,poseGraph=null,selectedMeshes=[];
+let catalog=[],selectedId=20,lastFrame=null,lastReceived=0,poseGraph=null,selectedMeshes=[],trunkYawReference=null;
 const rows=new Map(),thermalRows=new Map(),histories=new Map(),meshByMotor=new Map();
 const groupNames={left:'01 / LEFT LEG',head:'02 / HEAD + MOUTH',right:'03 / RIGHT LEG'};
 function selectMotor(id){selectedId=id;for(const [key,row]of rows)row.classList.toggle('selected',key===id);highlight();updateDetails();}
@@ -61,7 +61,8 @@ function paintSensors(frame,age,streamFresh){
   $(`${prefix}-imu-state`).textContent=euler?'实时':caption;
   $(`${prefix}-imu-state`).className=`sensor-state ${euler?'live':''}`;
  };
- showAttitude('body',frame?.robot_state?.imu?.quat,streamFresh,streamFresh?'姿态不可用':'等待遥测');
+ const bodyOrientation=trunkOrientation(frame?.robot_state?.imu?.quat,trunkYawReference);
+ showAttitude('body',bodyOrientation?.quat,streamFresh,streamFresh?'姿态不可用':'等待遥测');
  $('body-imu-age').textContent=streamFresh?`${format((frame.age_ms||0)+age,0)} ms`:'—';
  const head=frame?.head_imu,headFresh=age<1500&&head?.status==='live'&&finite(head.age_ms)&&head.age_ms+age<1500;
  showAttitude('head',head?.frame?.quat,headFresh,head?.status==='unavailable'?'未启用 / 不可用':head?.status==='stale'?'数据过期':'等待 tofd');
@@ -117,7 +118,8 @@ function paintState(){
   row.classList.toggle('missing',!good);row.classList.toggle('fault',Boolean(motor?.hardware_error));
   row.title=motor?.online?'':'暂无当前读数';
  }
- $('model-status').textContent=valid.length===15?'robotd 模型角 · 实时跟随':valid.length?`实时 ${valid.length}/15 · 缺失关节保持最后姿态`:'模型参考 / 最后姿态 · 非实时';
+ const trunkLive=streamFresh&&Boolean(quaternionEuler(frame?.robot_state?.imu?.quat));
+ $('model-status').textContent=valid.length===15&&trunkLive?'关节 + 躯干 IMU · 实时跟随':valid.length?`实时 ${valid.length}/15 · 躯干姿态${trunkLive?'实时':'保持最后读数'}`:'模型参考 / 最后姿态 · 非实时';
  $('model-status').className=`stage-status ${valid.length===15?'live':''}`;
  const mouth=frame?.motors.find(m=>m.name==='mouth');
  const marker=$('mouth-marker');if(marker){const visual=poseAngles(mouth?[mouth]:[],age,frame?.source).mouth;marker.textContent=`34 · ${finite(visual)?format(visual*180/Math.PI)+'°':'—'}`;}
@@ -127,8 +129,13 @@ function paintState(){
 }
 function receive(frame){
  if(!Array.isArray(frame.motors))return;
+ if(finite(lastFrame?.robot_state?.t)&&finite(frame.robot_state?.t)&&frame.robot_state.t<lastFrame.robot_state.t)trunkYawReference=null;
  lastFrame=frame;lastReceived=performance.now();
  for(const motor of frame.motors){if(motorUsable(motor)){const h=histories.get(motor.id)||[];h.push({t:lastReceived,v:motor.angle_deg});while(h.length&&lastReceived-h[0].t>30000)h.shift();histories.set(motor.id,h);}}
+ if(frame.connection==='live'&&finite(frame.age_ms)&&frame.age_ms<1500){
+  const orientation=trunkOrientation(frame.robot_state?.imu?.quat,trunkYawReference);
+  if(orientation){trunkYawReference=orientation.referenceYaw;poseGraph?.setTrunkOrientation(orientation.quat);}
+ }
  poseGraph?.setAngles(poseAngles(frame.motors,0,frame.source));paintState();
 }
 function connect(){
@@ -183,7 +190,11 @@ async function buildModel(definition){
   renderer.setAnimationLoop(()=>{controls.update();renderer.render(scene,camera);
     if(mouthAnchor&&mouthLabel){mouthAnchor.getWorldPosition(projectedMouth);projectedMouth.project(camera);mouthLabel.style.display=projectedMouth.z<1&&projectedMouth.z>-1?'block':'none';mouthLabel.style.left=`${(projectedMouth.x*.5+.5)*container.clientWidth}px`;mouthLabel.style.top=`${(-projectedMouth.y*.5+.5)*container.clientHeight}px`;}
   });
-  await populate(definition.root);$('model-loading').remove();highlight();if(lastFrame)poseGraph.setAngles(poseAngles(lastFrame.motors,performance.now()-lastReceived,lastFrame.source));
+  await populate(definition.root);$('model-loading').remove();highlight();if(lastFrame){
+    const orientation=trunkOrientation(lastFrame.robot_state?.imu?.quat,trunkYawReference);
+    if(orientation&&lastFrame.connection==='live'&&lastFrame.age_ms<1500)poseGraph.setTrunkOrientation(orientation.quat);
+    poseGraph.setAngles(poseAngles(lastFrame.motors,performance.now()-lastReceived,lastFrame.source));
+  }
  }catch(error){const loading=$('model-loading');if(loading){loading.classList.add('error');loading.textContent='三维模型无法加载，位置读数仍可使用。';}console.error(error);}
 }
 fetch('/assets/model.json').then(r=>{if(!r.ok)throw Error('model data missing');return r.json();}).then(definition=>{catalog=definition.motors;buildList();buildThermals();connect();buildModel(definition);setInterval(paintState,250);}).catch(error=>{$('model-loading').textContent='模型定义加载失败';console.error(error);});
