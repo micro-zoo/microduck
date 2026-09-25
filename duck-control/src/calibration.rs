@@ -14,6 +14,15 @@ use crate::model::{JOINT_IDS, JOINT_NAMES, NUM_JOINTS, joint_index};
 
 pub const RADIANS_PER_TICK: f64 = 2.0 * PI / 4096.0;
 
+/// What the real bus verified at startup, for a read-only fixture capture.
+/// The zeroes are the values actually loaded by this process, not a later edit on disk.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HardwareCalibrationInfo {
+    pub zero_ticks: [f64; NUM_JOINTS],
+    pub homing_offset_ticks: [i32; NUM_JOINTS],
+    pub single_turn_compatible: [bool; NUM_JOINTS],
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
@@ -109,6 +118,10 @@ impl JointCalibration {
 
     pub fn expected_homing_offset(&self, joint: usize) -> i32 {
         self.homing_offsets[joint]
+    }
+
+    pub fn zero_tick(&self, joint: usize) -> f64 {
+        2048.0 + self.offsets[joint] / RADIANS_PER_TICK
     }
 
     /// A replacement has a different installation zero even if its model and ID match.

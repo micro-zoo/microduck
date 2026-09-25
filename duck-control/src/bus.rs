@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use rustypot::servo::dynamixel::xl330::Xl330Controller;
 
-use crate::calibration::JointCalibration;
+use crate::calibration::{HardwareCalibrationInfo, JointCalibration};
 use crate::imu::{IMU_BLOCK_LEN, SflpDecoder};
 use crate::io::{ImuStale, IoError, JointTargets, Result, RobotIo, Sensors, SlowSensors};
 use crate::model::{
@@ -109,6 +109,9 @@ impl StaleImuTracker {
 pub struct DynamixelIo {
     controller: Xl330Controller,
     calibration: JointCalibration,
+    homing_offset_ticks: [i32; NUM_JOINTS],
+    single_turn_compatible: [bool; NUM_JOINTS],
+    hardware_checked: bool,
     /// Kept so the port can be reopened at the factory baud rate: `rustypot` owns the serial
     /// handle outright and offers no way to change its speed in place.
     port: String,
@@ -138,6 +141,9 @@ impl DynamixelIo {
         Ok(Self {
             controller,
             calibration: JointCalibration::default(),
+            homing_offset_ticks: [0; NUM_JOINTS],
+            single_turn_compatible: [false; NUM_JOINTS],
+            hardware_checked: false,
             port: port.to_owned(),
             ids,
             fast_sync_read,
@@ -158,12 +164,10 @@ impl DynamixelIo {
     /// budget across the bus. Checking costs one read per register at startup and removes
     /// a whole class of "why is it slow on this robot".
     pub fn check_registers(&mut self) -> Result<usize> {
-        // A saved zero belongs to this motor and encoder mode. Refuse a mismatched
-        // installation before changing any startup EEPROM register.
+        // Read the actual encoder setup for every joint, including uncalibrated
+        // ones that an operator may capture later. A saved zero is checked
+        // before changing any startup EEPROM register.
         for (joint, &id) in JOINT_IDS.iter().enumerate() {
-            if !self.calibration.is_configured(joint) {
-                continue;
-            }
             let model = self
                 .controller
                 .read_model_number(id)
@@ -188,12 +192,21 @@ impl DynamixelIo {
                 .controller
                 .read_max_position_limit(id)
                 .map_err(|e| IoError::Bus(format!("read max position on {id}: {e}")))?;
-            if model.as_slice() != [1200]
-                || mode.as_slice() != [3]
-                || drive.as_slice() != [0]
-                || offset.as_slice() != [self.calibration.expected_homing_offset(joint)]
-                || !matches!(min.as_slice(), [value] if (*value + PI).abs() < 1e-9)
-                || !matches!(max.as_slice(), [value] if (*value - (PI - crate::calibration::RADIANS_PER_TICK)).abs() < 1e-9)
+            let homing_offset = *offset.first().ok_or(IoError::ShortRead {
+                what: "homing offset",
+                expected: 1,
+                got: 0,
+            })?;
+            let compatible = model.as_slice() == [1200]
+                && mode.as_slice() == [3]
+                && drive.as_slice() == [0]
+                && (-1024..=1024).contains(&homing_offset)
+                && matches!(min.as_slice(), [value] if (*value + PI).abs() < 1e-9)
+                && matches!(max.as_slice(), [value] if (*value - (PI - crate::calibration::RADIANS_PER_TICK)).abs() < 1e-9);
+            self.homing_offset_ticks[joint] = homing_offset;
+            self.single_turn_compatible[joint] = compatible;
+            if self.calibration.is_configured(joint)
+                && (!compatible || homing_offset != self.calibration.expected_homing_offset(joint))
             {
                 return Err(IoError::Bus(format!(
                     "calibrated ID {id} requires XL330-M288, drive mode 0, mode 3, the recorded homing offset and position limits 0..4095"
@@ -204,6 +217,7 @@ impl DynamixelIo {
         for &id in &JOINT_IDS {
             fixed += self.check_registers_of(id)?;
         }
+        self.hardware_checked = true;
         Ok(fixed)
     }
 
@@ -511,6 +525,14 @@ pub fn replacement_target(missing: &[u8]) -> Option<u8> {
 }
 
 impl RobotIo for DynamixelIo {
+    fn hardware_calibration_info(&self) -> Option<HardwareCalibrationInfo> {
+        self.hardware_checked.then(|| HardwareCalibrationInfo {
+            zero_ticks: std::array::from_fn(|joint| self.calibration.zero_tick(joint)),
+            homing_offset_ticks: self.homing_offset_ticks,
+            single_turn_compatible: self.single_turn_compatible,
+        })
+    }
+
     fn read(&mut self) -> Result<Sensors> {
         let blocks = self
             .controller

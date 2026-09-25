@@ -117,6 +117,12 @@ pub trait RobotIo {
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
+    /// Startup-only hardware metadata for fixture zero capture. Fake and simulated
+    /// backends cannot supply encoder or EEPROM values.
+    fn hardware_calibration_info(&self) -> Option<crate::calibration::HardwareCalibrationInfo> {
+        None
+    }
+
     /// Whether [`Sensors::velocities`] from this backend is a measurement.
     ///
     /// [`Sensors`] is fixed-size arrays, so a backend with nothing to report has no way to say
