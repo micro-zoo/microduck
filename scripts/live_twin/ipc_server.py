@@ -150,13 +150,19 @@ class Bridge:
                         self.stop.wait(5)
                         continue
                     sock.settimeout(None)
+                    last_published = 0
                     while not self.stop.is_set():
                         buffer, values = self.messages(sock, buffer, 1.0)
                         for value in values:
                             if value.get("method") == "head_imu.frame":
-                                self.publish(head_imu_frame=value.get("params"),
-                                             head_imu_at=time.monotonic(),
-                                             head_imu_connection="live", head_imu_error=None)
+                                now = time.monotonic()
+                                # The sensor runs at 100 Hz; the viewer needs about 10 Hz.
+                                # Avoid sending a complete page snapshot for every IMU sample.
+                                if now - last_published >= .1:
+                                    self.publish(head_imu_frame=value.get("params"),
+                                                 head_imu_at=now, head_imu_connection="live",
+                                                 head_imu_error=None)
+                                    last_published = now
             except Exception as error:
                 self.publish(head_imu_connection="offline", head_imu_error=str(error))
                 self.stop.wait(1)

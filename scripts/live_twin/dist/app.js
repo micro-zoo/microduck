@@ -38,8 +38,11 @@ function paintSensors(frame,age,streamFresh){
  $('soc-temp').textContent=format(soc,0);
  $('soc-state').textContent=finite(soc)?'实时':'暂无读数';
  $('soc-state').className=`sensor-state ${finite(soc)?'live':''}`;
- $('soc-meter').style.width=finite(soc)?`${Math.max(0,Math.min(100,soc/110*100))}%`:'0%';
  const throttle=health?.cpu_throttle;
+ const throttleRatio=throttle?.max_level>0?throttle.level/throttle.max_level:
+  throttle?.max_khz>0?1-throttle.khz/throttle.max_khz:0;
+ $('soc-meter').style.width=`${Math.max(0,Math.min(100,throttleRatio*100))}%`;
+ $('soc-meter').parentElement.title='处理器频率受限程度';
  $('soc-throttle').textContent=throttle&&finite(throttle.khz)?`${format(throttle.khz/1000,0)} / ${format(throttle.max_khz/1000,0)} MHz${throttle.level>0?` · 节流 ${throttle.level}/${throttle.max_level}`:''}`:'频率状态 —';
  const temperatures=frame?.motors?.filter(m=>streamFresh&&finite(m.temperature_c))||[];
  $('thermal-state').textContent=temperatures.length===15?'15 / 15 实时':temperatures.length?`${temperatures.length} / 15 有读数`:'暂无读数';
