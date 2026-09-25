@@ -395,15 +395,53 @@ fn hooks_are_packaged_executable() {
 /// dropped `--include` has no unit and no `ExecStart` to give it away.
 #[test]
 fn every_include_lands_where_the_workflow_says() {
+    fn check(entries: &BTreeMap<String, (u32, Vec<u8>)>, src: &Path, dest: &str) {
+        if src.is_dir() {
+            for child in std::fs::read_dir(src).expect("include directory") {
+                let child = child.expect("include entry");
+                check(
+                    entries,
+                    &child.path(),
+                    &format!("{dest}/{}", child.file_name().to_string_lossy()),
+                );
+            }
+        } else {
+            let (_, bytes) = entries
+                .get(dest)
+                .unwrap_or_else(|| panic!("missing include {dest}"));
+            assert_eq!(
+                bytes,
+                &std::fs::read(src).expect("include source"),
+                "{dest}"
+            );
+        }
+    }
     for name in PACKAGING_SITES {
         let workflow = recipe(name);
         let entries = packaged_release(name);
 
         for (src, dest) in includes(&workflow) {
-            assert!(
-                entries.contains_key(&dest),
-                "{name} includes {src:?} as {dest:?}, which is not in the artifact"
-            );
+            check(&entries, &root().join(src), &dest);
+        }
+        for asset in [
+            "index.html",
+            "app.js",
+            "rig.js",
+            "state.js",
+            "style.css",
+            "assets/model.json",
+            "assets/MODEL-LICENSE.txt",
+            "assets/meshes/jaw.stl",
+            "vendor/three/three.module.js",
+            "vendor/three/OrbitControls.js",
+            "vendor/three/STLLoader.js",
+            "vendor/three/LICENSE.txt",
+        ] {
+            let dest = format!("scripts/live_twin/dist/{asset}");
+            let (mode, _) = entries
+                .get(&dest)
+                .unwrap_or_else(|| panic!("{name} missing {dest}"));
+            assert_eq!(*mode, 0o644, "{dest}");
         }
     }
 }

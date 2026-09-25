@@ -721,6 +721,12 @@ install_units() {
         fi
     done
 
+    # The Twin service uses a stable wrapper while its Python and assets follow `current`.
+    src="${INSTALL_DIR}/current/scripts/microduck-twin"
+    if [ -f "$src" ]; then
+        install -m 755 "$src" /usr/local/sbin/microduck-twin
+    fi
+
     # The login-shell files: the `robotctl` completions, the motd banner, and the robot's name in
     # the prompt.
     #
@@ -801,6 +807,11 @@ install_units() {
   The robot works without it — only the camera and the WebRTC console are unavailable."
     fi
 
+    if [ -f "${UNIT_DIR}/microduck-twin.service" ]; then
+        enable_unit microduck-twin.service || warn "the read-only Twin did not start; check:
+    journalctl -u microduck-twin -b"
+    fi
+
     # The boot-time recovery net: three minutes into each boot, ask whether this release brought
     # its daemons up, and fall back to golden if it did not.
     #
@@ -823,7 +834,7 @@ install_units() {
     for unit in $shipped; do
         case "$unit" in
             updaterd.service|robotd.service|configd.service|btd.service|padd.service) ;;
-            mediad.service) ;;
+            mediad.service|microduck-twin.service) ;;
             # No `enable_unit` of its own, unlike the three above: `postinstall` enabled every
             # unit carrying an `[Install]` section a step earlier, and nothing depends on this
             # one — `robotd` does not read depth and `monitor` says "no depth stream" and

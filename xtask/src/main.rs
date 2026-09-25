@@ -94,7 +94,7 @@ enum Command {
         #[arg(long)]
         min_supported: Option<semver::Version>,
 
-        /// Extra files to include, as `src=dest` (e.g. a post-install hook).
+        /// Extra files or directories to include, as `src=dest`.
         #[arg(long = "include")]
         includes: Vec<String>,
 
@@ -362,7 +362,7 @@ fn package(args: PackageArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 0o644
             };
-            append_file(&mut builder, Path::new(src), dest, mode)?;
+            append_include(&mut builder, Path::new(src), dest, mode)?;
         }
 
         // The preinstall hook, always, generated from its template.
@@ -806,6 +806,35 @@ fn workspace_version() -> Result<semver::Version, Box<dyn std::error::Error>> {
         .and_then(|v| v.as_str())
         .ok_or("Cargo.toml has no [workspace.package] version")?;
     Ok(semver::Version::parse(raw)?)
+}
+
+fn append_include(
+    builder: &mut tar::Builder<impl std::io::Write>,
+    src: &Path,
+    dest: &str,
+    mode: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let metadata = std::fs::symlink_metadata(src)?;
+    if metadata.is_dir() {
+        let mut children = std::fs::read_dir(src)?.collect::<Result<Vec<_>, _>>()?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let name = child
+                .file_name()
+                .into_string()
+                .map_err(|_| "non-UTF-8 include name")?;
+            append_include(builder, &child.path(), &format!("{dest}/{name}"), 0o644)?;
+        }
+        Ok(())
+    } else if metadata.is_file() {
+        append_file(builder, src, dest, mode)
+    } else {
+        Err(format!(
+            "include is not a regular file or directory: {}",
+            src.display()
+        )
+        .into())
+    }
 }
 
 fn append_file(
