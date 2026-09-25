@@ -23,6 +23,7 @@ docs give the reasoning and point at it.
 | [`duckctl.md`](robot/duckctl.md) | Every `duckctl` command — the robot from a laptop, over Bluetooth. |
 | [`install-dev.md`](robot/install-dev.md) | Setting up a board for development, from nothing. |
 | [`install-by-hand.md`](robot/install-by-hand.md) | The same install as separate commands, for testing one step at a time. |
+| [`joint-calibration.md`](robot/joint-calibration.md) | Capture and load per-robot motor zeroes through robotd. |
 
 ## `design/` — you are changing the daemon
 

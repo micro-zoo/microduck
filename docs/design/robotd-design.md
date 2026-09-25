@@ -38,6 +38,15 @@ second port:
   v2 board    5 servos             5 servos           5 servos
 ```
 
+An optional per-robot `[bus] calibration` file shifts encoder positions at
+`DynamixelIo`, in opposite directions for reads and goal writes. Startup pose,
+the control loop, `robotctl`, IPC, policies and kinematics continue to use model
+radians; fake and simulated I/O already speak model coordinates. A configured
+joint is checked for the expected servo mode before startup register correction,
+and a shifted goal outside the single-turn range is refused instead of wrapped.
+See [the operator procedure](../robot/joint-calibration.md) for capturing and
+loading this robot's zeroes.
+
 The IMU is `id 200` and is read in the *same* `sync_read` as the servos, because that is what
 the hardware does: the v2 board sits on the Dynamixel bus and serves an on-chip SFLP
 quaternion out of the same register block the servos answer at. One board, one code path, no
