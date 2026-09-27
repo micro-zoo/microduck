@@ -2,6 +2,7 @@
 .pairing-panel h2{font-size:20px;margin:4px 0 6px}
 .pairing-panel p{font-size:14px;max-width:720px}
 .pairing-panel small{display:block;margin-top:7px;color:var(--muted);font-size:12px}
+.pairing-panel #pad-driver.offline{color:#a64029}
 .pairing-action{display:flex;flex-direction:column;align-items:flex-end;gap:9px;min-width:155px}
 .pairing-action button{background:var(--ink);color:var(--surface);border:1px solid var(--ink);padding:10px 16px;font-weight:600}
 .pairing-action button:hover:not(:disabled){background:#344237}
