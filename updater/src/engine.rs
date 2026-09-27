@@ -550,6 +550,7 @@ impl Engine {
                 last_attempt: self.journal.last_for(name)?,
                 last_checked: checked.get(name),
                 last_check_attempt: checked.last_attempt(name),
+                periodic_checks: Some(self.config.check_interval.is_some()),
             });
         }
         Ok(out)

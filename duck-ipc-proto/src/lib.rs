@@ -3189,6 +3189,10 @@ pub struct ComponentStatus {
     /// reach its source — and the error says why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_attempt: Option<CheckAttempt>,
+    /// Whether updaterd has a periodic source-check timer configured. `None` means an older
+    /// updaterd did not report this; a paused checker can still accept signed local installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub periodic_checks: Option<bool>,
 }
 
 /// One check of an update source: when, and what went wrong if it did not get an answer.

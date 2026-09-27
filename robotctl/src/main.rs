@@ -1561,6 +1561,10 @@ struct ComponentReport {
     /// one thing here that says why the source has gone quiet.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_check_attempt: Option<proto::CheckAttempt>,
+    /// `None` for an older updaterd. False means no timer will retry this source until
+    /// the operator enables periodic checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    periodic_checks: Option<bool>,
     /// What that means, decided once where the clock and the daemon's version are both known.
     /// The line and the warning both read it rather than re-deriving it from the timestamp.
     #[serde(skip)]
@@ -1587,6 +1591,9 @@ enum SourceCheck {
     /// Nothing is shown and nothing is warned: this robot is not being asked the question.
     #[default]
     Unsupported,
+    /// No periodic timer is configured. The source's last failure is still available in
+    /// `update status`, but it is not a new health warning on every ordinary report.
+    Paused,
     /// A daemon that would say, with nothing to say. The source has not answered once since this
     /// board started recording — a robot blocked since it was provisioned, and the exact shape of
     /// #282: no error anywhere, and an installed release that looks current.
@@ -1651,6 +1658,9 @@ impl SourceCheck {
     fn line(self) -> Option<String> {
         match self {
             Self::Unsupported => None,
+            Self::Paused => {
+                Some("periodic update checks paused; signed local installs available".to_owned())
+            }
             Self::Never => Some("source has never answered on this robot".to_owned()),
             Self::NotYet => {
                 Some("source not checked yet (`robotctl update check` checks it now)".to_owned())
@@ -1672,7 +1682,7 @@ impl SourceCheck {
             return None;
         }
         match self {
-            Self::Unsupported | Self::NotYet | Self::Unrecorded => None,
+            Self::Unsupported | Self::Paused | Self::NotYet | Self::Unrecorded => None,
             Self::Never => Some("has not answered once on this robot".to_owned()),
             Self::Ahead => Some(
                 "last answered at a time this clock has not reached, so how long ago is not known"
@@ -1684,7 +1694,7 @@ impl SourceCheck {
 
     fn past_threshold(self) -> bool {
         match self {
-            Self::Unsupported | Self::NotYet | Self::Unrecorded => false,
+            Self::Unsupported | Self::Paused | Self::NotYet | Self::Unrecorded => false,
             Self::Never | Self::Ahead => true,
             Self::Answered(age) => age / 86_400 >= QUIET_SOURCE_DAYS,
         }
@@ -2036,7 +2046,10 @@ fn render_health(report: &HealthReport) -> String {
         if let Some(line) = component.source.line() {
             let _ = writeln!(out, "  {:<9} {line}", "");
         }
-        if let Some(why) = component.check_failure() {
+        if let Some(why) = component
+            .check_failure()
+            .filter(|_| component.source != SourceCheck::Paused)
+        {
             let _ = writeln!(out, "  {:<9} last check failed: {why}", "");
         }
     }
@@ -2224,13 +2237,18 @@ fn installed_components(client: &mut Client, api_version: Option<u32>) -> Vec<Co
                 pinned: status.pinned.map(|v| v.to_string()),
                 last_attempt: status.last_attempt.as_ref().map(describe_attempt),
                 last_checked: status.last_checked,
-                source: SourceCheck::read(
-                    status.last_checked,
-                    status.last_check_attempt.as_ref(),
-                    api_version,
-                    now,
-                ),
+                source: if status.periodic_checks == Some(false) {
+                    SourceCheck::Paused
+                } else {
+                    SourceCheck::read(
+                        status.last_checked,
+                        status.last_check_attempt.as_ref(),
+                        api_version,
+                        now,
+                    )
+                },
                 last_check_attempt: status.last_check_attempt,
+                periodic_checks: status.periodic_checks,
             }
         })
         .collect()
@@ -5444,12 +5462,21 @@ fn print_result(command: &UpdateCommand, result: serde_json::Value) {
                         {
                             println!("  {line}");
                         }
+                        if status.periodic_checks == Some(false) {
+                            println!(
+                                "  periodic update checks paused; signed local installs available"
+                            );
+                        }
                         if let Some(why) = status
                             .last_check_attempt
                             .as_ref()
                             .and_then(|attempt| attempt.error.as_deref())
                         {
-                            println!("  last check failed: {why}");
+                            if status.periodic_checks == Some(false) {
+                                println!("  last check failed (periodic checks paused): {why}");
+                            } else {
+                                println!("  last check failed: {why}");
+                            }
                         }
                     }
                 }
@@ -7029,6 +7056,7 @@ mod tests {
             last_attempt: None,
             last_checked: None,
             last_check_attempt: None,
+            periodic_checks: None,
         }
     }
 
@@ -7297,6 +7325,23 @@ mod tests {
         assert!(quiet_source_warnings(&report.software.components).is_empty());
     }
 
+    #[test]
+    fn a_paused_source_reports_the_pause_without_repeating_an_old_failure() {
+        let mut report = health_report(Some(proto::HealthResult::default()), None);
+        let component = &mut report.software.components[0];
+        component.source = SourceCheck::Paused;
+        component.periodic_checks = Some(false);
+        component.last_check_attempt = Some(proto::CheckAttempt {
+            at: 1_800_000_000,
+            error: Some("old source returned 404".into()),
+        });
+
+        let out = render_health(&report);
+        assert!(out.contains("periodic update checks paused"), "{out}");
+        assert!(!out.contains("old source returned 404"), "{out}");
+        assert!(quiet_source_warnings(&report.software.components).is_empty());
+    }
+
     /// A clock corrected backwards after a check must not read as a fresh one. Clamping the age
     /// at zero pinned it there for good: only a successful check overwrites the record, and this
     /// is the robot that is not getting one.
@@ -7348,6 +7393,7 @@ mod tests {
                 last_attempt: None,
                 last_checked: None,
                 last_check_attempt: None,
+                periodic_checks: None,
                 source: SourceCheck::Unsupported,
             }],
             warnings: Vec::new(),
