@@ -2,10 +2,12 @@ import http.client
 import json
 import os
 import socket
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 import sys
 
@@ -46,8 +48,11 @@ class FakeBridge:
 class IpcServerTests(unittest.TestCase):
     def setUp(self):
         self.bridge = FakeBridge()
+        self.pair_calls = 0
+        self.pair_started = None
+        self.pair_release = None
         self.server = ipc_server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), ipc_server.handler_for(self.bridge, None)
+            ("127.0.0.1", 0), ipc_server.handler_for(self.bridge, None, self.pair)
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -59,9 +64,16 @@ class IpcServerTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(1)
 
-    def request(self, method, path):
+    def pair(self):
+        self.pair_calls += 1
+        if self.pair_started:
+            self.pair_started.set()
+            self.pair_release.wait(2)
+        return {"outcome": "paired", "pad": {"name": "Xbox Wireless Controller", "connected": True}}
+
+    def request(self, method, path, body=None, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
-        connection.request(method, path)
+        connection.request(method, path, body=body, headers=headers or {})
         response = connection.getresponse()
         body = response.read()
         connection.close()
@@ -86,6 +98,54 @@ class IpcServerTests(unittest.TestCase):
         status, body = self.request("POST", "/api/control/home")
         self.assertEqual(status, 405)
         self.assertIn(b"read-only", body)
+
+    def test_pairing_only_accepts_parameterless_same_origin_lan_post(self):
+        headers = {"Origin": f"http://127.0.0.1:{self.port}",
+                   "Content-Type": "application/json"}
+        status, body = self.request("POST", "/api/pad/pair", "{}", headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["outcome"], "paired")
+        self.assertEqual(self.pair_calls, 1)
+
+        lan_headers = {**headers, "Host": f"192.168.1.42:{self.port}",
+                       "Origin": f"http://192.168.1.42:{self.port}"}
+        status, _ = self.request("POST", "/api/pad/pair", "{}", lan_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.pair_calls, 2)
+
+        status, _ = self.request("POST", "/api/pad/pair", "{}",
+                                 {**headers, "Origin": "http://other.example"})
+        self.assertEqual(status, 403)
+        status, _ = self.request("POST", "/api/pad/pair", "{}",
+                                 {**headers, "Host": f"attacker.example:{self.port}",
+                                  "Origin": f"http://attacker.example:{self.port}"})
+        self.assertEqual(status, 403)
+        status, _ = self.request("POST", "/api/pad/pair", '{"mac":"any"}', headers)
+        self.assertEqual(status, 400)
+        status, _ = self.request("GET", "/api/pad/pair")
+        self.assertEqual(status, 404)
+        self.assertEqual(self.pair_calls, 2)
+
+    def test_pairing_rejects_a_second_request_while_busy(self):
+        self.pair_started = threading.Event()
+        self.pair_release = threading.Event()
+        headers = {"Origin": f"http://127.0.0.1:{self.port}",
+                   "Content-Type": "application/json"}
+        first = threading.Thread(target=lambda: self.request("POST", "/api/pad/pair", "{}", headers))
+        first.start()
+        self.assertTrue(self.pair_started.wait(1))
+        status, _ = self.request("POST", "/api/pad/pair", "{}", headers)
+        self.assertEqual(status, 409)
+        self.pair_release.set()
+        first.join(2)
+        self.assertEqual(self.pair_calls, 1)
+
+    def test_pairing_runs_the_existing_operator_command(self):
+        completed = subprocess.CompletedProcess([], 0, '{"outcome":"failed","reason":"not_found"}', "")
+        with patch.object(ipc_server.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(ipc_server.pair_gamepad()["reason"], "not_found")
+        run.assert_called_once_with(("robotctl", "pad", "pair", "--json"),
+                                    capture_output=True, text=True, check=False)
 
     def test_unknown_route_is_not_a_control_fallback(self):
         status, _ = self.request("GET", "/api/control/home")
