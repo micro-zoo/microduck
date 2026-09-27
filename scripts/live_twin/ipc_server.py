@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Read-only Live Twin bridge for robotd's JSON-RPC state stream.
+"""Live Twin telemetry bridge with an explicit gamepad pairing action.
 
 This process never opens the Dynamixel UART and never sends a robot intent. It is
 safe to run beside robotd: robotd remains the only motor-bus owner.
 """
 import argparse
+import ipaddress
 import json
 import math
 import mimetypes
 import select
 import socket
+import subprocess
 import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 MAX_LINE = 64 * 1024
 STATIC_DIR = Path(__file__).resolve().parent / "dist"
@@ -207,8 +209,21 @@ class Bridge:
         self.head_thread.join(2)
 
 
-def handler_for(bridge, static_dir=None):
+def pair_gamepad():
+    """Use the operator command so its Bluetooth workaround and cleanup stay intact."""
+    result = subprocess.run(("robotctl", "pad", "pair", "--json"),
+                            capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise RuntimeError("robotctl pad pair failed")
+    answer = json.loads(result.stdout)
+    if not isinstance(answer, dict) or answer.get("outcome") not in ("paired", "failed"):
+        raise ValueError("robotctl returned an unknown pairing outcome")
+    return answer
+
+
+def handler_for(bridge, static_dir=None, pair=pair_gamepad):
     static_root = Path(static_dir or STATIC_DIR).resolve()
+    pairing_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -219,6 +234,29 @@ def handler_for(bridge, static_dir=None):
         def answer(self, body, status=200, content_type="application/json; charset=utf-8"):
             data = body if isinstance(body, bytes) else body.encode()
             self.send_response(status); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(data)
+
+        def same_origin_lan_request(self):
+            """Keep other web pages from using a LAN visitor's browser to start pairing."""
+            host = self.headers.get("Host", "")
+            origin = self.headers.get("Origin", "")
+            try:
+                peer = ipaddress.ip_address(self.client_address[0])
+                if not (peer.is_private or peer.is_loopback or peer.is_link_local):
+                    return False
+                target = urlsplit("http://" + host)
+                source = urlsplit(origin)
+                address = target.hostname
+                if address != "localhost":
+                    ip = ipaddress.ip_address(address)
+                    if not (ip.is_private or ip.is_loopback or ip.is_link_local):
+                        return False
+                return (target.path == "" and target.query == "" and
+                        target.username is None and target.password is None and
+                        target.port == self.server.server_port and
+                        source.scheme == "http" and source.netloc == host and
+                        source.path == "" and source.query == "")
+            except (ValueError, TypeError):
+                return False
 
         def do_GET(self):
             route = self.path.split("?", 1)[0]
@@ -251,7 +289,25 @@ def handler_for(bridge, static_dir=None):
             return self.answer(json.dumps({"error": "not found"}), 404)
 
         def do_POST(self):
-            self.answer(json.dumps({"error": "read-only robotd IPC viewer"}), 405)
+            self.close_connection = True
+            if self.path != "/api/pad/pair":
+                return self.answer(json.dumps({"error": "read-only robotd IPC viewer"}), 405)
+            if not self.same_origin_lan_request():
+                return self.answer(json.dumps({"error": "pairing requires a same-origin LAN page"}), 403)
+            if self.headers.get("Content-Type") != "application/json":
+                return self.answer(json.dumps({"error": "JSON body required"}), 415)
+            if self.headers.get("Content-Length") != "2" or self.rfile.read(2) != b"{}":
+                return self.answer(json.dumps({"error": "pairing takes no parameters"}), 400)
+            if not pairing_lock.acquire(blocking=False):
+                return self.answer(json.dumps({"error": "pairing already in progress"}), 409)
+            try:
+                result = pair()
+                return self.answer(json.dumps(result, ensure_ascii=False),
+                                   200 if result["outcome"] == "paired" else 422)
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
+                return self.answer(json.dumps({"error": "pairing service unavailable"}), 503)
+            finally:
+                pairing_lock.release()
 
     return Handler
 
