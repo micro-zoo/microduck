@@ -49,10 +49,11 @@ class IpcServerTests(unittest.TestCase):
     def setUp(self):
         self.bridge = FakeBridge()
         self.pair_calls = 0
+        self.status_calls = 0
         self.pair_started = None
         self.pair_release = None
         self.server = ipc_server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), ipc_server.handler_for(self.bridge, None, self.pair)
+            ("127.0.0.1", 0), ipc_server.handler_for(self.bridge, None, self.pair, self.pad_status)
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -70,6 +71,10 @@ class IpcServerTests(unittest.TestCase):
             self.pair_started.set()
             self.pair_release.wait(2)
         return {"outcome": "paired", "pad": {"name": "Xbox Wireless Controller", "connected": True}}
+
+    def pad_status(self):
+        self.status_calls += 1
+        return {"driver": "inactive", "pads": [{"name": "Xbox Wireless Controller", "connected": False}]}
 
     def request(self, method, path, body=None, headers=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=2)
@@ -141,10 +146,30 @@ class IpcServerTests(unittest.TestCase):
         self.assertEqual(self.pair_calls, 1)
 
     def test_pairing_runs_the_existing_operator_command(self):
-        completed = subprocess.CompletedProcess([], 0, '{"outcome":"failed","reason":"not_found"}', "")
+        completed = subprocess.CompletedProcess([], 0, '{"outcome":"failed","reason":"not_found","detail":"private"}', "")
         with patch.object(ipc_server.subprocess, "run", return_value=completed) as run:
-            self.assertEqual(ipc_server.pair_gamepad()["reason"], "not_found")
+            self.assertEqual(ipc_server.pair_gamepad(), {"outcome": "failed", "reason": "not_found"})
         run.assert_called_once_with(("robotctl", "pad", "pair", "--json"),
+                                    capture_output=True, text=True, check=False)
+
+        completed = subprocess.CompletedProcess([], 0,
+            '{"outcome":"paired","pad":{"name":"Xbox","mac":"68:6C:E6:37:A8:F5","connected":true}}', "")
+        with patch.object(ipc_server.subprocess, "run", return_value=completed):
+            self.assertEqual(ipc_server.pair_gamepad(),
+                             {"outcome": "paired", "pad": {"name": "Xbox", "connected": True}})
+
+    def test_gamepad_status_reports_the_real_driver_state(self):
+        status, body = self.request("GET", "/api/pad/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["driver"], "inactive")
+        self.assertEqual(self.status_calls, 1)
+
+        completed = subprocess.CompletedProcess([], 0,
+            '{"driver":"inactive","pads":[{"name":"Xbox","mac":"68:6C:E6:37:A8:F5","connected":false}]}', "")
+        with patch.object(ipc_server.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(ipc_server.gamepad_status(),
+                             {"driver": "inactive", "pads": [{"name": "Xbox", "connected": False}]})
+        run.assert_called_once_with(("robotctl", "pad", "status", "--json"),
                                     capture_output=True, text=True, check=False)
 
     def test_unknown_route_is_not_a_control_fallback(self):

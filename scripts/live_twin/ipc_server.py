@@ -218,10 +218,30 @@ def pair_gamepad():
     answer = json.loads(result.stdout)
     if not isinstance(answer, dict) or answer.get("outcome") not in ("paired", "failed"):
         raise ValueError("robotctl returned an unknown pairing outcome")
-    return answer
+    if answer["outcome"] == "failed":
+        return {"outcome": "failed", "reason": answer.get("reason", "other")}
+    pad = answer.get("pad")
+    if not isinstance(pad, dict):
+        raise ValueError("robotctl returned no paired gamepad")
+    return {"outcome": "paired", "pad": {"name": pad.get("name") or "Gamepad",
+                                        "connected": bool(pad.get("connected"))}}
 
 
-def handler_for(bridge, static_dir=None, pair=pair_gamepad):
+def gamepad_status():
+    result = subprocess.run(("robotctl", "pad", "status", "--json"),
+                            capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise RuntimeError("robotctl pad status failed")
+    answer = json.loads(result.stdout)
+    if not isinstance(answer, dict) or not isinstance(answer.get("pads"), list):
+        raise ValueError("robotctl returned an unknown gamepad status")
+    return {"driver": answer.get("driver", "unknown"),
+            "pads": [{"name": pad.get("name") or "Gamepad",
+                      "connected": bool(pad.get("connected"))}
+                     for pad in answer["pads"] if isinstance(pad, dict)]}
+
+
+def handler_for(bridge, static_dir=None, pair=pair_gamepad, pad_status=gamepad_status):
     static_root = Path(static_dir or STATIC_DIR).resolve()
     pairing_lock = threading.Lock()
 
@@ -262,6 +282,12 @@ def handler_for(bridge, static_dir=None, pair=pair_gamepad):
             route = self.path.split("?", 1)[0]
             if route == "/api/state":
                 return self.answer(json.dumps(bridge.snapshot(), ensure_ascii=False, separators=(",", ":")))
+            if route == "/api/pad/status":
+                try:
+                    result = pad_status()
+                    return self.answer(json.dumps(result, ensure_ascii=False))
+                except (OSError, RuntimeError, ValueError):
+                    return self.answer(json.dumps({"error": "gamepad status unavailable"}), 503)
             if route == "/api/events":
                 self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "close"); self.end_headers()
                 previous = -1

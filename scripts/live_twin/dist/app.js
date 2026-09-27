@@ -149,6 +149,19 @@ function connect(){
 function bindPairing(){
  const button=$('pair-button'),status=$('pair-status');
  const failures={not_found:'未找到处于配对模式的手柄，请确认 Xbox 灯快速闪烁后重试。',ambiguous:'发现多个待配对手柄，请只让目标手柄进入配对模式。',timeout:'找到手柄，但未能完成配对，请重新按 Sync 键后重试。',no_adapter:'蓝牙适配器尚未就绪，请稍后重试。',rejected:'蓝牙拒绝了配对，请检查手柄配对模式和机器人蓝牙设置。'};
+ async function refreshStatus(){
+  const label=$('pad-driver');
+  try{
+   const response=await fetch('/api/pad/status',{cache:'no-store'});
+   if(!response.ok)throw Error('status unavailable');
+   const result=await response.json();
+   const pad=result.pads?.find(item=>item.connected)||result.pads?.[0];
+   const running=result.driver==='active';
+   label.className=running?'':'offline';
+   label.textContent=`padd ${running?'运行中':'未运行，配对后仍不会发送控制指令'} · ${pad?`${pad.name} ${pad.connected?'已连接':'已配对，未连接'}`:'暂无已配对手柄'}`;
+  }catch(error){label.className='offline';label.textContent='无法读取手柄状态';}
+ }
+ refreshStatus();
  button.addEventListener('click',async()=>{
   button.disabled=true;status.className='';status.textContent='正在搜索并配对，可能需要约 30 秒…';
   try{
@@ -156,7 +169,7 @@ function bindPairing(){
    const result=await response.json();
    if(result.outcome==='paired'){
     status.className='success';
-    status.textContent=`${result.pad?.name||'手柄'}已配对${result.pad?.connected?'并连接，可由 padd 读取输入。':'，连接建立后 padd 会自动读取输入。'}`;
+    status.textContent=`${result.pad?.name||'手柄'}已配对${result.pad?.connected?'并连接。':'，稍后会自动连接。'}`;
    }else{
     status.className='error';
     status.textContent=failures[result.reason]||
@@ -164,7 +177,7 @@ function bindPairing(){
       response.status===503?'配对服务不可用，请检查机器人上的 robotctl 和 configd。':'配对未完成，请重试。');
    }
   }catch(error){status.className='error';status.textContent='无法联系配对服务，请检查 Twin 连接。';}
-  finally{button.disabled=false;}
+  finally{button.disabled=false;refreshStatus();}
  });
 }
 async function buildModel(definition){

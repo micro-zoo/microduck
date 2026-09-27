@@ -17,7 +17,8 @@ fixed. It never opens the
 motor serial port or sends a robot intent. The only HTTP write route is
 `POST /api/pad/pair`, which invokes the existing `robotctl pad pair --json`
 command. It accepts no MAC address or other parameters, and concurrent pairing
-requests are refused. Other HTTP write requests return 405.
+requests are refused. `GET /api/pad/status` reports the driver and pad state
+without exposing Bluetooth addresses. Other HTTP write requests return 405.
 
 ```sh
 robotctl twin
@@ -34,7 +35,9 @@ and press **开始配对** after putting an Xbox pad in pairing mode. The write 
 requires a same-origin browser request using the robot's LAN IP address; it
 does not accept requests sent by unrelated web pages through a visitor's browser.
 Use this page on a trusted network. Pairing uses `configd` and BlueZ; `padd`
-reads the resulting input device. The viewer can start while
+reads the resulting input device when its service is active. The page shows the
+current `padd` state, so pairing success is not presented as motor control when
+the driver has been deliberately stopped. The viewer can start while
 `robotd` is stopped; it reports offline until `robotd` supplies state. Enabling
 the viewer does not start `robotd` because its service has only `After=robotd`.
 

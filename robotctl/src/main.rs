@@ -595,7 +595,7 @@ enum CalibrateCommand {
 
 #[derive(Subcommand, Debug)]
 enum TwinCommand {
-    /// Show whether the default read-only Live Twin service is installed, enabled and running.
+    /// Show whether Live Twin telemetry and gamepad pairing are available.
     Status {
         #[arg(long)]
         json: bool,
@@ -610,7 +610,7 @@ enum TwinCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Restart only the read-only Live Twin service.
+    /// Restart only the Live Twin service.
     Restart {
         #[arg(long)]
         json: bool,
@@ -3421,7 +3421,7 @@ fn twin_properties(text: &str) -> serde_json::Value {
     serde_json::Value::Object(object)
 }
 
-/// Maintain the default read-only viewer without touching robotd, padd or the motor bus.
+/// Maintain the Live Twin service without touching robotd, padd or the motor bus.
 fn run_twin(command: TwinCommand) -> Result<(), Failure> {
     let urls = twin_urls();
     let url = urls.first().cloned();
@@ -3477,7 +3477,7 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
                         println!("url     {address}");
                     }
                 }
-                println!("mode    read-only robotd IPC; no UART access");
+                println!("mode    read-only motor telemetry; gamepad pairing available");
             }
             Ok(())
         }
@@ -3498,7 +3498,7 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
                 );
             } else {
                 println!(
-                    "read-only Live Twin enabled and started at {}",
+                    "Live Twin enabled and started at {}",
                     url.as_deref().unwrap_or("no network IPv4 address yet")
                 );
             }
@@ -3520,7 +3520,7 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
                     )
                 );
             } else {
-                println!("read-only Live Twin stopped and disabled; robotd was not changed");
+                println!("Live Twin stopped and disabled; robotd was not changed");
             }
             Ok(())
         }
@@ -3541,7 +3541,7 @@ fn run_twin(command: TwinCommand) -> Result<(), Failure> {
                 );
             } else {
                 println!(
-                    "read-only Live Twin restarted at {}; robotd was not changed",
+                    "Live Twin restarted at {}; robotd was not changed",
                     url.as_deref().unwrap_or("no network IPv4 address yet")
                 );
             }
