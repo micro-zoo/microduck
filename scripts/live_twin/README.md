@@ -37,7 +37,10 @@ does not accept requests sent by unrelated web pages through a visitor's browser
 Use this page on a trusted network. Pairing uses `configd` and BlueZ; `padd`
 reads the resulting input device when its service is active. The page shows the
 current `padd` state, so pairing success is not presented as motor control when
-the driver has been deliberately stopped. The viewer can start while
+the driver has been deliberately stopped. It refreshes pad status every three
+seconds: an unpaired pad offers **开始配对**, a bonded but disconnected pad offers
+**重新配对**, and a connected pad shows **已连接** without a pairing button. The
+viewer can start while
 `robotd` is stopped; it reports offline until `robotd` supplies state. Enabling
 the viewer does not start `robotd` because its service has only `After=robotd`.
 
