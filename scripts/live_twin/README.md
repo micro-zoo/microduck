@@ -1,4 +1,4 @@
-# Read-only Live Twin
+# Live Twin telemetry and gamepad pairing
 
 `robotctl twin` manages a web viewer for the joint state published by
 `robotd`. The Python bridge connects to `/run/robotd.sock`, requests `hello`,
@@ -14,7 +14,10 @@ The viewer anchors the first yaw to its initial heading because game-rotation
 yaw has no absolute north; subsequent relative yaw and measured tilt remain
 live. No IMU mount transform is kept in the viewer, and trunk translation stays
 fixed. It never opens the
-motor serial port or sends a robot intent. HTTP write requests return 405.
+motor serial port or sends a robot intent. The only HTTP write route is
+`POST /api/pad/pair`, which invokes the existing `robotctl pad pair --json`
+command. It accepts no MAC address or other parameters, and concurrent pairing
+requests are refused. Other HTTP write requests return 405.
 
 ```sh
 robotctl twin
@@ -26,8 +29,12 @@ sudo robotctl twin disable
 
 `robotctl twin` and `robotctl twin status` list the robot's current IPv4 URLs;
 open one directly from the same network, such as `http://ROBOT_IP:8765/`.
-The HTTP viewer has no login and exposes read-only telemetry to hosts that can
-reach that port, so use it on a trusted network. The viewer can start while
+The HTTP viewer has no login. Anyone who can open it on the LAN can see telemetry
+and press **开始配对** after putting an Xbox pad in pairing mode. The write route
+requires a same-origin browser request using the robot's LAN IP address; it
+does not accept requests sent by unrelated web pages through a visitor's browser.
+Use this page on a trusted network. Pairing uses `configd` and BlueZ; `padd`
+reads the resulting input device. The viewer can start while
 `robotd` is stopped; it reports offline until `robotd` supplies state. Enabling
 the viewer does not start `robotd` because its service has only `After=robotd`.
 
@@ -51,8 +58,8 @@ generic `tofd` defaults look for the HAT bus at `/dev/i2c-pihat` or
 Keep that bus override specific to boards whose physical I²C wiring has been
 verified.
 
-The page is limited to telemetry and model rotation. It has no HOME, zero,
-relax, WBC, or other control route. The old experimental control page remains
+The robot telemetry and model remain read-only. The page has no HOME, zero,
+relax, WBC, or motor control route. The old experimental control page remains
 on the archived Git branch and is not part of this service.
 
 The release package includes `ipc_server.py`, the complete `dist/` tree, and

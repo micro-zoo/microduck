@@ -808,7 +808,7 @@ install_units() {
     fi
 
     if [ -f "${UNIT_DIR}/microduck-twin.service" ]; then
-        enable_unit microduck-twin.service || warn "the read-only Twin did not start; check:
+        enable_unit microduck-twin.service || warn "the Twin did not start; check:
     journalctl -u microduck-twin -b"
     fi
 

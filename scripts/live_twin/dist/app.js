@@ -146,6 +146,27 @@ function connect(){
  source.onerror=()=>{lastReceived=0;paintState();};
  fetch('/api/state',{cache:'no-store'}).then(r=>r.json()).then(receive).catch(()=>paintState());
 }
+function bindPairing(){
+ const button=$('pair-button'),status=$('pair-status');
+ const failures={not_found:'未找到处于配对模式的手柄，请确认 Xbox 灯快速闪烁后重试。',ambiguous:'发现多个待配对手柄，请只让目标手柄进入配对模式。',timeout:'找到手柄，但未能完成配对，请重新按 Sync 键后重试。',no_adapter:'蓝牙适配器尚未就绪，请稍后重试。',rejected:'蓝牙拒绝了配对，请检查手柄配对模式和机器人蓝牙设置。'};
+ button.addEventListener('click',async()=>{
+  button.disabled=true;status.className='';status.textContent='正在搜索并配对，可能需要约 30 秒…';
+  try{
+   const response=await fetch('/api/pad/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',cache:'no-store'});
+   const result=await response.json();
+   if(result.outcome==='paired'){
+    status.className='success';
+    status.textContent=`${result.pad?.name||'手柄'}已配对${result.pad?.connected?'并连接，可由 padd 读取输入。':'，连接建立后 padd 会自动读取输入。'}`;
+   }else{
+    status.className='error';
+    status.textContent=failures[result.reason]||
+     (response.status===409?'已有配对进行中，请稍候。':
+      response.status===503?'配对服务不可用，请检查机器人上的 robotctl 和 configd。':'配对未完成，请重试。');
+   }
+  }catch(error){status.className='error';status.textContent='无法联系配对服务，请检查 Twin 连接。';}
+  finally{button.disabled=false;}
+ });
+}
 async function buildModel(definition){
  const container=$('viewport');
  try{
@@ -197,4 +218,5 @@ async function buildModel(definition){
   }
  }catch(error){const loading=$('model-loading');if(loading){loading.classList.add('error');loading.textContent='三维模型无法加载，位置读数仍可使用。';}console.error(error);}
 }
+bindPairing();
 fetch('/assets/model.json').then(r=>{if(!r.ok)throw Error('model data missing');return r.json();}).then(definition=>{catalog=definition.motors;buildList();buildThermals();connect();buildModel(definition);setInterval(paintState,250);}).catch(error=>{$('model-loading').textContent='模型定义加载失败';console.error(error);});

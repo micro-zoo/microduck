@@ -1,0 +1,12 @@
+.pairing-panel{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:22px 28px;border-bottom:1px solid var(--ink);background:var(--surface)}
+.pairing-panel h2{font-size:20px;margin:4px 0 6px}
+.pairing-panel p{font-size:14px;max-width:720px}
+.pairing-panel small{display:block;margin-top:7px;color:var(--muted);font-size:12px}
+.pairing-action{display:flex;flex-direction:column;align-items:flex-end;gap:9px;min-width:155px}
+.pairing-action button{background:var(--ink);color:var(--surface);border:1px solid var(--ink);padding:10px 16px;font-weight:600}
+.pairing-action button:hover:not(:disabled){background:#344237}
+.pairing-action button:disabled{cursor:wait;opacity:.55}
+.pairing-action span{font-size:12px;text-align:right;max-width:310px}
+.pairing-action span.error{color:#a64029}
+.pairing-action span.success{color:#356926}
+@media(max-width:700px){.pairing-panel{flex-direction:column;align-items:stretch;padding:20px}.pairing-action{align-items:stretch}.pairing-action span{text-align:left;max-width:none}}
