@@ -1,5 +1,5 @@
 [Unit]
-Description=Microduck read-only Live Twin (robotd IPC)
+Description=Microduck Live Twin telemetry and gamepad pairing
 After=robotd.service
 
 [Service]

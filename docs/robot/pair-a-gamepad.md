@@ -22,6 +22,11 @@ the robot pairs the two in opposite orders; `pad pair` picks the right one by it
 
 ## Pair it
 
+On the robot's LAN, you can also open the Live Twin URL shown by `robotctl twin`
+and press **开始配对**. Anyone who can open that page can start pairing; use it on a
+trusted network. The button runs the same command below and does not accept a
+specific MAC address. Use the command line when several pads are in pairing mode.
+
 ```bash
 sudo robotctl pad pair
 ```
