@@ -105,7 +105,8 @@ survive a daemon crash to perform rollback.
 **Corollary — `updaterd` must be resident, and must exclude itself from the
 restart set.** `updaterd` and `btd` both ship *inside* the daemon artifact, so a
 naive "restart everything" would kill the executor mid-swap or mid-health-gate.
-`on_apply` therefore restarts everything the release ships **except** those two.
+`on_apply` force-restarts configured units and conditionally restarts other shipped units that
+are already running. It excludes `updaterd` and `btd` from the in-flight restart.
 
 **Excluded from the in-flight restart is not the same as skipped**, and reading it that way was the
 bug. Deferring them to "the next boot or an explicit later restart" left both running the old binary
@@ -1431,9 +1432,10 @@ gate against. Both are now live:
 
 `mediad` needed an entry under the old authoritative list and needs none now: the restart
 set is derived from the units a release ships, skipping any without an `[Install]`
-section, and `mediad.service` has one. So an apply restarts it, and a robot that has
-never run it enables it on the next install — the rule is the unit file, not a name
-anybody maintains.
+section, and `mediad.service` has one. An apply uses `try-restart` for it, so a stopped
+`mediad` stays stopped. The install hook enables new units but preserves an explicitly
+disabled existing unit. The rule is the unit file and existing systemd state, not a
+name anybody maintains.
 
 **`health = none` was the weakest the design gets**: it commits as soon as the swap
 succeeds, so there was no auto-rollback at all, and the boot counter was the only
@@ -1445,11 +1447,12 @@ opposite: `on_apply` must restart `robotd` and must **not** restart `updaterd` o
 silently disable auto-rollback while looking like a one-word diff, which is exactly the
 kind of change that needs a test standing in front of it.
 
-**What is still untested:** the `systemctl restart` in `on_apply` has never run against
-real systemd — there is none on a dev laptop, and stubbing it would test the stub. The
-health gate itself *is* tested against a real `robotd` process over a real socket
-(`robotd/tests/updater_gate.rs`), so what remains unproven is specifically the restart
-step and the 30s timeout. Both land in M4 on the Radxa.
+The `on_apply` restart and `try-restart` paths have now run against real systemd on the
+Orange Pi Zero 3W: a signed update restarted `robotd` and `configd` while stopped,
+disabled `padd` and `mediad` remained stopped and disabled. The health gate is also
+tested against a real `robotd` process over a real socket
+(`robotd/tests/updater_gate.rs`). The configured timeout under a failed board update
+(30s in the shipped template, 60s on this bench robot) is still unverified.
 
 ## 17. Open questions / future
 

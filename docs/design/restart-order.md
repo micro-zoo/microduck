@@ -239,8 +239,8 @@ release being returned to.
 
 The `no` for an explicit `rollback` / `reset-to-golden` is a different case and worth knowing:
 if the release being left was applied successfully at some earlier point, `updaterd` and `btd` *were*
-restarted onto it, and an explicit revert leaves them there. `robotd`, `configd` and `padd` move back;
-those two stay **ahead** of the active release.
+restarted onto it, and an explicit revert leaves them there. `robotd` and `configd` move back, as
+does a running `padd`; `updaterd` and `btd` stay **ahead** of the active release.
 
 That resolves itself at the next `updaterd` start rather than at a reboot: §5 compares in both
 directions, so `btd` running a release newer than `current` is stale by the same test and gets
@@ -288,8 +288,8 @@ adapter rather than failing.
    - Reverting means going to `previous`, escalating to
      `golden` when `previous` is absent, missing from disk, or itself recorded as rolled back. That
      means swap the symlink, confirm the trial, and re-run `on_apply` — **so a boot-counter revert
-     restarts `configd`, `padd` and `robotd`.** It runs no hooks and schedules nothing, so the
-     `updaterd` and `btd` processes systemd has just launched are left running from the release being
+     restarts `configd` and `robotd`, plus `padd` if running.** It runs no hooks and schedules nothing,
+     so the `updaterd` and `btd` processes systemd has just launched are left running from the release being
      abandoned. Step 6 then catches `btd`, since it runs after this and compares against the release
      the revert made active; `updaterd` is reported and left, and is stale until the next boot.
    - Journal the outcome. A failure here is logged and serving continues: refusing to serve would

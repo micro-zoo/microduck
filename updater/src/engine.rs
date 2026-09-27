@@ -3124,8 +3124,8 @@ fn has_install_section(path: &Path) -> bool {
     }
 }
 
-/// The subset an update restarts in flight: everything shipped, less the two it cannot touch while
-/// it is running.
+/// The subset an update considers for in-flight restart: configured units are force-restarted,
+/// other shipped units are tried only if running, and the two deferred units are excluded.
 fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
     let mut units = units_shipped(release_dir, configured);
     units.retain(|unit| !NEVER_RESTART.contains(&unit.as_str()));
