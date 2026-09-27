@@ -22,9 +22,9 @@ no `[Install]` section, and that is what keeps it out — see §1.1.
 |---|---|---|
 | `robotd` | yes | — |
 | `configd` | yes | — |
-| `padd` | yes | — |
-| `mediad` | yes | — |
-| `tofd` | yes | — |
+| `padd` | if already running (`try-restart`) | — |
+| `mediad` | if already running (`try-restart`) | — |
+| `tofd` | if already running (`try-restart`) | — |
 | `updaterd` | **never** — it is the process performing the update | yes |
 | `btd` | **never** — it may be the transport the update arrived over | yes |
 
@@ -67,8 +67,10 @@ sorted and deduplicated. `engine.rs::units_to_restart` is that, minus `NEVER_RES
 units_shipped(…)  −  {updaterd, btd}
 ```
 
-An update restarts `units_to_restart`; the startup check in §5 reads `units_shipped`, because the two
-units an update cannot touch are exactly the two it exists to watch.
+An update force-restarts the units explicitly named by `on_apply` (`robotd`, `configd` here), and
+uses systemd's `try-restart` for the other shipped units. That updates a running daemon without
+starting a unit the operator stopped. The startup check in §5 reads `units_shipped`, because the
+two units an update cannot touch are exactly the two it exists to watch.
 
 On today's release `units_to_restart` is exactly:
 
@@ -82,8 +84,9 @@ be: both ship a unit with an `[Install]` section, which is the whole rule.
 
 Two consequences of deriving it from the release rather than from the board:
 
-- `padd` is restarted even though `deploy/updater.toml` never mentions it. The config list is
-  **additive**, not authoritative; it only needs to name units the release does *not* ship.
+- A running `padd` is restarted even though `deploy/updater.toml` never mentions it. A stopped one
+  stays stopped. The config list is **additive**, not authoritative; it names units whose restart
+  is required even when they are stopped.
 - A board whose `updater.toml` predates a daemon still restarts that daemon. That file belongs to the
   operator and `install.sh` preserves it, which is how `configd` went unrestarted for a while
   (`../project/install-path-gap.md` §4).
@@ -119,7 +122,7 @@ onto the release carrying it. This cost a confused round of "the hook ran and lo
 | 9 | arm the boot counter (`pending.json`), *before* the swap | no |
 | 10 | swap `current` → `releases/<ver>` | no |
 | 11 | **`hooks/postinstall`** (cwd = `releases/<ver>`) | **starts newly shipped units** |
-| 12 | `on_apply` — `systemctl restart` each unit from §1, one at a time | **configd, mediad, padd, robotd, tofd** |
+| 12 | `on_apply` — force-restart configured units and `try-restart` other shipped units, one at a time | **configd, robotd; mediad, padd, tofd if running** |
 | 13 | `releases/<ver>/bin/updaterd --self-test` | no |
 | 14 | health gate: poll `robotd` over its socket, every 500 ms, up to 30 s | no |
 | 15 | confirm the boot counter, prune old releases | no |
@@ -150,8 +153,9 @@ The hook ships inside the signed artifact and runs with the release directory as
    including `updaterd.service` and `btd.service` — the hook has no exclusion list, and does not
    need one.
 3. `systemctl daemon-reload`.
-4. `systemctl enable --now` each unit that has an `[Install]` section (§1.1); one without is
-   installed and left alone, and a `.timer` is enabled without `--now`.
+4. `systemctl enable --now` each new unit that has an `[Install]` section (§1.1), preserving an
+   existing disabled unit. One without `[Install]` is installed and left alone, and a `.timer` is
+   enabled without `--now`.
 
 Step 4 is why the exclusions in §1 still hold: `--now` means *start*, and starting an already-running
 unit is a no-op. It does not restart `updaterd` or `btd`. What it does do is start a unit the board

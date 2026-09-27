@@ -2243,10 +2243,19 @@ impl Engine {
             }
             ApplyAction::Restart { units } => {
                 for unit in units_to_restart(release_dir, units) {
-                    let result = restart_one(SYSTEMCTL, &unit).await;
+                    // The configured list names units whose health the update must establish.
+                    // Shipped additions still need the new binary if already running, but an
+                    // operator-stopped service must stay stopped. `try-restart` makes that check
+                    // and restart one atomic systemd operation.
+                    let configured = units.contains(&unit);
+                    let result = if configured {
+                        restart_one(SYSTEMCTL, &unit).await
+                    } else {
+                        restart_if_running(SYSTEMCTL, &unit).await
+                    };
                     rec.note(RunEvent::Unit {
                         unit: unit.clone(),
-                        action: "restart".into(),
+                        action: if configured { "restart" } else { "try-restart" }.into(),
                         detail: match &result {
                             Ok(()) => None,
                             Err(e) => Some(e.to_string()),
@@ -3012,7 +3021,7 @@ async fn schedule_deferred_restarts(systemd_run: &str, units: &[&str], rec: &Rec
 /// would break in a way nobody could see until an update was already running.
 const NEVER_RESTART: [&str; 2] = ["updaterd", "btd"];
 
-/// The units to restart: what the release ships, plus anything the config names.
+/// The units to consider: what the release ships, plus anything the config names.
 ///
 /// **Derived from the release rather than read from the board**, which is the whole point.
 /// `on_apply`'s list lives in the operator's `/etc/robot/updater.toml`, and `install.sh` preserves
@@ -3142,7 +3151,17 @@ fn units_to_restart(release_dir: &Path, configured: &[String]) -> Vec<String> {
 /// with. The cost is one extra pair of calls on a path that has already failed; a unit that
 /// genuinely cannot start fails the second time too and is reported then.
 async fn restart_one(systemctl: &str, unit: &str) -> Result<(), Error> {
-    match try_restart(systemctl, unit).await {
+    restart_one_with(systemctl, unit, "restart").await
+}
+
+/// Update a shipped daemon only if it was running before the swap. A disabled,
+/// stopped service is still installed but does not acquire an unwanted process.
+async fn restart_if_running(systemctl: &str, unit: &str) -> Result<(), Error> {
+    restart_one_with(systemctl, unit, "try-restart").await
+}
+
+async fn restart_one_with(systemctl: &str, unit: &str, operation: &str) -> Result<(), Error> {
+    match try_restart(systemctl, unit, operation).await {
         Ok(()) => Ok(()),
         Err(e) => {
             if unit_is_absent(systemctl, unit).await {
@@ -3168,7 +3187,7 @@ async fn restart_one(systemctl: &str, unit: &str) -> Result<(), Error> {
             // versions, and that must not replace the restart's own error with a worse one.
             let _ = run_systemctl(c, "reset-failed").await;
 
-            try_restart(systemctl, unit).await
+            try_restart(systemctl, unit, operation).await
         }
     }
 }
@@ -3178,10 +3197,15 @@ async fn restart_one(systemctl: &str, unit: &str) -> Result<(), Error> {
 /// Named, because the caller restarts up to six of them and the bare message — systemd's own
 /// "Job for X.service failed because the control process exited" wrapped in "restart failed" —
 /// reached the update log without ever saying which unit the job was for.
-async fn try_restart(systemctl: &str, unit: &str) -> Result<(), Error> {
+async fn try_restart(systemctl: &str, unit: &str, operation: &str) -> Result<(), Error> {
     let mut c = tokio::process::Command::new(systemctl);
-    c.arg("restart").arg(unit);
-    run_systemctl(c, &format!("restarting {unit}")).await
+    c.arg(operation).arg(unit);
+    let description = if operation == "restart" {
+        format!("restarting {unit}")
+    } else {
+        format!("try-restarting {unit}")
+    };
+    run_systemctl(c, &description).await
 }
 
 /// Does systemd know this unit at all?
@@ -3917,6 +3941,19 @@ exit 1
         assert!(log.contains("restart configd"), "{log}");
         // Never both in one command, which is what broke.
         assert!(!log.contains("restart robotd configd"), "{log}");
+    }
+
+    /// A shipped service that the operator stopped is updated on disk without being started.
+    /// `try-restart` is systemd's atomic "restart only if active" operation; an `is-active`
+    /// probe followed by `restart` would reintroduce a stop/start race.
+    #[tokio::test]
+    async fn shipped_units_use_try_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = stub_systemctl(dir.path(), &["padd"]);
+        restart_if_running(systemctl.to_str().unwrap(), "padd")
+            .await
+            .unwrap();
+        assert_eq!(calls(dir.path()), "try-restart padd\n");
     }
 }
 

@@ -1,6 +1,6 @@
 //! Did the restarts an update scheduled actually happen?
 //!
-//! An update restarts the units a release ships, then — five seconds after its reply is on the wire
+//! An update restarts running units a release ships, then — five seconds after its reply is on the wire
 //! — restarts the two it could not touch while running: itself, and `btd`, which may be carrying
 //! the reply. Both are scheduled through `systemd-run`, and **scheduling is all that is checked
 //! today.** `systemd-run` succeeding means a transient timer was created, not that the restart ran,
