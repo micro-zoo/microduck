@@ -134,9 +134,18 @@ fi
 # release, and the supported way to customise one is a drop-in under
 # /etc/systemd/system/<unit>.d/, which this does not touch.
 units=""
+previously_disabled=""
 for unit in systemd/*.service systemd/*.timer; do
     [ -f "$unit" ] || continue
     name="$(basename "$unit")"
+    # Existing disabled units are an operator choice. In particular, this bench keeps
+    # robotd off at boot while it is supported in a q=0 fixture. Remember the state
+    # before installing the new unit: a newly introduced unit also reads as disabled
+    # after installation, and still needs to be enabled on its first release.
+    if [ -f "${UNIT_DIR}/${name}" ] && command -v systemctl >/dev/null 2>&1; then
+        enabled="$(systemctl is-enabled "$name" 2>/dev/null || true)"
+        [ "$enabled" != disabled ] || previously_disabled="${previously_disabled} ${name}"
+    fi
     install -m 644 "$unit" "${UNIT_DIR}/${name}" \
         || { echo "postinstall: cannot install ${name}" >&2; exit 1; }
     units="${units} ${name}"
@@ -153,11 +162,11 @@ fi
 
 systemctl daemon-reload || echo "postinstall: daemon-reload failed" >&2
 
-# Enable — and start — every unit the release ships.
+# Enable and start new units; preserve an existing unit's disabled state.
 #
-# `install.sh` does the same on a first install, so this only differs in *when*. Enabling is what
-# makes a newly added service arrive working rather than at the next manual step, which is the
-# whole point of this hook.
+# `install.sh` also enables new units on a first install. A unit already present and disabled was
+# turned off by the operator; enabling it here would undo that choice at the next boot. A new unit
+# has no such history and still needs to arrive working without a manual step.
 #
 # Every failure is a warning. `on_apply` restarts the units in its own list moments after this, so
 # a unit that is merely slow is not a problem; and a unit that genuinely cannot start must not fail
@@ -173,6 +182,12 @@ systemctl daemon-reload || echo "postinstall: daemon-reload failed" >&2
 #     immediately, and this hook runs mid-update. It arms on the next boot, which is the boot it is
 #     about.
 for name in $units; do
+    case " $previously_disabled " in
+        *" $name "*)
+            echo "postinstall: ${name} was disabled before this update; leaving it disabled" >&2
+            continue
+            ;;
+    esac
     if ! grep -q '^\[Install\]' "${UNIT_DIR}/${name}"; then
         echo "postinstall: ${name} installed; it has no [Install] and is started by something else" >&2
         continue
@@ -188,4 +203,4 @@ for name in $units; do
         || echo "postinstall: ${name} did not start; check: journalctl -u ${name} -b" >&2
 done
 
-echo "postinstall: installed and enabled${units}" >&2
+echo "postinstall: installed and reconciled${units}" >&2
