@@ -999,7 +999,9 @@ This has now been got wrong four times, in four different shapes:
 1. **Units.** A release that added a daemon put its `.service` inside the artifact and
    nowhere systemd looks. `btd` failed with `203/EXEC` on a board where the release was
    complete and correct, and `on_apply` could not restart a unit that did not exist yet.
-   `docs/project/install-path-gap.md` is the write-up; `hooks/postinstall` is the fix.
+   `docs/project/install-path-gap.md` is the write-up; `hooks/postinstall` is the fix. It
+   enables new units while preserving an existing unit the operator disabled, so a bench
+   robot's boot setting survives a software update.
 2. **The GStreamer stack and the 3A engine.** Provisioning installed them, so boards
    provisioned before they existed did not have them, and neither did a board whose plugins
    were older than the release was built against. `hooks/preinstall` runs the release's own
