@@ -3114,7 +3114,9 @@ fn brief(reason: &str) -> &str {
 fn explain_limit(limit: &str) -> String {
     match limit {
         "deadman" => "deadman — no intent arrived recently, velocity zeroed".to_owned(),
-        "joint_range" => "joint_range — a target was outside the actuator's travel".to_owned(),
+        "joint_range" => {
+            "joint_range — a target exceeded modeled joint or actuator travel".to_owned()
+        }
         "not_finite" => "not_finite — a target was NaN or infinite".to_owned(),
         "fallen" => "fallen — the robot is down, the policy is not driving".to_owned(),
         other => other.to_owned(),

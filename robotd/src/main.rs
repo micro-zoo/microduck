@@ -2999,6 +2999,7 @@ async fn control_loop<T: RobotIo>(
             1.0
         };
 
+        let mut policy_generated = false;
         let (mut targets, gain, moving, policy_label) = match (driving, sensors.as_ref()) {
             // The limp-fall sequence, before anything else — `driving` is false throughout,
             // so without this it would fall through to the hold branch and the robot would
@@ -3035,13 +3036,16 @@ async fn control_loop<T: RobotIo>(
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
-                    Ok(step) => (
-                        step.targets,
-                        step.gain,
-                        // A scripted move is motion whatever the twist says; so is walking.
-                        step.busy || command.twist_magnitude() > 0.0,
-                        step.label,
-                    ),
+                    Ok(step) => {
+                        policy_generated = true;
+                        (
+                            step.targets,
+                            step.gain,
+                            // A scripted move is motion whatever the twist says; so is walking.
+                            step.busy || command.twist_magnitude() > 0.0,
+                            step.label,
+                        )
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "inference failed; holding");
                         (hold, policy_cfg.gain, false, "held".into())
@@ -3243,7 +3247,12 @@ async fn control_loop<T: RobotIo>(
                 duck_control::model::mouth_target(snapshot.mouth);
         }
 
-        match safety.apply(targets, hold, gain) {
+        let applied = if policy_generated {
+            safety.apply_policy(targets, hold, gain)
+        } else {
+            safety.apply(targets, hold, gain)
+        };
+        match applied {
             Ok(applied) => limits.extend(applied.limits),
             Err(e) => tracing::warn!(error = %e, "bus write failed"),
         }
