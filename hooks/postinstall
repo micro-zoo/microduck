@@ -118,8 +118,14 @@ if [ -d systemd/sysusers.d ]; then
     for conf in systemd/sysusers.d/*.conf; do
         [ -f "$conf" ] || continue
         mkdir -p "$SYSUSERS_DIR"
-        install -m 644 "$conf" "${SYSUSERS_DIR}/$(basename "$conf")" \
-            || { echo "postinstall: cannot install $(basename "$conf")" >&2; exit 1; }
+        name="$(basename "$conf")"
+        temporary="$(mktemp "${SYSUSERS_DIR}/.${name}.XXXXXX")" \
+            || { echo "postinstall: cannot stage ${name}" >&2; exit 1; }
+        if ! install -m 644 "$conf" "$temporary" || ! mv -f "$temporary" "${SYSUSERS_DIR}/${name}"; then
+            rm -f "$temporary"
+            echo "postinstall: cannot install ${name}" >&2
+            exit 1
+        fi
     done
     if command -v systemd-sysusers >/dev/null 2>&1; then
         # A warning, not fatal: the accounts may already exist, which is the common case.
@@ -146,8 +152,16 @@ for unit in systemd/*.service systemd/*.timer; do
         enabled="$(systemctl is-enabled "$name" 2>/dev/null || true)"
         [ "$enabled" != disabled ] || previously_disabled="${previously_disabled} ${name}"
     fi
-    install -m 644 "$unit" "${UNIT_DIR}/${name}" \
-        || { echo "postinstall: cannot install ${name}" >&2; exit 1; }
+    # Replace the unit atomically. After a reboot following an update, this board had nine unit
+    # files with the right lengths but only NUL bytes, while the release copies were intact.
+    # An in-place install can leave the active unit truncated or unwritten if power goes away.
+    temporary="$(mktemp "${UNIT_DIR}/.${name}.XXXXXX")" \
+        || { echo "postinstall: cannot stage ${name}" >&2; exit 1; }
+    if ! install -m 644 "$unit" "$temporary" || ! mv -f "$temporary" "${UNIT_DIR}/${name}"; then
+        rm -f "$temporary"
+        echo "postinstall: cannot install ${name}" >&2
+        exit 1
+    fi
     units="${units} ${name}"
 done
 
@@ -156,6 +170,8 @@ done
 if ! command -v systemctl >/dev/null 2>&1; then
     # No systemd here (a container, a test). The files are in place, which is all this hook
     # promises; whatever runs them will find them.
+    sync -f "$UNIT_DIR" || { echo "postinstall: could not sync systemd files" >&2; exit 1; }
+    sync -f "$SYSUSERS_DIR" || { echo "postinstall: could not sync sysusers files" >&2; exit 1; }
     echo "postinstall: installed${units}; no systemctl to reload" >&2
     exit 0
 fi
@@ -202,5 +218,10 @@ for name in $units; do
     systemctl enable --now "$name" \
         || echo "postinstall: ${name} did not start; check: journalctl -u ${name} -b" >&2
 done
+
+# The update must not report success with unit files still only in the page cache. This flushes
+# their contents and the enablement links before the health gate commits the new release.
+sync -f "$UNIT_DIR" || { echo "postinstall: could not sync systemd files" >&2; exit 1; }
+sync -f "$SYSUSERS_DIR" || { echo "postinstall: could not sync sysusers files" >&2; exit 1; }
 
 echo "postinstall: installed and reconciled${units}" >&2
