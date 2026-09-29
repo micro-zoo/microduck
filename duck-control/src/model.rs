@@ -83,6 +83,28 @@ pub const REST_POSITION: [f64; NUM_JOINTS] = [
 pub const MOUTH_CLOSED: f64 = -5.0 * std::f64::consts::PI / 180.0;
 pub const MOUTH_OPEN: f64 = 30.0 * std::f64::consts::PI / 180.0;
 
+/// Alpha model joint travel in [`JOINT_NAMES`] order. A finite policy target can be within
+/// the servo's ±π travel yet cross a calibrated encoder's single-turn seam. These ranges
+/// come from the Alpha MJCF; safety also retains the actuator's own travel bound.
+const DEG: f64 = std::f64::consts::PI / 180.0;
+pub const JOINT_LIMITS: [(f64, f64); NUM_JOINTS] = [
+    (-25.0 * DEG, 30.0 * DEG),   // left_hip_yaw
+    (-22.0 * DEG, 22.0 * DEG),   // left_hip_roll
+    (-90.0 * DEG, 90.0 * DEG),   // left_hip_pitch
+    (-90.0 * DEG, 90.0 * DEG),   // left_knee
+    (-90.0 * DEG, 90.0 * DEG),   // left_ankle
+    (-90.0 * DEG, 60.0 * DEG),   // neck_pitch
+    (-90.0 * DEG, 90.0 * DEG),   // head_pitch
+    (-170.0 * DEG, 170.0 * DEG), // head_yaw
+    (-25.0 * DEG, 25.0 * DEG),   // head_roll
+    (MOUTH_CLOSED, MOUTH_OPEN),  // mouth
+    (-30.0 * DEG, 25.0 * DEG),   // right_hip_yaw
+    (-22.0 * DEG, 22.0 * DEG),   // right_hip_roll
+    (-90.0 * DEG, 90.0 * DEG),   // right_hip_pitch
+    (-90.0 * DEG, 90.0 * DEG),   // right_knee
+    (-90.0 * DEG, 90.0 * DEG),   // right_ankle
+];
+
 /// Joint angle for a mouth opening fraction. 0 is closed, 1 is fully open; anything outside
 /// is clamped rather than fed to a servo as an out-of-travel target.
 pub fn mouth_target(open: f64) -> f64 {
