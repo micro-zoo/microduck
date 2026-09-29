@@ -34,6 +34,18 @@ function buildThermals(){
 function paintSensors(frame,age,streamFresh){
  const healthFresh=streamFresh&&finite(frame?.health_age_ms)&&frame.health_age_ms+age<3000;
  const health=healthFresh?frame.health:null;
+ const battery=health?.battery;
+ const batteryLive=finite(battery?.volts)&&battery.volts>0&&finite(battery?.percent);
+ const batteryPercent=batteryLive?Math.max(0,Math.min(100,battery.percent)):null;
+ $('top-battery').textContent=batteryLive?`${format(batteryPercent,0)}%`:'—';
+ $('battery-percent').textContent=format(batteryPercent,0);
+ $('battery-voltage').textContent=batteryLive?`${format(battery.volts,2)} V`:'— V';
+ $('battery-state').textContent=batteryLive?'实时':'暂无读数';
+ $('battery-state').className=`sensor-state ${batteryLive?'live':''}`;
+ $('battery-meter').style.width=`${batteryPercent??0}%`;
+ const batteryGauge=$('battery-meter').parentElement;
+ if(batteryLive)batteryGauge.setAttribute('aria-valuenow',String(Math.round(batteryPercent)));
+ else batteryGauge.removeAttribute('aria-valuenow');
  const soc=health?.cpu_temp_c;
  $('top-soc').textContent=format(soc,0);
  $('top-motor').textContent=format(health?.motors?.max_c,0);

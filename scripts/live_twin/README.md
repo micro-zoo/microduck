@@ -3,7 +3,11 @@
 `robotctl twin` manages a web viewer for the joint state published by
 `robotd`. The Python bridge connects to `/run/robotd.sock`, requests `hello`,
 `robot.health` once a second, and `robot.subscribe`. It also subscribes to
-`head_imu.stream` on `/run/tofd/tof.sock`. The page shows the SoC temperature,
+`head_imu.stream` on `/run/tofd/tof.sock`. The page shows the battery voltage
+and percentage already calculated by `robotd` from its 6.6–8.2 V loaded-pack
+range; it does not calculate a second percentage in the browser. The battery
+reading is a voltage estimate, not a separate fuel gauge, and disappears when
+the health sample is stale. The page also shows the SoC temperature,
 all 15 servo case temperatures from `robotd`'s existing slow sample, the trunk
 IMU attitude, and the head BMI088 attitude when enabled. The two IMUs retain
 their own reference frames and arbitrary yaw origins; no mount correction is
