@@ -3286,7 +3286,9 @@ async fn control_loop<T: RobotIo>(
                     missed: state.missed.load(Ordering::Relaxed),
                 },
                 joints: sensors.positions.to_vec(),
-                targets: targets.to_vec(),
+                targets: safety
+                    .last_targets()
+                    .map_or_else(Vec::new, |goals| goals.to_vec()),
                 // Empty is *not reported* on this wire, and both of these have two ways of
                 // being that: `[control] publish_velocity_and_load = false` on a robot whose
                 // operator does not want the bytes, and a backend with nothing to report —
@@ -6784,6 +6786,43 @@ mod tests {
         );
         assert_eq!(frame.policy, "held", "no policy was loaded");
         assert_eq!(frame.joints.len(), NUM_JOINTS);
+    }
+
+    #[tokio::test]
+    async fn the_state_stream_reports_the_goals_sent_after_clamping() {
+        let mut resting = DEFAULT_POSITION;
+        resting[2] = 4.0;
+        let io = FakeIo::at(resting).frozen();
+        let s = Arc::new(RobotState::new(
+            &Params::default(),
+            std::path::Path::new("/test/robotd.toml"),
+            false,
+            false,
+        ));
+        let mut states = s.state_tx.subscribe();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let loop_state = Arc::clone(&s);
+        let handle = tokio::spawn(async move {
+            let mut io = io;
+            control_loop_probe(&mut io, loop_state, Duration::from_millis(2)).await;
+            tx.send(io.last_written).unwrap();
+        });
+        let frame = tokio::time::timeout(Duration::from_secs(5), states.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        s.shutdown.store(true, Ordering::Relaxed);
+        handle.await.unwrap();
+        let written = rx.recv().unwrap().unwrap();
+        assert_eq!(frame.joints[2], resting[2]);
+        assert_eq!(frame.targets, written.positions);
+        assert_ne!(frame.targets[2], resting[2]);
+        assert!(
+            frame
+                .movement
+                .limited_by
+                .contains(&"joint_range".to_owned())
+        );
     }
 
     /// Measured velocity and load must reach the state stream.

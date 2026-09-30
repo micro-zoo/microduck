@@ -3754,7 +3754,8 @@ pub struct RobotState {
     pub control_loop: LoopState,
     /// Measured joint angles, radians, indexed as [`JOINT_NAMES`].
     pub joints: Vec<f64>,
-    /// What was commanded, so a viewer can show tracking error rather than guessing at it.
+    /// Last joint goals successfully sent, after limiting or a hold fallback. Empty until
+    /// the first successful write, so a viewer does not mistake a rejected request for a goal.
     pub targets: Vec<f64>,
     /// Measured joint velocities, rad/s, indexed as [`JOINT_NAMES`].
     ///
