@@ -226,6 +226,13 @@ else
     say "ONNX Runtime now ${have}"
 fi
 
-install_gstreamer
-install_rkaiq
-install_npu
+platform="$(cat /etc/robot/platform 2>/dev/null || true)"
+if [ "$platform" = orangepi-zero3w-debian-arm64 ]; then
+    # These three installers fetch Rockchip binaries and configure Radxa devices.
+    # The Orange Pi image supplies its own media packages and board integration.
+    say "Orange Pi platform: skipping Rockchip media and NPU setup"
+else
+    install_gstreamer
+    install_rkaiq
+    install_npu
+fi

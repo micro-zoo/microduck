@@ -70,10 +70,12 @@ fi
 
 # Apt off the boot path: Armbian's `@reboot` simulated upgrade and the stock apt-daily timers. Here
 # rather than in setup-board.sh alone because every board in the field was provisioned with them
-# running, and this hook is what reaches those boards. Never fatal — a slower boot is not worth a
-# rollback.
+# running, and this hook is what reaches those boards. Leave the Orange Pi vendor image's apt
+# settings alone; its boot behavior has not been qualified by the Radxa setup script. Never fatal
+# on the supported boards — a slower boot is not worth a rollback.
 script=scripts/setup-quiet-boot.sh
-if [ -f "$script" ]; then
+platform="$(cat /etc/robot/platform 2>/dev/null || true)"
+if [ -f "$script" ] && [ "$platform" != orangepi-zero3w-debian-arm64 ]; then
     sh "$script" \
         || echo "postinstall: could not take apt off the boot path; boot stays slower than it needs to be" >&2
 fi
