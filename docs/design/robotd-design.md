@@ -237,6 +237,11 @@ And the decisions around it, which the dataflow above does not show:
              └─ state frame        only if subscribed   → robot.state
 ```
 
+`robot.state.targets` carries the last goals successfully sent by safety, after travel
+limiting or a non-finite hold fallback. A failed write retains the previous goals; before
+any successful write the vector is empty. Tracking error therefore compares the encoder
+with the goal sent to the bus.
+
 The four conditions on `driving` are each load-bearing. `sensors this tick` is the non-obvious
 one: a read that failed leaves nothing to build an observation from, and inventing one would
 feed the policy a robot that does not exist. `¬limp-fall` is the one that is not a refusal —

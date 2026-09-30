@@ -153,6 +153,8 @@ pub struct Safety<T: RobotIo> {
     /// Tracks the last gain written so an unchanged one is not rewritten every tick — that
     /// would be fifteen bus writes per tick for no reason.
     gain: Option<u16>,
+    /// Last goals successfully sent to the backend, after limiting or a hold fallback.
+    last_targets: Option<[f64; NUM_JOINTS]>,
     /// Trip counts, for rate-limiting what the layer says about itself.
     runs: LimitRuns,
     /// Whether an intent has ever arrived inside the deadman, which is what makes a stale
@@ -169,6 +171,7 @@ impl<T: RobotIo> Safety<T> {
             falling_for: Duration::ZERO,
             fallen: false,
             gain: None,
+            last_targets: None,
             runs: LimitRuns::default(),
             deadman_armed: false,
         }
@@ -233,6 +236,10 @@ impl<T: RobotIo> Safety<T> {
     /// the robot is running at, which is not always what the caller asked for.
     pub fn gain(&self) -> Option<u16> {
         self.gain
+    }
+
+    pub fn last_targets(&self) -> Option<[f64; NUM_JOINTS]> {
+        self.last_targets
     }
 
     /// Update fall state from a fresh sample. Call every tick, before [`Self::apply`].
@@ -400,6 +407,7 @@ impl<T: RobotIo> Safety<T> {
             }
             applied.limits.push(Limit::NotFinite);
             self.io.write(&JointTargets::new(hold))?;
+            self.last_targets = Some(hold);
             return Ok(applied);
         }
         self.runs.not_finite = 0;
@@ -442,6 +450,7 @@ impl<T: RobotIo> Safety<T> {
         }
 
         self.io.write(&JointTargets::new(safe))?;
+        self.last_targets = Some(safe);
         Ok(applied)
     }
 
@@ -695,6 +704,7 @@ mod tests {
         assert!(applied.limited_by(Limit::NotFinite));
         assert!(!applied.limited_by(Limit::Range), "must not be clamped");
         assert_eq!(s.io().last_written.unwrap().positions, DEFAULT_POSITION);
+        assert_eq!(s.last_targets(), Some(DEFAULT_POSITION));
     }
 
     /// Out-of-range targets are clamped and reported. Reported matters: a client whose
@@ -715,6 +725,7 @@ mod tests {
         let written = s.io().last_written.unwrap().positions;
         assert_eq!(written[2], ACTUATOR_MAX);
         assert_eq!(written[7], ACTUATOR_MIN);
+        assert_eq!(s.last_targets(), Some(written));
     }
 
     /// A folded robot can start outside a trained joint's range. Holding that measured
@@ -761,7 +772,57 @@ mod tests {
         assert_eq!(written[5], JOINT_LIMITS[5].1);
         assert_eq!(written[7], JOINT_LIMITS[7].0);
         assert_eq!(written[2], JOINT_LIMITS[2].0);
+        assert_eq!(s.last_targets(), Some(written));
         calibration.servo_targets(&written).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_last_successfully_sent_targets() {
+        struct WriteFault {
+            inner: FakeIo,
+            fail: bool,
+        }
+        impl RobotIo for WriteFault {
+            fn read(&mut self) -> Result<Sensors, IoError> {
+                self.inner.read()
+            }
+            fn write(&mut self, targets: &JointTargets) -> Result<(), IoError> {
+                if self.fail {
+                    Err(IoError::Simulated)
+                } else {
+                    self.inner.write(targets)
+                }
+            }
+            fn set_gain(&mut self, gain: u16) -> Result<(), IoError> {
+                self.inner.set_gain(gain)
+            }
+            fn set_torque(&mut self, on: bool) -> Result<(), IoError> {
+                self.inner.set_torque(on)
+            }
+            fn reboot(&mut self, id: u8) -> Result<(), IoError> {
+                self.inner.reboot(id)
+            }
+            fn slow_sensors(&mut self) -> Result<crate::io::SlowSensors, IoError> {
+                self.inner.slow_sensors()
+            }
+        }
+
+        let mut s = Safety::new(
+            WriteFault {
+                inner: FakeIo::new(),
+                fail: true,
+            },
+            SafetyConfig::default(),
+        );
+        assert!(s.apply(DEFAULT_POSITION, DEFAULT_POSITION, gain()).is_err());
+        assert_eq!(s.last_targets(), None);
+        s.io.fail = false;
+        s.apply(DEFAULT_POSITION, DEFAULT_POSITION, gain()).unwrap();
+        s.io.fail = true;
+        let mut requested = DEFAULT_POSITION;
+        requested[5] = 0.5;
+        assert!(s.apply_policy(requested, DEFAULT_POSITION, gain()).is_err());
+        assert_eq!(s.last_targets(), Some(DEFAULT_POSITION));
     }
 
     /// An ordinary tick must pass through untouched, or the clamp is silently mangling
