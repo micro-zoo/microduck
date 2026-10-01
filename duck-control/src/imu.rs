@@ -366,4 +366,67 @@ mod tests {
         assert!(out.gravity[0].abs().max(out.gravity[1].abs()) > 0.1);
         assert!((out.gravity.iter().map(|v| v * v).sum::<f64>() - 1.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn sensor_mount_reaches_policy_observation_and_fall_detection() {
+        use crate::io::{FakeIo, Sensors};
+        use crate::model::{DEFAULT_POSITION, NUM_JOINTS};
+        use crate::obs::{ACTION_LEN, Command, Observation};
+        use crate::safety::{Safety, SafetyConfig};
+        use std::time::Duration;
+
+        // An upright trunk with the sensor's +Y pointing down. A default mount
+        // misreports it as fallen; -90 degrees around X maps it into trunk axes.
+        let mount = [
+            std::f64::consts::FRAC_1_SQRT_2,
+            -std::f64::consts::FRAC_1_SQRT_2,
+            0.0,
+            0.0,
+        ];
+        let mut mounted = SflpDecoder::new(mount);
+        let mut original = SflpDecoder::default();
+        let mut block = [0u8; IMU_BLOCK_LEN];
+        for (index, value) in [1000i16, 2000, -3000].into_iter().enumerate() {
+            block[index * 2..index * 2 + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        block[6..8].copy_from_slice(&0xb9a8u16.to_le_bytes()); // half(-sqrt(0.5))
+        for _ in 0..25 {
+            mounted.decode(&block);
+            original.decode(&block);
+        }
+        let imu = mounted.decode(&block);
+        let obs = Observation::build(
+            &imu,
+            &DEFAULT_POSITION,
+            &[0.0; NUM_JOINTS],
+            &DEFAULT_POSITION,
+            &[0.0; ACTION_LEN],
+            &Command::default(),
+        );
+        for (got, raw) in obs.as_slice()[..3].iter().zip([1000.0, -3000.0, -2000.0]) {
+            assert!((*got as f64 - raw * GYRO_RAD_PER_LSB).abs() < 1e-6);
+        }
+        for (got, expected) in obs.as_slice()[3..6].iter().zip([0.0, 0.0, -1.0]) {
+            assert!((*got as f64 - expected).abs() < 1e-3);
+        }
+        assert!(imu.quat[0] > 0.999);
+        assert!(imu.quat[1..].iter().all(|v| v.abs() < 1e-3));
+
+        let mut safety = Safety::new(FakeIo::default(), SafetyConfig::default());
+        let mut sensors = Sensors {
+            imu: original.decode(&block),
+            ..Sensors::default()
+        };
+        safety.observe(&sensors, Duration::from_secs(1));
+        assert!(
+            safety.fallen(),
+            "the wrong mount reproduces the false fall verdict"
+        );
+        sensors.imu = imu;
+        safety.observe(&sensors, Duration::from_secs(1));
+        assert!(
+            !safety.fallen(),
+            "the corrected policy input is also used by safety"
+        );
+    }
 }
