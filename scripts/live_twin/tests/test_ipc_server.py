@@ -46,6 +46,24 @@ class FakeBridge:
 
 
 class IpcServerTests(unittest.TestCase):
+    def test_bridge_maps_motor_measurements_by_joint_order(self):
+        bridge = ipc_server.Bridge("/unused.sock", 10, tof_socket="/unused-tof.sock")
+        self.addCleanup(bridge.close)
+        bridge.robot_state = {"joints": [0.0] * 15,
+                              "velocities": [0.0, -0.25, float("nan")],
+                              "currents_ma": [0.0, 12.5, float("inf")]}
+        motors = bridge.snapshot()["motors"]
+        self.assertEqual(motors[0]["id"], 20)
+        self.assertEqual(motors[0]["velocity_rad_s"], 0.0)
+        self.assertEqual(motors[0]["current_ma"], 0.0)
+        self.assertEqual(motors[1]["id"], 21)
+        self.assertEqual(motors[1]["velocity_rad_s"], -0.25)
+        self.assertEqual(motors[1]["current_ma"], 12.5)
+        for motor in motors[2:]:
+            self.assertIsNone(motor["velocity_rad_s"])
+            self.assertIsNone(motor["current_ma"])
+        self.assertIsNone(motors[0]["torque"])
+
     def setUp(self):
         self.bridge = FakeBridge()
         self.pair_calls = 0

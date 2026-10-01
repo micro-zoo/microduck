@@ -184,6 +184,8 @@ class Bridge:
                        if connection == "live" and len(times) > 1 and times[-1] > times[0] else 0)
             measured = state.get("joints", []) if state else []
             targets = state.get("targets", []) if state else []
+            velocities = state.get("velocities", []) if state else []
+            currents = state.get("currents_ma", []) if state else []
             health_age = None if self.health_at is None else (time.monotonic() - self.health_at) * 1000
             thermal = (self.health or {}).get("motors") or {}
             temps = thermal.get("temps_c", []) if connection == "live" and health_age is not None and health_age < 3000 else []
@@ -191,8 +193,10 @@ class Bridge:
             for index, (motor_id, name, label) in enumerate(MOTORS):
                 q = measured[index] if index < len(measured) and finite(measured[index]) else None
                 target = targets[index] if index < len(targets) and finite(targets[index]) else None
+                velocity = velocities[index] if index < len(velocities) and finite(velocities[index]) else None
+                current = currents[index] if index < len(currents) and finite(currents[index]) else None
                 temp = temps[index] if index < len(temps) and finite(temps[index]) else None
-                motors.append({"id": motor_id, "name": name, "label": label, "group": "head" if 5 <= index <= 9 else ("left" if index < 5 else "right"), "online": connection == "live" and q is not None and age is not None and age < 1500, "calibrated": q is not None, "angle_rad": q, "angle_deg": math.degrees(q) if q is not None else None, "target_rad": target, "torque": None, "torque_known": False, "current_ma": None, "temperature_c": temp, "voltage_v": None, "hardware_error": None, "status_error": None})
+                motors.append({"id": motor_id, "name": name, "label": label, "group": "head" if 5 <= index <= 9 else ("left" if index < 5 else "right"), "online": connection == "live" and q is not None and age is not None and age < 1500, "calibrated": q is not None, "angle_rad": q, "angle_deg": math.degrees(q) if q is not None else None, "target_rad": target, "torque": None, "torque_known": False, "velocity_rad_s": velocity, "current_ma": current, "temperature_c": temp, "voltage_v": None, "hardware_error": None, "status_error": None})
             head_age = None if self.head_imu_at is None else (time.monotonic() - self.head_imu_at) * 1000
             head_status = ("offline" if self.head_imu_connection == "offline" else
                            "unavailable" if self.head_imu_result and not self.head_imu_result.get("sensor") else
