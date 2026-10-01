@@ -375,14 +375,9 @@ mod tests {
         use crate::safety::{Safety, SafetyConfig};
         use std::time::Duration;
 
-        // An upright trunk with the sensor's +Y pointing down. A default mount
-        // misreports it as fallen; -90 degrees around X maps it into trunk axes.
-        let mount = [
-            std::f64::consts::FRAC_1_SQRT_2,
-            -std::f64::consts::FRAC_1_SQRT_2,
-            0.0,
-            0.0,
-        ];
+        // An upright trunk with sensor +Y down and +Z forward. The original
+        // mount reports a false fall; this mount gives trunk = [+Z, -X, -Y].
+        let mount = [0.5, -0.5, 0.5, -0.5];
         let mut mounted = SflpDecoder::new(mount);
         let mut original = SflpDecoder::default();
         let mut block = [0u8; IMU_BLOCK_LEN];
@@ -403,14 +398,15 @@ mod tests {
             &[0.0; ACTION_LEN],
             &Command::default(),
         );
-        for (got, raw) in obs.as_slice()[..3].iter().zip([1000.0, -3000.0, -2000.0]) {
+        for (got, raw) in obs.as_slice()[..3].iter().zip([-3000.0, -1000.0, -2000.0]) {
             assert!((*got as f64 - raw * GYRO_RAD_PER_LSB).abs() < 1e-6);
         }
         for (got, expected) in obs.as_slice()[3..6].iter().zip([0.0, 0.0, -1.0]) {
             assert!((*got as f64 - expected).abs() < 1e-3);
         }
-        assert!(imu.quat[0] > 0.999);
-        assert!(imu.quat[1..].iter().all(|v| v.abs() < 1e-3));
+        // Game-rotation yaw is arbitrary; an upright quaternion has zero
+        // roll/pitch even when its initial heading is not zero.
+        assert!(imu.quat[1..3].iter().all(|v| v.abs() < 1e-3));
 
         let mut safety = Safety::new(FakeIo::default(), SafetyConfig::default());
         let mut sensors = Sensors {
