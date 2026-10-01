@@ -90,6 +90,10 @@ const POLL_GUARD: Duration = Duration::from_millis(20);
 const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
+// EMFILE remains immediately ready until a descriptor is freed. Retrying without a pause fills
+// the journal and consumes a core instead of letting disconnected subscribers release their FDs.
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
+
 /// Buses to try when none was named, in order.
 ///
 /// `/dev/i2c-pihat` is the udev symlink `setup-board.sh` installs, which follows
@@ -639,10 +643,14 @@ async fn serve(
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut accept_after = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
-            accepted = listener.accept() => match accepted {
+            accepted = async {
+                tokio::time::sleep_until(accept_after).await;
+                listener.accept().await
+            } => match accepted {
                 Ok((stream, _)) => {
                     let status = status.clone();
                     let imu_status = imu_status.clone();
@@ -654,7 +662,10 @@ async fn serve(
                         }
                     });
                 }
-                Err(e) => tracing::warn!(error = %e, "accept failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed; retrying in one second");
+                    accept_after = tokio::time::Instant::now() + ACCEPT_RETRY;
+                }
             },
             _ = term.recv() => {
                 tracing::warn!("SIGTERM; stopping");
@@ -709,13 +720,19 @@ async fn subscriber(
                 let response = proto::Response::ok(id, &status.result());
                 write_line(&mut write, &response).await?;
                 let mut frames = frames.subscribe();
-                return stream_tof(&mut write, &mut frames).await;
+                return tokio::select! {
+                    result = stream_tof(&mut write, &mut frames) => result,
+                    result = client_disconnected(&mut reader) => result,
+                };
             }
             Ok(proto::Call::HeadImuStream) => {
                 let response = proto::Response::ok(id, &imu_status.result());
                 write_line(&mut write, &response).await?;
                 let mut imu_frames = imu_frames.subscribe();
-                return stream_imu(&mut write, &mut imu_frames).await;
+                return tokio::select! {
+                    result = stream_imu(&mut write, &mut imu_frames) => result,
+                    result = client_disconnected(&mut reader) => result,
+                };
             }
             _ => {
                 let response = proto::Response::err(
@@ -729,6 +746,16 @@ async fn subscriber(
             }
         }
     }
+}
+
+/// A missing or disabled sensor never wakes the frame channel, so a failed write cannot reveal
+/// that the viewer went away. Watch the read half too, and discard further input: subscriptions
+/// carry one request followed only by server notifications.
+async fn client_disconnected(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+) -> Result<()> {
+    tokio::io::copy(reader, &mut tokio::io::sink()).await?;
+    Ok(())
 }
 
 /// Stream ToF frames as notifications until the socket closes or the consumer lags out. A lag is
@@ -890,9 +917,68 @@ mod tests {
             "a client that asked for depth must not hold an imu receiver"
         );
 
-        // `stream_tof` is parked on the channel, not on the socket, so it would sit there until a
-        // frame arrived. Nothing here sends one, and the counts have already been taken.
-        served.abort();
+        drop(reader);
+        drop(write);
+        tokio::time::timeout(Duration::from_secs(1), served)
+            .await
+            .expect("a disconnected subscriber must not wait for a sensor frame")
+            .unwrap();
+        assert_eq!(frames.receiver_count(), 0);
+        assert_eq!(imu_frames.receiver_count(), 0);
+    }
+
+    /// An absent or disabled sensor produces no frames. A viewer that retries its subscription
+    /// must not leave a socket and task behind on each reconnect; otherwise the daemon exhausts
+    /// its file descriptors and turns every accept into a warning.
+    #[tokio::test]
+    async fn reconnecting_without_sensor_frames_releases_each_subscriber() {
+        let (frames, _) = tokio::sync::broadcast::channel::<proto::TofFrame>(4);
+        let (imu_frames, _) = tokio::sync::broadcast::channel::<proto::HeadImuFrame>(4);
+        let status = Arc::new(Status::new(15));
+        status.down("no ToF sensor fitted");
+        let imu_status = Arc::new(ImuStatus::new(25));
+        imu_status.off();
+
+        for call in [proto::Call::TofStream, proto::Call::HeadImuStream] {
+            for _ in 0..32 {
+                let (client, server) = UnixStream::pair().unwrap();
+                let served = {
+                    let (status, imu_status, frames, imu_frames) = (
+                        status.clone(),
+                        imu_status.clone(),
+                        frames.clone(),
+                        imu_frames.clone(),
+                    );
+                    tokio::spawn(async move {
+                        subscriber(server, &status, &frames, &imu_status, &imu_frames).await
+                    })
+                };
+                let (read, mut write) = client.into_split();
+                let mut reader = BufReader::new(read);
+                write_line(
+                    &mut write,
+                    &proto::Request::call(proto::Id::Number(1), &call),
+                )
+                .await
+                .unwrap();
+                let mut answer = String::new();
+                reader.read_line(&mut answer).await.unwrap();
+                let response: serde_json::Value = serde_json::from_str(&answer).unwrap();
+                assert_eq!(response["result"]["accepted"], true, "{answer}");
+                assert!(response["result"]["sensor"].is_null(), "{answer}");
+                assert!(!served.is_finished(), "a live client still owns its stream");
+
+                drop(reader);
+                drop(write);
+                tokio::time::timeout(Duration::from_secs(1), served)
+                    .await
+                    .expect("disconnect must release a stream even when no frames arrive")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(frames.receiver_count(), 0, "depth receiver leaked");
+                assert_eq!(imu_frames.receiver_count(), 0, "IMU receiver leaked");
+            }
+        }
     }
 
     #[test]
