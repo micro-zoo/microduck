@@ -1130,6 +1130,5 @@ accelerometer can therefore remain suspended. The INT1 session explicitly sets t
 0x7c/0x7d normal/enabled state before constructing that driver, and restores the original state
 when it exits. This corrects interrupt initialisation without changing the old polling branch.
 
-The [hardware validation record](../project/head-imu-int1-validation.md) reports the direct
-100 Hz comparison and CPU tradeoff. It distinguishes interval stability from physical sampling
-accuracy; consumers retaining `t_ns` do not gain the new event-time semantics.
+Consumers retaining `t_ns` still use the host completion time. Use
+`timing.accel_data_ready_ns` for the kernel-observed acceleration-ready event.
