@@ -1082,53 +1082,33 @@ Cost: three small structs per published tick, only while someone is subscribed; 
 
 ### Head-IMU acquisition timing (API v38)
 
-The existing `head_imu.frame` fields, units and sensor axes are unchanged. `t_ns` remains the
-host read/fusion-completion timestamp, including a temperature read when one was needed.
-Polling frames omit `timing`; an older frame with no such member must not be treated as having
-a hardware timestamp. The gyro/accel Madgwick filter is still used, with beta 0.1 and no axis
-or bias calibration introduced by acquisition.
+`head_imu.frame` keeps its existing fields, units, sensor axes and Madgwick filter (beta 0.1).
+`t_ns` remains host read/fusion completion, including occasional temperature reads. Polling
+frames omit the optional `timing` member; old frames decode without an invented event time.
 
-With both `tofd --imu-int1-gpiochip PATH --imu-int1-line OFFSET`, acquisition is triggered by
-BMI088 acceleration data-ready on INT1 rather than a sleeping polling loop. The GPIO v2 request
-uses the kernel's `CLOCK_MONOTONIC` edge timestamp, not the user's thread wakeup time. This mode
-accepts `--imu-hz 25`, `50`, `100` or `200`, setting the accelerometer ODR accordingly; at 25/50
-Hz the gyro keeps its 100 Hz rate. The default stays 100 Hz. These are ODR choices, not the
-low-pass cutoff frequencies. Without the two options the existing polling path is used.
-The head IMU must still be explicitly enabled by `[head_imu] enabled = true` or `--imu`.
+The head IMU is still off unless `[head_imu] enabled = true` or `--imu`. With both
+`--imu-int1-gpiochip PATH --imu-int1-line OFFSET`, `tofd` uses the stock HAT's acc INT1 signal
+(R25 to header pin 15) for GPIO v2 rising-edge acquisition. Choose chip/offset from this board's
+`gpioinfo`, not physical-pin numbers. Linux 5.10+ and GPIO access are required; a systemd drop-in
+with `SupplementaryGroups=gpio` extends the existing `i2c robot` groups when the device is owned
+by `gpio`. Without the two options, the original polling path remains.
 
-`timing` carries `accel_data_ready_ns`, the kernel `accel_event_seq`, and the host
-`read_started_ns`/`read_finished_ns` interval for the two I²C reads. An old queued edge, a read
-longer than the configured sample period, or a new edge during the read cannot date the data
-registers reliably: those measurements are discarded before advancing the fusion filter.
-The GPIO event sequence makes discarded/overwritten samples visible even though `seq` keeps
-its existing meaning of published samples. GPIO failure or a missing edge reports unavailable
-and retries with backoff; it never silently substitutes polling for interrupt timing. Sensor
-register settings are restored before the GPIO request is released on cooperative shutdown.
-INT1 maps only DRDY: prior FIFO-full/watermark mapping on that pin is cleared for the session,
-while INT2 routing is preserved and the original register value is restored on exit.
+The default stays 100 Hz. INT1 mode accepts 25/50/100/200 Hz and sets acc ODR accordingly;
+gyro ODR is 100 Hz at the two lower rates and otherwise matches. ODR is not filter cutoff.
 
-**This is a data-ready timestamp, not a calibrated physical sampling centre.** C1 connects only
-the accelerometer INT1, through R25 to physical header pin 15. Gyro INT3/INT4 are not wired, so
-no gyro acquisition timestamp is inferred from that edge. Sensor filter/group delay and kernel
-GPIO interrupt latency are not measured by the software checks. Camera synchronisation remains
-the separate media-clock work in `remote-webrtc.md` §11.
+`timing` contains the kernel `CLOCK_MONOTONIC` edge time `accel_data_ready_ns`, the per-request
+`accel_event_seq`, and `read_started_ns`/`read_finished_ns` for the sequential I²C reads. Stale,
+duplicate, overlong or observed overlapping reads are discarded before fusion advances. Sequence
+gaps expose skipped events while `seq` continues to count published frames. GPIO failure or
+silence reports unavailable and retries with backoff; it does not substitute polling timestamps.
 
-This mode uses the stock HAT connection without PCB changes, jumper wires or another host GPIO.
-One acceleration-ready event triggers both reads; it does not establish simultaneous six-axis
-sampling. Bosch sensor-to-sensor Data Sync requires an additional physical connection and is
-outside this integration.
+Initialization refuses a kernel-bound BMI088, verifies chip IDs, maps DRDY alone onto INT1
+and preserves INT2 routing. It saves/restores modified registers before releasing GPIO on
+cooperative exit or initialization failure. The pinned driver's `ACC_PWR_CONF` address is 0x7d
+(the power-control register); INT1 initialization explicitly uses 0x7c/0x7d to wake a cold acc.
 
-Choose the GPIO chip and offset from this board's `gpioinfo`; they are not physical-pin numbers.
-On the measured Radxa Zero 3W kernel, `PIN_15` was `/dev/gpiochip3` line 8. Do not hard-code that
-for another board. GPIO v2 needs Linux 5.10+ and the kernel/device permissions; a kernel-bound
-BMI088 must instead use its existing IIO path. The standard service keeps its existing access:
-opting in on a device owned by `gpio` also needs a systemd drop-in with
-`SupplementaryGroups=gpio`, which extends its existing `i2c robot` groups.
-
-The pinned BMI088 dependency writes `ACC_PWR_CONF` to 0x7d, the `ACC_PWR_CTRL` address; a cold
-accelerometer can therefore remain suspended. The INT1 session explicitly sets the documented
-0x7c/0x7d normal/enabled state before constructing that driver, and restores the original state
-when it exits. This corrects interrupt initialisation without changing the old polling branch.
-
-Consumers retaining `t_ns` still use the host completion time. Use
-`timing.accel_data_ready_ns` for the kernel-observed acceleration-ready event.
+Use `accel_data_ready_ns` for acc-ready event time. This is not a calibrated physical sampling
+centre: sensor group delay and GPIO capture latency remain unmeasured. Gyro INT3/INT4 are
+unconnected, so no gyro timestamp or simultaneous six-axis sampling is inferred. Sensor-to-sensor
+Data Sync needs extra wiring and is outside this stock-HAT integration. Camera alignment remains
+separate (`remote-webrtc.md` §11).

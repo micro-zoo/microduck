@@ -42,7 +42,6 @@ use crate::BUS_CANDIDATES;
 #[path = "imu_interrupt.rs"]
 mod interrupt;
 
-#[derive(Clone)]
 pub struct Int1Line {
     pub chip: PathBuf,
     pub line: u32,

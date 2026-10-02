@@ -1,9 +1,5 @@
-//! Associate a register read with a data-ready edge before updating the fusion state.
-//!
-//! BMI088 data registers are overwritten by the next sample. A queued GPIO edge cannot be
-//! attached to whatever data happens to be read later; a read which overlaps the next edge is
-//! discarded as well. The event clock is the kernel's CLOCK_MONOTONIC, not the time the reader
-//! thread wakes up. Physical filter delay and interrupt latency are outside this check.
+//! Host checks for stale/overlapping register reads. A rejected read must not advance
+//! fusion time; physical sensor delay and GPIO capture latency are not calibrated here.
 
 use duck_ipc_proto::HeadImuTiming;
 

@@ -4828,18 +4828,13 @@ pub struct HeadImuFrame {
     pub quat: [f32; 4],
     /// Chip temperature, °C.
     pub temp_c: f32,
-    /// Present only when INT1 acquisition passes the host association checks. The accelerometer's data-ready
-    /// event is distinct from both the host read-completion time above and the gyro's unknown
-    /// hardware sample time. Absence means no interrupt timing was established.
+    /// Optional INT1 event/read timing. Polling frames omit it; event time is acc-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<HeadImuTiming>,
 }
 
-/// Acquisition times on the same `CLOCK_MONOTONIC` axis as `HeadImuFrame::t_ns`.
-///
-/// INT1 on the C1 HAT is the accelerometer output, not the gyroscope's data-ready pin.
-/// These fields report the kernel-observed data-ready event and the host read window, not
-/// a sampling-centre calibration. GPIO latency and sensor filter delay still need measurement.
+/// Kernel-observed acc INT1 event and host read window, on `HeadImuFrame::t_ns`'s
+/// `CLOCK_MONOTONIC` axis. Neither calibrated sampling-centre time nor gyro sample time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadImuTiming {
     pub accel_data_ready_ns: u64,

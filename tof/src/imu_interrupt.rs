@@ -1,9 +1,5 @@
-//! Optional BMI088 INT1 acquisition using the kernel GPIO v2 event clock.
-//!
-//! INT1 on the C1 HAT is acceleration data-ready only. Gyro registers are read beside it for
-//! the existing fusion/output, but no gyro hardware timestamp is invented. Queued or raced
-//! reads are rejected before they can change the filter. The ordinary polling path stays in
-//! `imu.rs` and emits no `timing` object.
+//! Linux GPIO v2 INT1 acquisition. Validate event/read timing before advancing fusion;
+//! the ordinary polling path remains in `imu.rs`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +12,7 @@ use bmi088::{AccBandwidth, Bmi088, Config, GyroBandwidth};
 use duck_ipc_proto as proto;
 use embedded_hal::i2c::I2c;
 use gpiocdev::Request;
-use gpiocdev::line::{EdgeDetection, EdgeEvent, EventClock};
+use gpiocdev::line::{EdgeDetection, EventClock};
 use linux_embedded_hal::I2cdev;
 use nalgebra::Vector3;
 
@@ -219,7 +215,11 @@ impl Session {
             if !self.events.has_edge_event()? {
                 return Ok(first.zip(last));
             }
-            let event = data_ready(self.events.read_edge_event()?);
+            let edge = self.events.read_edge_event()?;
+            let event = DataReady {
+                t_ns: edge.timestamp_ns,
+                seq: edge.line_seqno,
+            };
             if first.is_none() {
                 first = Some(event);
             }
@@ -234,13 +234,6 @@ impl Session {
             return Ok(None);
         }
         Ok(self.drain()?.map(|(_, last)| last).or(pending))
-    }
-}
-
-fn data_ready(event: EdgeEvent) -> DataReady {
-    DataReady {
-        t_ns: event.timestamp_ns,
-        seq: event.line_seqno,
     }
 }
 
@@ -282,7 +275,6 @@ fn capture(
     let mut filter = Madgwick::new(1.0 / f64::from(hz), BETA);
     let mut last_edge = Instant::now();
     let mut temperature = 0.0;
-    let mut rejected = 0u64;
     while !shutdown.load(Ordering::Acquire) {
         let Some(event) = session.next()? else {
             if last_edge.elapsed() > SILENCE_LIMIT {
@@ -293,7 +285,6 @@ fn capture(
         last_edge = Instant::now();
         let read_started_ns = proto::clock::monotonic_ns();
         if !clock.is_fresh(event, read_started_ns) {
-            rejected += 1;
             continue;
         }
         let (ax, ay, az) = session
@@ -310,7 +301,6 @@ fn capture(
         let next_edge = pending.map(|(first, _)| first);
         let Some((timing, dt)) = clock.finish(event, read_started_ns, read_finished_ns, next_edge)
         else {
-            rejected += 1;
             continue;
         };
         // Same Madgwick state/gain and units as Bmi088Ahrs::update_all, but only accepted
@@ -341,7 +331,7 @@ fn capture(
             timing: Some(timing),
         });
     }
-    tracing::info!(rejected, "head IMU interrupt acquisition stopped");
+    tracing::info!("head IMU interrupt acquisition stopped");
     Ok(())
 }
 
