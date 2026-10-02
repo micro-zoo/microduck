@@ -184,6 +184,7 @@ pub fn imu_loop(
                         accel,
                         quat,
                         temp_c,
+                        timing: None,
                     });
                 }
                 Err(e) => {
