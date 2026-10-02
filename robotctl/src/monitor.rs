@@ -3589,6 +3589,7 @@ mod tests {
                 max_c: 41.0,
                 mean_c: 35.0,
                 temps_c: vec![35.0; 15],
+                torque_enabled: Some(vec![false; 15]),
             }),
             cpu_temp_c: Some(52.0),
             control_loop: Some(proto::LoopHealth {
@@ -3677,7 +3678,7 @@ mod tests {
         // The servo temperatures are trimmed off this row to make room, which is the right
         // trade at this width: a capped clock explains a robot that is moving badly, and 41 °C
         // on a knee does not. Asserted on the row rather than the frame — every joint is named
-        // again in the table below, so a search of the whole screen would find `left_knee`
+        // again in the table below, so a search of the whole screen would find `left_knee`.
         // whatever this row did.
         let power = screen
             .lines()

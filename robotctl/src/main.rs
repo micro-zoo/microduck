@@ -332,9 +332,9 @@ enum Namespace {
     /// The full state of this robot: hardware and software.
     ///
     /// Hardware from `robotd` — the verdict the update system's health gate turns on, the loop
-    /// and bus numbers behind it, the IMU, the battery and the motor temperatures. Software
-    /// from `updaterd` — what is running, what is installed, what is pinned, and how the last
-    /// update went.
+    /// and bus numbers behind it, the IMU, battery, motor temperatures and actual Torque Enable
+    /// register readback. Software from `updaterd` — what is running, what is installed, what is
+    /// pinned, and how the last update went.
     ///
     /// One command because that is how the question arrives. "What is wrong with this robot"
     /// does not divide into hardware and software until after it is answered, and a robot that
@@ -1936,6 +1936,33 @@ fn render_health(report: &HealthReport) -> String {
                     "  {:<9} {:.0} °C max ({}) · {:.0} °C mean",
                     "motors", m.max_c, m.hottest, m.mean_c
                 );
+            }
+            let torque_readback = health
+                .motors
+                .as_ref()
+                .and_then(|motors| motors.torque_enabled.as_ref());
+            match torque_readback {
+                Some(states) if states.len() == proto::JOINT_NAMES.len() => {
+                    let enabled = states.iter().filter(|&&state| state).count();
+                    let _ = writeln!(
+                        out,
+                        "  {:<9} {enabled}/{} enabled (register readback)",
+                        "torque",
+                        states.len()
+                    );
+                }
+                Some(states) => {
+                    let _ = writeln!(
+                        out,
+                        "  {:<9} incomplete readback ({}/{} joints)",
+                        "torque",
+                        states.len(),
+                        proto::JOINT_NAMES.len()
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "  {:<9} unknown (not read back)", "torque");
+                }
             }
             // Its own line, next to the motors rather than merged with them: hot servos and a
             // hot board are different faults with different fixes, and a reader scanning for
@@ -6727,6 +6754,7 @@ mod tests {
                     max_c: 48.0,
                     mean_c: 36.0,
                     temps_c: vec![36.0; 15],
+                    torque_enabled: Some(vec![false; 15]),
                 }),
                 cpu_temp_c: Some(52.0),
                 control_loop: Some(proto::LoopHealth {
@@ -6752,6 +6780,7 @@ mod tests {
         assert!(out.contains("2490 ticks"), "{out}");
         assert!(out.contains("7.62 V (64%)"), "{out}");
         assert!(out.contains("48 °C max (left_knee)"), "{out}");
+        assert!(out.contains("0/15 enabled (register readback)"), "{out}");
         // Board and servos on separate lines: they fail differently.
         assert!(out.contains("cpu       52 °C"), "{out}");
         // Nothing holding the clock down, so the line says nothing about the clock.
