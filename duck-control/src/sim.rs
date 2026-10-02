@@ -322,6 +322,8 @@ impl RobotIo for RemoteIo {
         Ok(SlowSensors {
             volts: frame.volts,
             temps_c: frame.temps_c,
+            // MuJoCo has no Dynamixel Torque Enable register to read back.
+            torque_enabled: None,
         })
     }
 }

@@ -559,6 +559,9 @@ struct RobotState {
     motor_mean_c: AtomicU64,
     /// The same slow bus sample as max/mean, kept together for read-only clients.
     motor_temps_c: ArcSwapOption<[f64; duck_control::model::NUM_JOINTS]>,
+    /// Actual Torque Enable register bits from the same slow-sensor poll, or `None` when the
+    /// backend could not return a complete readback. This is not the last requested state.
+    motor_torque_enabled: ArcSwapOption<[bool; duck_control::model::NUM_JOINTS]>,
     /// Index into [`duck_control::JOINT_NAMES`] of the hottest joint.
     motor_hottest: AtomicU32,
     /// Hottest board thermal zone, as `f64::to_bits`. Zero means no reading — off Linux, or a
@@ -713,6 +716,7 @@ impl RobotState {
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
             motor_temps_c: ArcSwapOption::empty(),
+            motor_torque_enabled: ArcSwapOption::empty(),
             motor_hottest: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
             cpu_throttle: ArcSwapOption::empty(),
@@ -899,6 +903,10 @@ impl RobotState {
                 .motor_temps_c
                 .load_full()
                 .map_or_else(Vec::new, |t| t.to_vec()),
+            torque_enabled: self
+                .motor_torque_enabled
+                .load_full()
+                .map(|states| states.to_vec()),
         })
     }
 
@@ -3597,9 +3605,9 @@ fn limit_name(limit: duck_control::safety::Limit) -> &'static str {
 /// Sample and publish everything that does not need sampling every tick, once per
 /// [`RATE_WINDOW`].
 ///
-/// Not part of the tick. The voltage/temperature registers are a second bus transaction —
-/// about a millisecond — which is nothing once a second and would be 5% of the budget at
-/// 50 Hz. A second is also faster than a pack can drain or a servo can heat up.
+/// Not part of the tick. Voltage/temperature and Torque Enable readback use two additional
+/// bus transactions — about two milliseconds total — once a second. That is negligible at
+/// this rate, and keeps the readback out of the 50 Hz control path.
 ///
 /// Called from the loop thread because that thread owns the IO, and nothing else may touch
 /// the bus: a transaction issued from the IPC side would interleave bytes with a tick and
@@ -3656,11 +3664,18 @@ fn publish_slow_sensors<T: RobotIo>(io: &mut Safety<T>, state: &RobotState) {
             state
                 .motor_temps_c
                 .store(Some(std::sync::Arc::new(slow.temps_c)));
+            state
+                .motor_torque_enabled
+                .store(slow.torque_enabled.map(std::sync::Arc::new));
         }
-        // Keep the last sample. A single failed transaction is ordinary on a serial bus, and
-        // dropping to "unknown" over one would make the reported battery flicker. A bus that
-        // is really gone already shows up in the verdict and in `bus.consecutive_errors`.
-        Err(e) => tracing::debug!(error = %e, "slow-sensor read failed; keeping the last sample"),
+        // Keep the last battery and thermal samples. A single failed transaction is ordinary
+        // on a serial bus, and dropping those readings to "unknown" over one would make them
+        // flicker. Torque is different: callers use its *current register state* to confirm a
+        // safety boundary, so a missed slow poll clears it rather than serving stale bits.
+        Err(e) => {
+            state.motor_torque_enabled.store(None);
+            tracing::debug!(error = %e, "slow-sensor read failed; keeping battery and thermals, clearing torque readback");
+        }
     }
 }
 
@@ -7304,6 +7319,18 @@ mod tests {
         temperatures[knee] = 48.0;
         s.motor_temps_c
             .store(Some(std::sync::Arc::new(temperatures)));
+        assert!(
+            s.health()
+                .motors
+                .expect("thermals")
+                .torque_enabled
+                .is_none(),
+            "missing readback is unknown, not all torque disabled"
+        );
+        let mut torque_enabled = [false; duck_control::model::NUM_JOINTS];
+        torque_enabled[0] = true;
+        s.motor_torque_enabled
+            .store(Some(std::sync::Arc::new(torque_enabled)));
 
         let motors = s.health().motors.expect("thermals");
         assert_eq!(motors.hottest, "left_knee");
@@ -7311,6 +7338,7 @@ mod tests {
         assert_eq!(motors.mean_c, 36.0);
         assert_eq!(motors.temps_c[knee], 48.0);
         assert_eq!(motors.temps_c.len(), duck_control::model::NUM_JOINTS);
+        assert_eq!(motors.torque_enabled, Some(torque_enabled.to_vec()));
 
         // A servo cooking must not change the verdict, for the same reason a flat pack must
         // not: it is a fact about the robot, not evidence about the release.

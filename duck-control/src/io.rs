@@ -74,11 +74,13 @@ pub enum IoError {
 
 pub type Result<T> = std::result::Result<T, IoError>;
 
-/// What the servos report about their own supply and case, rather than their motion.
+/// What the servos report about their own supply, case and torque-enable registers, rather than
+/// their motion.
 ///
 /// Sampled about once a second rather than every tick — see [`RobotIo::slow_sensors`]. A pack
-/// does not drain and a motor does not heat up in 20 ms, so the tick would be paying for a
-/// second bus transaction to learn nothing new.
+/// does not drain and a motor does not heat up in 20 ms, so the tick would be paying for extra
+/// bus transactions to learn nothing new. `torque_enabled` is absent when a backend cannot read
+/// a physical register (the simulator), or when a complete bus readback was not available.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SlowSensors {
     /// Mean supply voltage across the servos, in volts — the only battery measurement the
@@ -90,6 +92,9 @@ pub struct SlowSensors {
     /// the load — a knee holding a squat runs far hotter than the mouth, and a mean over
     /// fifteen servos hides exactly the servo about to latch its overheat shutdown.
     pub temps_c: [f64; NUM_JOINTS],
+    /// Actual Torque Enable register state, indexed as [`crate::model::JOINT_NAMES`]. This is
+    /// deliberately distinct from `set_torque`'s last requested value.
+    pub torque_enabled: Option<[bool; NUM_JOINTS]>,
 }
 
 /// IMU reads that came back byte-for-byte identical to their predecessor.
@@ -169,12 +174,11 @@ pub trait RobotIo {
     /// registers, the gains among them, at their EEPROM defaults; the caller owns putting them back.
     fn reboot(&mut self, id: u8) -> Result<()>;
 
-    /// Supply voltage and case temperatures, in one extra transaction.
+    /// Supply voltage and case temperatures, plus actual Torque Enable register readback.
     ///
-    /// Not part of [`Sensors`], and not on the tick's critical path: these registers sit at
-    /// 144–146, past the end of the contiguous block [`Self::read`] fetches, so reaching them
-    /// costs a transaction of its own — about a millisecond. Negligible once a second, 5% of
-    /// the budget at 50 Hz.
+    /// Not part of [`Sensors`], and not on the tick's critical path: voltage/temperature sit at
+    /// 144–146, past the end of the contiguous block [`Self::read`] fetches, and torque enable
+    /// is at register 64. They cost two extra transactions, once a second.
     fn slow_sensors(&mut self) -> Result<SlowSensors>;
 
     /// Diagnostics the bus keeps about itself. Default to "nothing to report" so a fake or a
@@ -255,6 +259,7 @@ impl FakeIo {
             slow: Some(SlowSensors {
                 volts: 7.4,
                 temps_c: [32.0; NUM_JOINTS],
+                torque_enabled: None,
             }),
             track_targets: true,
             velocity_stated: false,

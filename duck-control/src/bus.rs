@@ -10,9 +10,9 @@
 //! `bus.fast_sync_read` in `robotd.toml` turns it off for a robot whose devices do not
 //! implement the instruction. See [`open_controller`].
 //!
-//! Battery and thermals are the one thing that does not fit that shape: they live at registers
-//! outside the block the tick fetches, so [`RobotIo::slow_sensors`] is a transaction of its
-//! own, meant to be called about once a second rather than every tick.
+//! Battery, thermals and torque-enable readback do not fit that shape: they live at registers
+//! outside the block the tick fetches, so [`RobotIo::slow_sensors`] reads them in two extra
+//! transactions about once a second rather than every tick.
 //!
 //! Written against `rustypot`, but the *numbers* — conversion factors and the EEPROM
 //! registers asserted at startup — come from `microduck_runtime`, where they were arrived
@@ -50,6 +50,32 @@ const RAD_PER_SEC_PER_COUNT: f64 = 0.229 * (2.0 * PI / 60.0);
 /// bus time than the two transactions do.
 const SLOW_READ_ADDR: u8 = 144;
 const SLOW_READ_LEN: u8 = 3;
+
+/// Dynamixel X-series Torque Enable (RAM), read only for `robot.health` diagnostics.
+const TORQUE_ENABLE_ADDR: u8 = 64;
+const TORQUE_ENABLE_LEN: u8 = 1;
+
+/// Decode a complete broadcast Torque Enable readback in joint-id order.
+///
+/// An absent, short or out-of-domain byte is unknown; none of those cases means that torque is
+/// off. Keeping this pure makes the distinction testable without a serial bus.
+fn torque_enable_readback(blocks: &[Vec<u8>]) -> Option<[bool; NUM_JOINTS]> {
+    if blocks.len() != NUM_JOINTS {
+        return None;
+    }
+    let mut states = [false; NUM_JOINTS];
+    for (joint, block) in blocks.iter().enumerate() {
+        if block.len() != TORQUE_ENABLE_LEN as usize {
+            return None;
+        }
+        states[joint] = match block[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+    }
+    Some(states)
+}
 
 /// `present_input_voltage` counts 0.1 V each.
 const VOLTS_PER_COUNT: f64 = 0.1;
@@ -667,7 +693,7 @@ impl RobotIo for DynamixelIo {
         Ok(())
     }
 
-    /// Supply voltage and case temperatures, in one `sync_read` over registers 144–146.
+    /// Supply voltage and case temperatures, then Torque Enable readback at register 64.
     ///
     /// Voltage is averaged because all 15 servos sit on one pack: a single reading is the
     /// same measurement with more noise. Temperature is *not* averaged here — the caller gets
@@ -675,10 +701,11 @@ impl RobotIo for DynamixelIo {
     /// over fifteen hides it.
     ///
     /// Note that a silent servo does not produce a short answer: `rustypot`'s `sync_read`
-    /// waits for every id and fails the whole transaction if one does not reply. So this is
-    /// all-or-nothing, and the caller is expected to keep its previous sample rather than
-    /// treat one miss as news. The zero filter on voltage guards a device that answers with a
-    /// nonsense value, which must not be averaged in as if the pack were half flat.
+    /// waits for every id and fails the whole transaction if one does not reply. Voltage and
+    /// temperature therefore remain all-or-nothing. Torque Enable is a separate diagnostic
+    /// read: a miss makes that field unknown without hiding valid thermal and battery data.
+    /// The zero filter on voltage guards a device that answers with a nonsense value, which
+    /// must not be averaged in as if the pack were half flat.
     fn slow_sensors(&mut self) -> Result<SlowSensors> {
         let blocks = self
             .controller
@@ -719,9 +746,25 @@ impl RobotIo for DynamixelIo {
                 got: 0,
             });
         }
+
+        // Torque Enable is volatile device state, not something the last write proves. Read
+        // it while this loop owns the bus, away from the 50 Hz path. A failed read stays
+        // unknown rather than becoming fifteen false bits or discarding good thermals.
+        let torque_enabled = match self.controller.sync_read_raw_data(
+            &JOINT_IDS,
+            TORQUE_ENABLE_ADDR,
+            TORQUE_ENABLE_LEN,
+        ) {
+            Ok(blocks) => torque_enable_readback(&blocks),
+            Err(error) => {
+                tracing::debug!(error = %error, "torque-enable readback failed");
+                None
+            }
+        };
         Ok(SlowSensors {
             volts: volts.iter().sum::<f64>() / volts.len() as f64,
             temps_c,
+            torque_enabled,
         })
     }
 
@@ -737,6 +780,30 @@ impl RobotIo for DynamixelIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torque_enable_readback_preserves_joint_order_and_off_bits() {
+        let blocks = (0..NUM_JOINTS)
+            .map(|joint| vec![(joint % 2) as u8])
+            .collect::<Vec<_>>();
+        let states = torque_enable_readback(&blocks).expect("one byte for every joint");
+
+        for (joint, enabled) in states.iter().enumerate() {
+            assert_eq!(*enabled, joint % 2 == 1, "joint index {joint}");
+        }
+    }
+
+    #[test]
+    fn incomplete_or_invalid_torque_enable_readback_is_unknown() {
+        let mut blocks = vec![vec![0]; NUM_JOINTS];
+        assert!(torque_enable_readback(&blocks[..NUM_JOINTS - 1]).is_none());
+
+        blocks[3].clear();
+        assert!(torque_enable_readback(&blocks).is_none());
+
+        blocks[3] = vec![2];
+        assert!(torque_enable_readback(&blocks).is_none());
+    }
 
     /// One silent servo is the only case a swap can be inferred from. With two silent there is
     /// no telling which the fresh servo replaces, and guessing would flash a leg joint as a neck

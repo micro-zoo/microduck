@@ -424,7 +424,9 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// starts, including the one right after the update that brought v35 in. Both warned. The attempt
 /// tells them apart, and its error is what the warning was pointing at the journal for.
 /// v39 adds the complete once-per-second servo temperature sample to `robot.health`.
-pub const API_VERSION: u32 = 39;
+/// v40 adds the once-per-second readback of each servo's Torque Enable register. Zero current
+/// and a command to relax do not prove the volatile register actually changed.
+pub const API_VERSION: u32 = 40;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -3490,8 +3492,8 @@ pub struct HealthResult {
     /// it as an empty battery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery: Option<Battery>,
-    /// Hottest servo, when temperatures have been read. Same rule as the battery: reported,
-    /// never judged.
+    /// Servo temperatures and, when available, actual Torque Enable register readback. Same
+    /// rule as the battery: reported, never judged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motors: Option<MotorThermal>,
     /// Board temperature in °C — the hottest of the SoC's thermal zones.
@@ -3662,11 +3664,11 @@ impl CpuThrottle {
     }
 }
 
-/// Servo case temperature, reduced to the part worth acting on.
+/// Servo case temperatures and Torque Enable register readback.
 ///
-/// The hottest joint rather than a mean over fifteen: a knee holding a squat runs far hotter
-/// than the mouth, and averaging hides the one servo approaching the overheat shutdown its
-/// error mask latches on.
+/// The hottest joint is named because a knee holding a squat can run far hotter than the
+/// mouth, and averaging hides the one servo approaching its overheat shutdown. Torque state is
+/// kept per joint because a requested write or a zero current reading is not register readback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MotorThermal {
     /// Name of the hottest joint, as [`JOINT_NAMES`] spells it.
@@ -3677,6 +3679,13 @@ pub struct MotorThermal {
     /// Empty before the first sample or from a daemon predating v39.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub temps_c: Vec<f64>,
+    /// Actual Torque Enable register readback in [`JOINT_NAMES`] order. `true` means the servo
+    /// reports torque enabled; `false` means it reports disabled. Absent when the bus has not
+    /// returned a complete readback, or from a backend without physical servos. This is a
+    /// measurement, not the last state `robotd` asked the servos to take, and it never changes
+    /// the health verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torque_enabled: Option<Vec<bool>>,
 }
 
 /// Motor-bus voltage, and what fraction of a pack that is.
@@ -6470,6 +6479,35 @@ mod tests {
             serde_json::from_str::<HealthResult>(&line).unwrap(),
             measured
         );
+    }
+
+    /// Torque Enable is a register readback, and a health reply from a pre-v40 daemon must
+    /// keep it unknown rather than inventing fifteen disabled motors.
+    #[test]
+    fn torque_enable_readback_round_trips_and_old_replies_stay_unknown() {
+        let measured = HealthResult {
+            healthy: true,
+            motors: Some(MotorThermal {
+                hottest: "left_knee".into(),
+                max_c: 40.0,
+                mean_c: 32.0,
+                temps_c: vec![32.0; 2],
+                torque_enabled: Some(vec![false, true]),
+            }),
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&measured).unwrap();
+        assert!(line.contains(r#""torque_enabled":[false,true]"#), "{line}");
+        assert_eq!(
+            serde_json::from_str::<HealthResult>(&line).unwrap(),
+            measured
+        );
+
+        let legacy: HealthResult = serde_json::from_str(
+            r#"{"healthy":true,"motors":{"hottest":"left_knee","max_c":40.0,"mean_c":32.0,"temps_c":[32.0]}}"#,
+        )
+        .unwrap();
+        assert!(legacy.motors.unwrap().torque_enabled.is_none());
     }
 
     /// A local build must say so, rather than looking like a release whose revision was

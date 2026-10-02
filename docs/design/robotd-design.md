@@ -833,7 +833,7 @@ robot.
 
 | method | answer |
 |---|---|
-| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo and board temperature, and the board's clock ceiling |
+| `robot.health` | **the loop is meeting its deadline** — from achieved rate and missed-deadline count — plus a description of the robot the verdict never consults: loop, bus, IMU, battery, servo temperature and Torque Enable register readback, board temperature, and the board's clock ceiling |
 | `robot.safeToRestart` | false while the policy is enabled and the robot is moving |
 | `robot.modelApi` | constant |
 | `robot.remoteSessionActive` | `false` — `mediad` owns the real answer |
@@ -841,6 +841,15 @@ robot.
 Health is computed by the IPC side from atomics the loop publishes — a last-tick timestamp plus
 counters — never by asking the loop. That is what lets a *wedged* loop report itself unhealthy
 instead of hanging the caller.
+
+**Torque Enable is read back, not inferred.** Once per second, the control thread reads register
+64 for all fifteen servos and publishes `motors.torque_enabled` in `JOINT_NAMES` order. An absent
+array means the backend or the read did not provide a complete answer; fifteen `false` values mean
+the servos themselves reported torque disabled. Current, `robotd`'s last torque request, and a
+`held` policy label do not establish that register state. The extra sync read stays off the 50 Hz
+path and does not affect the health verdict.
+This is API v40: install the matching `robotd` and `robotctl` to collect and display it; older
+clients continue to read the rest of health, but cannot show this field.
 
 A loop running at 60% of target is alive, answers every request, and is badly broken. Making that
 distinction real is why the control loop was built before anything that walks (§5.1).
