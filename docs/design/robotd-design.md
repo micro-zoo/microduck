@@ -1108,11 +1108,65 @@ projected gravity, and where the camera and the ToF sensor are. All three are ad
   `mono_ns` and `real_ns` at one instant, so RTP timestamps — which RTCP sender reports state in
   wall-clock — can be put on the same axis.
 - **`imu: {gyro, quat}`** is `ImuData` as the loop read it: the trunk IMU, 50 Hz, nothing above
-  it (`docs/design/robotd-design.md` §IMU). The head IMU on the prototype HAT is not read by
-  anything yet; when it is, it streams beside `tof.frame`, not here.
+  it (`docs/design/robotd-design.md` §IMU). The head BMI088 is a separate `head_imu.stream`
+  from `tofd`, with its own acquisition timing below; it is not an input to the walking policy.
 - **`frames: {camera, tof}`** are trunk-frame poses at this tick's *measured* head joints from
   `kinematics::head::HeadFk` — the same FK `robot.look` solves against — and **`robot.model`**
   answers the static geometry (trunk height, joint order, ToF beam directions, the poses at head
   zero). The kinematics stay in one crate; a client asks rather than transcribes.
 
 Cost: three small structs per published tick, only while someone is subscribed; the FK is ~50 ns.
+
+### Head-IMU acquisition timing (API v41)
+
+The existing `head_imu.frame` fields, units and sensor axes are unchanged. `t_ns` remains the
+host read/fusion-completion timestamp, including a temperature read when one was needed.
+Polling frames omit `timing`; an older frame with no such member must not be treated as having
+a hardware timestamp. The gyro/accel Madgwick filter is still used, with beta 0.1 and no axis
+or bias calibration introduced by acquisition.
+
+With both `tofd --imu-int1-gpiochip PATH --imu-int1-line OFFSET`, acquisition is triggered by
+BMI088 acceleration data-ready on INT1 rather than a sleeping polling loop. The GPIO v2 request
+uses the kernel's `CLOCK_MONOTONIC` edge timestamp, not the user's thread wakeup time. This mode
+accepts `--imu-hz 25`, `50`, `100` or `200`, setting the accelerometer ODR accordingly; at 25/50
+Hz the gyro keeps its 100 Hz rate. The default stays 100 Hz. These are ODR choices, not the
+low-pass cutoff frequencies. Without the two options the existing polling path is used.
+The head IMU must still be explicitly enabled by `[head_imu] enabled = true` or `--imu`.
+
+`timing` carries `accel_data_ready_ns`, the kernel `accel_event_seq`, and the host
+`read_started_ns`/`read_finished_ns` interval for the two I²C reads. An old queued edge, a read
+longer than the configured sample period, or a new edge during the read cannot date the data
+registers reliably: those measurements are discarded before advancing the fusion filter.
+The GPIO event sequence makes discarded/overwritten samples visible even though `seq` keeps
+its existing meaning of published samples. GPIO failure or a missing edge reports unavailable
+and retries with backoff; it never silently substitutes polling for interrupt timing. Sensor
+register settings are restored before the GPIO request is released on cooperative shutdown.
+INT1 maps only DRDY: prior FIFO-full/watermark mapping on that pin is cleared for the session,
+while INT2 routing is preserved and the original register value is restored on exit.
+
+**This is a data-ready timestamp, not a calibrated physical sampling centre.** C1 connects only
+the accelerometer INT1, through R25 to physical header pin 15. Gyro INT3/INT4 are not wired, so
+no gyro acquisition timestamp is inferred from that edge. Sensor filter/group delay and kernel
+GPIO interrupt latency are not measured by the software checks. Camera synchronisation remains
+the separate media-clock work in `remote-webrtc.md` §11.
+
+This mode uses the stock HAT connection without PCB changes, jumper wires or another host GPIO.
+One acceleration-ready event triggers both reads; it does not establish simultaneous six-axis
+sampling. Bosch sensor-to-sensor Data Sync requires an additional physical connection and is
+outside this integration.
+
+Choose the GPIO chip and offset from this board's `gpioinfo`; they are not physical-pin numbers.
+On the measured Radxa Zero 3W kernel, `PIN_15` was `/dev/gpiochip3` line 8. Do not hard-code that
+for another board. GPIO v2 needs Linux 5.10+ and the kernel/device permissions; a kernel-bound
+BMI088 must instead use its existing IIO path. The standard service keeps its existing access:
+opting in on a device owned by `gpio` also needs a systemd drop-in with
+`SupplementaryGroups=gpio`, which extends its existing `i2c robot` groups.
+
+The pinned BMI088 dependency writes `ACC_PWR_CONF` to 0x7d, the `ACC_PWR_CTRL` address; a cold
+accelerometer can therefore remain suspended. The INT1 session explicitly sets the documented
+0x7c/0x7d normal/enabled state before constructing that driver, and restores the original state
+when it exits. This corrects interrupt initialisation without changing the old polling branch.
+
+The [hardware validation record](../project/head-imu-int1-validation.md) reports the direct
+100 Hz comparison and CPU tradeoff. It distinguishes interval stability from physical sampling
+accuracy; consumers retaining `t_ns` do not gain the new event-time semantics.
