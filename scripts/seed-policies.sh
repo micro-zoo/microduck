@@ -114,7 +114,8 @@ number_of() {
     esac
 }
 manifest_files() {
-    sed -n 's/.*"file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | tr '\n' ' '
+    # An unreadable manifest is unavailable, not a failed daemon install.
+    sed -n 's/.*"file"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" || true
 }
 complete_set() {
     [ -f "$1/manifest.json" ] || return 1
@@ -138,14 +139,9 @@ if [ -n "$live" ]; then
     record="${POLICY_ROOT}/${live}/.source"
     have_repo="$(sed -n 's/^repo=//p' "$record" 2>/dev/null | head -n 1)"
     have_version="$(sed -n 's/^version=//p' "$record" 2>/dev/null | head -n 1)"
-    # An old fallback may have lost version= while still naming the official seed revision.
-    # Do not infer a version for a tool's directory or override an explicitly nonnumeric one.
-    if [ -z "$have_version" ]; then
-        case "$live" in
-            releases/seed-*) have_version="${live#releases/seed-}"
-                have_version="${have_version%-repair}" ;;
-        esac
-    fi
+    # Missing versions fall back to the seed name. Tool directories retain their releases/
+    # prefix, which number_of refuses; an explicit custom version still takes precedence.
+    have_version="${have_version:-${seed_version%-repair}}"
     have="$(number_of "$have_version")"
     want="$(number_of "$POLICY_VERSION")"
     if [ "$have_repo" != "$POLICY_REPO" ] || [ -z "$have" ] || [ -z "$want" ] \
@@ -184,7 +180,6 @@ else
     else
         echo "seed-policies: could not fetch the manifest for ${POLICY_VERSION}; will retry" >&2
     fi
-    rm -f "${staging}/manifest.json"
     POLICY_FILES=""
 fi
 if [ -z "$POLICY_FILES" ]; then

@@ -308,19 +308,17 @@ person could make, into a directory `robotd` shape-checks everything out of. The
 also what catches a truncated file, which is why no hashes are pinned here to go stale on every
 retrain.
 
-An incomplete official seed **at the same pin** is retried too. A manifest fetch can fail while
-the eight fallback files still download; recording `version=v5` alone must not make that a
-complete ten-file set. Seeds without a manifest, or missing a file it lists, retry into staging.
-Only seed destinations are repaired this way; a same-version set installed by another tool is
-left alone. A repair uses the other of `seed-<pin>` and `seed-<pin>-repair`, so the directory
-`current` points at survives until the complete replacement is linked.
+An incomplete official seed **at the same pin** retries into staging when its manifest or a
+listed file is missing or empty. Same-version sets installed by other tools are left alone.
+Repairs alternate between `seed-<pin>` and `seed-<pin>-repair`, preserving the live directory
+until the replacement is complete. `policy update` keeps the actual predecessor directory,
+so updating a repaired seed retains that complete set rather than its old fallback.
 
-HTTP 404 says the tag has no manifest; a timeout, HTTP 5xx or other curl failure says it could
-not be fetched. Either still permits a first install of the fallback for compatibility with
-older tags. Without a local manifest neither is assumed complete: subsequent runs make one
-bounded manifest request, and keep the installed fallback if it remains unavailable. A
-successful manifest followed by a failed policy download also leaves `current` alone and removes
-staging. This needs no extra completeness marker and repairs fallbacks installed by older seeders.
+HTTP 404 reports a missing manifest; timeout, HTTP 5xx and other curl failures report a fetch
+failure. Both permit a first fallback install for older tags. Without a local manifest later
+runs make one bounded manifest request, keeping the installed set until the manifest and every
+listed file arrive. Failed downloads remove staging and leave `current` alone. This also
+repairs fallbacks installed by older seeders, without an extra completeness marker.
 
 The no-downgrade rule followed a board proving the looser one wrong. It used to replace an older
 `seed-*` on the reasoning that a daemon update was still how a retrained gait reached a robot.

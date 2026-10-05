@@ -1189,12 +1189,9 @@ mod tests {
     fn fake_hub_manifest(dir: &std::path::Path, marker: &str) {
         fake_hub(dir, marker);
         let mut names = policies_robotd_expects();
-        names.extend([
-            "alpha_walking.onnx".to_owned(),
-            "alpha_stand.onnx".to_owned(),
-        ]);
-        for name in &names {
+        for name in ["alpha_walking.onnx", "alpha_stand.onnx"] {
             std::fs::write(dir.join(name), format!("{marker}-{name}")).unwrap();
+            names.push(name.to_owned());
         }
         let policies: Vec<_> = names
             .iter()
@@ -1642,7 +1639,7 @@ mod tests {
             .expect("the extraction line");
         let expression = sed
             .split_once('\'')
-            .and_then(|(_, rest)| rest.split_once('\''))
+            .and_then(|(_, rest)| rest.rsplit_once('\''))
             .map(|(expr, _)| expr.to_owned())
             .expect("a quoted sed expression");
 
