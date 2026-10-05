@@ -613,6 +613,31 @@ mod tests {
         );
     }
 
+    /// After repairing v5, updating to v6 must keep the complete predecessor rather than its
+    /// old fallback, even though both directories record version=v5.
+    #[test]
+    fn a_repaired_seed_is_kept_as_the_predecessor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in ["seed-v5", "seed-v5-repair", "seed-v6", "from-a-tool"] {
+            std::fs::create_dir_all(root.join("releases").join(name)).unwrap();
+        }
+        swap_current(root, "seed-v5-repair").unwrap();
+        let previous = std::fs::read_link(root.join("current")).unwrap();
+        swap_current(root, "seed-v6").unwrap();
+
+        prune(root, "seed-v6", previous.file_name().unwrap().to_str());
+
+        assert_eq!(
+            std::fs::read_link(root.join("current")).unwrap(),
+            Path::new("releases/seed-v6")
+        );
+        assert!(root.join("releases/seed-v6").exists());
+        assert!(root.join("releases/seed-v5-repair").exists());
+        assert!(!root.join("releases/seed-v5").exists());
+        assert!(root.join("releases/from-a-tool").exists());
+    }
+
     /// A first install has no predecessor, and must not read that as licence to keep nothing —
     /// nor to delete a set some other tool put there.
     #[test]
