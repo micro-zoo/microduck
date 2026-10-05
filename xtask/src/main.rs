@@ -1185,6 +1185,75 @@ mod tests {
         }
     }
 
+    /// The manifest can name policies beyond the daemon's fallback defaults, as v5 does.
+    fn fake_hub_manifest(dir: &std::path::Path, marker: &str) {
+        fake_hub(dir, marker);
+        let mut names = policies_robotd_expects();
+        names.extend([
+            "alpha_walking.onnx".to_owned(),
+            "alpha_stand.onnx".to_owned(),
+        ]);
+        for name in &names {
+            std::fs::write(dir.join(name), format!("{marker}-{name}")).unwrap();
+        }
+        let policies: Vec<_> = names
+            .iter()
+            .map(|name| serde_json::json!({ "file": name }))
+            .collect();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({ "policies": policies })).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A failed manifest fetch must not make the fallback satisfy the same-version fast path.
+    /// These are real curl downloads from a temporary file:// Hub, with tiny policy fixtures.
+    #[test]
+    fn a_failed_manifest_fetch_is_repaired_at_the_same_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_hub(&hub, "fallback");
+        seed(&root, "v5", Some(&hub));
+        assert!(root.join("current/velstand.onnx").exists());
+        assert!(!root.join("current/manifest.json").exists());
+        assert!(!root.join("current/alpha_walking.onnx").exists());
+
+        fake_hub_manifest(&hub, "complete");
+        let (_, content) = seed(&root, "v5", Some(&hub));
+        assert_eq!(content.as_deref(), Some("complete-velstand.onnx"));
+        assert!(root.join("current/manifest.json").exists());
+        assert!(root.join("current/alpha_walking.onnx").exists());
+        assert!(root.join("current/alpha_stand.onnx").exists());
+        assert!(!root.join("releases/.staging").exists());
+    }
+
+    /// Removing version= from an old fallback record used to hit the incomparable-version
+    /// fast path too. Its official seed directory still identifies the revision to repair.
+    #[test]
+    fn an_old_fallback_without_a_recorded_version_is_repaired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        let old = root.join("releases/seed-v5");
+        fake_hub(&old, "old");
+        std::fs::write(
+            old.join(".source"),
+            "repo=pollen-robotics/microduck-policies\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("releases/seed-v5", root.join("current")).unwrap();
+        fake_hub_manifest(&hub, "complete");
+
+        let (_, content) = seed(&root, "v5", Some(&hub));
+        assert_eq!(content.as_deref(), Some("complete-velstand.onnx"));
+        assert!(root.join("current/alpha_walking.onnx").exists());
+        let record = std::fs::read_to_string(root.join("current/.source")).unwrap();
+        assert!(record.contains("version=v5"), "{record}");
+    }
+
     /// **The pin is in two places and they must agree.** `seed-policies.sh` runs from inside a
     /// release and cannot read Cargo.toml, so it carries the repo and the version as literals —
     /// the same trap `setup-gstreamer.sh` and `setup-board.sh` already carry, where a drift is a
