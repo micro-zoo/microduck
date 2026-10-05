@@ -286,6 +286,19 @@ impl DynamixelIo {
 
         // An EEPROM register like the others, so it is written only with torque off, which is how
         // a servo powers up and how a fresh one is adopted.
+        //
+        // Not on a joint the robot's joint-zero file calibrates: that zero was captured on top of
+        // the offset the servo already holds, and `check_registers` has just refused to run if
+        // the offset moved since. Writing the flashing rig's value there would shift the joint by
+        // the difference on the next cold start (torque off, so the write lands) and then stop
+        // robotd starting at all.
+        if JOINT_IDS
+            .iter()
+            .position(|&joint_id| joint_id == id)
+            .is_some_and(|joint| self.calibration.is_configured(joint))
+        {
+            return Ok(fixed);
+        }
         let want = homing_offset(id);
         let got = *self
             .controller

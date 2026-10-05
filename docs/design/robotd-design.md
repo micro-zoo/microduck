@@ -296,7 +296,9 @@ saying so:
   "latches on input-voltage faults" it says the opposite of what it does. Alongside them,
   `homing_offset` is −512 on the knees (13, 23) and 0 everywhere else, the values from the
   runtime's `setup_motor_rpi.py` flashing rig. Every pose and policy assumes the knees carry that
-  offset, and a servo straight from the box does not.
+  offset, and a servo straight from the box does not. A joint the robot's `joint-zero.json`
+  calibrates is left alone: its zero was captured on top of whatever offset the servo holds, and
+  the calibration check refuses to start if that offset has moved.
 - **A swapped-in servo is adopted, not configured by hand.** A new XL330 answers as ID 1 at
   57 600 baud, and neither is used on this bus. So before the register check, `open_bus` pings
   the fifteen expected IDs; if *exactly one* is silent, it looks for ID 1 — first at 1 Mbps,
