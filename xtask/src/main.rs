@@ -1254,6 +1254,110 @@ mod tests {
         assert!(record.contains("version=v5"), "{record}");
     }
 
+    /// Old seeders recorded an eight-file fallback as v5. Repair those existing records too,
+    /// retaining the predecessor until all ten manifest files have reached a new destination.
+    #[test]
+    fn an_old_versioned_fallback_survives_failed_repairs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        let old = root.join("releases/seed-v5");
+        fake_hub(&old, "old");
+        let record = "repo=pollen-robotics/microduck-policies\nversion=v5\nfetched=old\n";
+        std::fs::write(old.join(".source"), record).unwrap();
+        std::os::unix::fs::symlink("releases/seed-v5", root.join("current")).unwrap();
+
+        // No manifest, then a manifest whose final download fails: neither can replace old.
+        fake_hub(&hub, "fallback");
+        for with_manifest in [false, true] {
+            if with_manifest {
+                fake_hub_manifest(&hub, "complete");
+                std::fs::remove_file(hub.join("alpha_stand.onnx")).unwrap();
+            }
+            assert_eq!(
+                seed(&root, "v5", Some(&hub)),
+                (
+                    Some("releases/seed-v5".to_owned()),
+                    Some("old-velstand.onnx".to_owned())
+                )
+            );
+            assert_eq!(
+                std::fs::read_to_string(old.join(".source")).unwrap(),
+                record
+            );
+            assert!(!root.join("releases/.staging").exists());
+            assert!(!root.join("releases/seed-v5-repair").exists());
+            assert!(!root.join("current/alpha_walking.onnx").exists());
+        }
+
+        fake_hub_manifest(&hub, "complete");
+        let (link, content) = seed(&root, "v5", Some(&hub));
+        assert_eq!(link.as_deref(), Some("releases/seed-v5-repair"));
+        assert_eq!(content.as_deref(), Some("complete-velstand.onnx"));
+        assert_eq!(
+            std::fs::read_to_string(old.join("velstand.onnx")).unwrap(),
+            "old-velstand.onnx"
+        );
+        assert!(root.join("current/alpha_stand.onnx").exists());
+    }
+
+    /// Even with a manifest on disk, a missing or empty listed file is not a complete seed.
+    #[test]
+    fn missing_manifest_files_are_repaired_at_the_same_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        let root = tmp.path().join("policies");
+        std::fs::create_dir_all(&root).unwrap();
+        fake_hub_manifest(&hub, "complete");
+        seed(&root, "v5", Some(&hub));
+        for empty in [false, true] {
+            let file = root.join("current/alpha_stand.onnx");
+            if empty {
+                std::fs::write(&file, "").unwrap();
+            } else {
+                std::fs::remove_file(&file).unwrap();
+            }
+            seed(&root, "v5", Some(&hub));
+            assert_eq!(
+                std::fs::read_to_string(file).unwrap(),
+                "complete-alpha_stand.onnx"
+            );
+            assert!(!root.join("releases/.staging").exists());
+        }
+    }
+
+    /// Same-version repair belongs only to official seed destinations. A user/tool's choice
+    /// and an explicitly incomparable version must still be left alone, even without a manifest.
+    #[test]
+    fn incomplete_sets_owned_by_a_tool_or_with_a_custom_version_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hub = tmp.path().join("hub");
+        fake_hub_manifest(&hub, "complete");
+        for (i, (target, version)) in [
+            ("releases/from-a-tool", "v5"),
+            ("releases/from-a-tool", ""),
+            ("releases/seed-v5", "custom"),
+            ("releases/seed-v6", ""),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let root = tmp.path().join(format!("policies-{i}"));
+            fake_hub(&root.join(target), "chosen");
+            let record = format!("repo=pollen-robotics/microduck-policies\nversion={version}\n");
+            std::fs::write(root.join(target).join(".source"), &record).unwrap();
+            std::os::unix::fs::symlink(target, root.join("current")).unwrap();
+            let (link, content) = seed(&root, "v5", Some(&hub));
+            assert_eq!(link.as_deref(), Some(*target));
+            assert_eq!(content.as_deref(), Some("chosen-velstand.onnx"));
+            assert_eq!(
+                std::fs::read_to_string(root.join("current/.source")).unwrap(),
+                record
+            );
+            assert!(!root.join("releases/.staging").exists());
+        }
+    }
+
     /// **The pin is in two places and they must agree.** `seed-policies.sh` runs from inside a
     /// release and cannot read Cargo.toml, so it carries the repo and the version as literals —
     /// the same trap `setup-gstreamer.sh` and `setup-board.sh` already carry, where a drift is a
@@ -1538,7 +1642,7 @@ mod tests {
             .expect("the extraction line");
         let expression = sed
             .split_once('\'')
-            .and_then(|(_, rest)| rest.rsplit_once('\''))
+            .and_then(|(_, rest)| rest.split_once('\''))
             .map(|(expr, _)| expr.to_owned())
             .expect("a quoted sed expression");
 
@@ -1637,21 +1741,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let hub = tmp.path().join("hub");
         let root = tmp.path().join("policies");
-        fake_hub(&hub, "hub");
+        fake_hub_manifest(&hub, "hub");
         std::fs::create_dir_all(&root).unwrap();
 
         let first = seed(&root, "v1", Some(&hub));
-        // No Hub at all the second time: reaching for one would fall back and change the answer.
+        // The complete manifest satisfies the fast path even when the Hub cannot be reached.
         assert_eq!(seed(&root, "v1", None), first);
     }
 
     /// **A set installed before the provenance record existed must gain one.**
     ///
-    /// From a board: the fast path — the pinned set is already installed, so no network — exits
-    /// before anything is written, which is right for the policies and wrong for the record. A
-    /// board seeded by the previous version of this script would take that branch forever and
-    /// never gain one, and `robotctl policy check` reported a robot with a perfectly good set as
-    /// having nothing installed.
+    /// A board seeded by the previous version of this script can have a working set but no
+    /// record, so `policy check` reports nothing installed. Back-fill it without disturbing the
+    /// files, including when a missing manifest is retried and the Hub cannot be reached.
     #[test]
     fn a_set_with_no_provenance_record_gains_one() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1667,8 +1769,8 @@ mod tests {
             "the board's starting state"
         );
 
-        // No Hub, deliberately: the point is that this happens on the branch that touches no
-        // network at all, which is the branch such a board takes every time.
+        // With no manifest on disk this seed may retry, but an unreachable Hub must leave its
+        // policies alone while back-filling the record.
         seed(&root, "v1", None);
 
         let record = std::fs::read_to_string(root.join("current/.source")).unwrap();
