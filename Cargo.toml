@@ -56,7 +56,7 @@ runtime = "v2.3.2"
 # and it is bumped when a slot's default names a file only the new set carries.
 [workspace.metadata.policies]
 repo    = "pollen-robotics/microduck-policies"
-version = "v5"
+version = "v7"
 
 # The duck detector, the same way: trained in pollen-robotics/duck_detector, published on the Hub,
 # and seeded onto a board by `scripts/seed-detector.sh` from this pin — a floor, moved past with
@@ -80,7 +80,7 @@ repo    = "pollen-robotics/microduck-gst-plugins"
 version = "v3"
 
 [workspace.package]
-version = "0.15.1"
+version = "0.15.2"
 edition = "2024"
 # 1.99 for the atomics' `try_update` (mediad), which replaced the now-deprecated
 # `fetch_update`. That also covers `std::fs::File::try_lock` (1.89), how the single-flight
