@@ -472,6 +472,8 @@ pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 /// every one takes a `--socket` override, and `updaterd` reads `robot_socket` from its config.
 /// They live here because more than one client needs them: `robotctl` and `btd` both connect
 /// to all three, and a path duplicated per client is a path that drifts per client.
+pub mod mount;
+
 pub mod socket {
     /// `updaterd`. Same value as [`super::DEFAULT_SOCKET`], which predates this module.
     pub const UPDATER: &str = super::DEFAULT_SOCKET;

@@ -37,7 +37,8 @@ the line about it says whether it answers now.
 To generate a joint-zero **candidate** while the robot is physically held in its
 q=0 fixture, run `robotctl calibrate zero --fixture-q0 --output PATH`. It reads
 through `robotd` and does not activate the result; see
-[joint calibration](joint-calibration.md).
+[joint calibration](joint-calibration.md). `robotctl calibrate imu --output PATH`
+does the same for the body IMU's mount, from two held poses.
 
 ```
 robotctl monitor

@@ -1,8 +1,13 @@
-# Joint zeroes on a physical robot
+# Joint zeroes and the IMU mount on a physical robot
 
-`robotd` can load a per-robot joint-zero file through `[bus] calibration` in
+`robotd` can load a per-robot calibration file through `[bus] calibration` in
 `/etc/robot/robotd.toml`. `robotctl configure` exposes that setting and offers a
 `robotd` restart when it changes. The file stays on the robot, outside Git.
+
+It holds what is measured once on the bench and is true of this robot only: the
+joint zeroes, and how the body IMU board is mounted (below). Both are read at
+startup, and both are captured by `robotctl calibrate` into a new candidate file
+rather than into the live one.
 
 ## Capture while the robot is in its q=0 fixture
 
@@ -54,8 +59,43 @@ positions. The twin remains a read-only consumer of `robotd` state and needs no
 separate offset file or motor connection.
 
 This establishes a position reference. It does not validate travel, torque,
-IMU mounting, or a walking policy. Keep physical support and the existing
+or a walking policy. Keep physical support and the existing
 `--no-policy` commissioning configuration until those are checked separately.
+
+## The body IMU mount
+
+The IMU board at Dynamixel ID 200 can sit in the trunk in any orientation; the
+mount is the rotation from its axes to the trunk's (x forward, y left, z up). The
+decoder applies it before gravity, gyro and orientation reach the policy, fall
+detection and `robot.state`, so a wrong mount is a robot that believes it is
+tilted.
+
+```sh
+robotctl calibrate imu --output /root/calibration-candidate.json
+```
+
+Two held poses, two seconds each, the legs limp or not: the trunk **upright** as
+it stands, then the same trunk **pitched nose-down 20–40°, straight forward with
+no roll**. Upright gives the trunk's up axis; the nose-down tilt gives forward.
+`robotctl` reads gravity through `robotd`, turns it back into the sensor's own
+frame with the mount `robotd` is using now (`robot.calibrationInfo`, API v42),
+refuses a pose that turned or wandered more than a degree, and refuses a tilt
+under 15°. It copies the joint zeroes from `--from` or from the file
+`bus.calibration` names, and adds:
+
+```json
+{"joints":[...],"body_imu":{"mount":[0.5,-0.5,0.5,-0.5]}}
+```
+
+Like the zero capture it only writes a new candidate. Review it, install it as
+the calibration file and restart `robotd`; the journal names the mount it loaded.
+`robotctl calibrate zero` carries a recorded mount over into its own candidate,
+so recapturing the zeroes does not lose it.
+
+A file without `body_imu` leaves `[body_imu]` in `robotd.toml` in charge, which
+defaults to the original board's +90° Y mount. When the file records a mount,
+`[body_imu]` is ignored, and a value there that differs from both is named in the
+journal.
 
 ## EEPROM and turn count
 

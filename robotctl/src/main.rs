@@ -591,6 +591,16 @@ enum CalibrateCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Measure how the body IMU board is mounted, from two held poses: trunk upright, then
+    /// pitched nose-down. Writes a new calibration candidate carrying the joint zeroes over.
+    Imu {
+        /// New candidate JSON path. Existing files are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+        /// Calibration to carry the joint zeroes over from. Defaults to `bus.calibration`.
+        #[arg(long)]
+        from: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -5400,8 +5410,17 @@ fn run(cli: Cli) -> Result<(), Failure> {
             return run_robot(&cli.robot_socket, command);
         }
         Namespace::Calibrate { command } => {
-            let CalibrateCommand::Zero { fixture_q0, output } = command;
-            return calibrate::capture_zero(&cli.robot_socket, &output, fixture_q0);
+            return match command {
+                CalibrateCommand::Zero { fixture_q0, output } => {
+                    calibrate::capture_zero(&cli.robot_socket, &output, fixture_q0)
+                }
+                CalibrateCommand::Imu { output, from } => calibrate::capture_imu(
+                    &cli.robot_socket,
+                    &output,
+                    from.as_deref(),
+                    &cli.pad_config,
+                ),
+            };
         }
         Namespace::Twin { command } => {
             return run_twin(command.unwrap_or(TwinCommand::Status { json: false }));

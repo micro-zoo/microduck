@@ -1,4 +1,5 @@
-//! Capture a fixture zero through robotd's existing state stream.
+//! Capture this robot's hardware calibration through robotd's existing state stream: the
+//! fixture joint zeroes, and the body IMU's mount. Both land in one per-robot file.
 //! This client never opens the motor UART, sends an intent or writes EEPROM.
 
 use std::io::Write;
@@ -19,6 +20,15 @@ const MOUTH_CLOSED_RAD: f64 = -5.0 * std::f64::consts::PI / 180.0;
 #[derive(Serialize)]
 struct ZeroFile {
     joints: Vec<JointZero>,
+    /// Carried over from the calibration robotd loaded, so recapturing the zeroes does not lose
+    /// the IMU mount measured before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body_imu: Option<BodyImu>,
+}
+
+#[derive(Serialize)]
+struct BodyImu {
+    mount: [f64; 4],
 }
 
 #[derive(Serialize)]
@@ -145,16 +155,15 @@ fn candidate(info: &proto::CalibrationInfo, frames: &[Frame]) -> Result<(ZeroFil
                 .then_some(info.homing_offset_ticks[joint]),
         });
     }
-    Ok((ZeroFile { joints }, largest_spread))
+    let body_imu = info
+        .body_imu_mount
+        .filter(|_| info.body_imu_mount_calibrated)
+        .map(|mount| BodyImu { mount });
+    Ok((ZeroFile { joints, body_imu }, largest_spread))
 }
 
-pub fn capture_zero(socket: &Path, output: &Path, fixture_q0: bool) -> Result<(), Failure> {
-    if !fixture_q0 {
-        return Err(Failure::new(
-            exit::USAGE,
-            "place and support the robot in its q=0 fixture, then pass --fixture-q0".into(),
-        ));
-    }
+/// Where a candidate goes: a new file in an existing directory. Returns the directory.
+fn candidate_destination(output: &Path) -> Result<&Path, Failure> {
     let parent = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -174,6 +183,38 @@ pub fn capture_zero(socket: &Path, output: &Path, fixture_q0: bool) -> Result<()
             ),
         ));
     }
+    Ok(parent)
+}
+
+/// Write a candidate without ever replacing a file, through a synced temporary.
+fn persist_candidate(parent: &Path, output: &Path, data: &[u8]) -> Result<(), Failure> {
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| Failure::new(exit::FAILED, format!("could not create candidate: {e}")))?;
+    temporary
+        .write_all(data)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|e| Failure::new(exit::FAILED, format!("could not write candidate: {e}")))?;
+    temporary.persist_noclobber(output).map_err(|e| {
+        Failure::new(
+            exit::REFUSED,
+            format!(
+                "could not save {} without overwriting: {}",
+                output.display(),
+                e.error
+            ),
+        )
+    })?;
+    Ok(())
+}
+
+pub fn capture_zero(socket: &Path, output: &Path, fixture_q0: bool) -> Result<(), Failure> {
+    if !fixture_q0 {
+        return Err(Failure::new(
+            exit::USAGE,
+            "place and support the robot in its q=0 fixture, then pass --fixture-q0".into(),
+        ));
+    }
+    let parent = candidate_destination(output)?;
 
     let mut client = Client::connect_to("robotd", socket)?;
     client.set_read_timeout(Duration::from_secs(2))?;
@@ -228,28 +269,207 @@ pub fn capture_zero(socket: &Path, output: &Path, fixture_q0: bool) -> Result<()
     let mut data = serde_json::to_vec_pretty(&candidate)
         .map_err(|e| Failure::new(exit::FAILED, format!("could not encode calibration: {e}")))?;
     data.push(b'\n');
-
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|e| Failure::new(exit::FAILED, format!("could not create candidate: {e}")))?;
-    temporary
-        .write_all(&data)
-        .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|e| Failure::new(exit::FAILED, format!("could not write candidate: {e}")))?;
-    temporary.persist_noclobber(output).map_err(|e| {
-        Failure::new(
-            exit::REFUSED,
-            format!(
-                "could not save {} without overwriting: {}",
-                output.display(),
-                e.error
-            ),
-        )
-    })?;
+    persist_candidate(parent, output, &data)?;
     println!(
         "captured {} joint zeroes from {FRAMES} fresh robotd frames (max spread {spread} ticks): {}",
         candidate.joints.len(),
         output.display()
     );
+    println!(
+        "candidate only; set bus.calibration with robotctl configure and restart robotd to apply it"
+    );
+    Ok(())
+}
+
+/// Frames averaged per pose: two seconds at [`HZ`].
+const IMU_FRAMES: usize = 20;
+/// Rotation rate above which a frame is not "still", rad/s.
+const IMU_STILL_RAD_S: f64 = 0.05;
+/// How far the gravity direction may wander within one pose, degrees.
+const IMU_MAX_SPREAD_DEG: f64 = 1.0;
+
+/// Average gravity, in the sensor's own frame, over a still stretch of fresh frames.
+///
+/// A fresh connection per pose, so nothing buffered while the operator was moving the robot is
+/// counted as the pose they then held.
+fn still_sensor_gravity(socket: &Path, mount: [f64; 4]) -> Result<[f64; 3], Failure> {
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.set_read_timeout(Duration::from_secs(2))?;
+    client.hello()?;
+    let subscribed: proto::SubscribeResult = decode(&result_of(client.call(
+        &proto::Call::RobotSubscribe(proto::SubscribeParams { hz: Some(HZ) }),
+    )?)?)?;
+    if !subscribed.accepted {
+        return Err(Failure::new(
+            exit::REFUSED,
+            "robotd refused the state subscription".into(),
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut samples: Vec<[f64; 3]> = Vec::with_capacity(IMU_FRAMES);
+    let mut last_t_ns = 0;
+    while samples.len() < IMU_FRAMES {
+        if Instant::now() >= deadline {
+            return Err(Failure::new(
+                exit::UNREACHABLE,
+                format!("timed out waiting for {IMU_FRAMES} fresh robotd frames"),
+            ));
+        }
+        let state = client.next_robot_state()?;
+        if state.t_ns <= last_t_ns {
+            continue;
+        }
+        last_t_ns = state.t_ns;
+        if let Some(imu) = &state.imu {
+            let rate = imu.gyro.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if rate > IMU_STILL_RAD_S {
+                return Err(Failure::new(
+                    exit::REFUSED,
+                    format!("the robot turned at {rate:.2} rad/s; hold it still and retry"),
+                ));
+            }
+        }
+        samples.push(proto::mount::sensor_gravity(mount, state.safety.gravity));
+    }
+    let mean = average_direction(&samples).ok_or_else(|| {
+        Failure::new(
+            exit::FAILED,
+            "gravity samples do not average to a direction".into(),
+        )
+    })?;
+    let spread = samples
+        .iter()
+        .map(|g| angle_deg(*g, mean))
+        .fold(0.0f64, f64::max);
+    if spread > IMU_MAX_SPREAD_DEG {
+        return Err(Failure::new(
+            exit::REFUSED,
+            format!("gravity wandered {spread:.1}° while held; hold the robot still and retry"),
+        ));
+    }
+    Ok(mean)
+}
+
+fn average_direction(samples: &[[f64; 3]]) -> Option<[f64; 3]> {
+    let sum = samples.iter().fold([0.0; 3], |acc, g| {
+        let n = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+        [0, 1, 2].map(|i| acc[i] + g[i] / n)
+    });
+    let n = sum.iter().map(|v| v * v).sum::<f64>().sqrt();
+    (n > 1e-9).then(|| sum.map(|v| v / n))
+}
+
+fn angle_deg(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let na = a.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let nb = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let cos = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (na * nb);
+    cos.clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// How far apart two mounts are, as one rotation angle in degrees.
+fn mount_change_deg(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let d: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    (2.0 * d.abs().clamp(0.0, 1.0).acos()).to_degrees()
+}
+
+/// The calibration file with `body_imu.mount` set, everything else in it untouched.
+fn with_mount(mut base: serde_json::Value, mount: [f64; 4]) -> Result<serde_json::Value, Failure> {
+    let object = base.as_object_mut().ok_or_else(|| {
+        Failure::new(
+            exit::REFUSED,
+            "the existing calibration is not a JSON object".into(),
+        )
+    })?;
+    object
+        .entry("joints")
+        .or_insert_with(|| serde_json::json!([]));
+    object.insert("body_imu".into(), serde_json::json!({ "mount": mount }));
+    Ok(base)
+}
+
+fn wait_for_enter(prompt: &str) -> Result<(), Failure> {
+    print!("{prompt} — press Enter when it is still: ");
+    std::io::stdout()
+        .flush()
+        .map_err(|e| Failure::new(exit::FAILED, format!("stdout: {e}")))?;
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| Failure::new(exit::FAILED, format!("stdin: {e}")))?;
+    Ok(())
+}
+
+/// Measure the body IMU's mount from two held poses and write it into a new calibration candidate
+/// alongside the joint zeroes this robot already has.
+pub fn capture_imu(
+    socket: &Path,
+    output: &Path,
+    from: Option<&Path>,
+    config: &Path,
+) -> Result<(), Failure> {
+    let parent = candidate_destination(output)?;
+    // The joint zeroes carry over: from the file named, else the one robotd.toml points at.
+    let base_path = match from {
+        Some(path) => Some(path.to_path_buf()),
+        None => robotd_params::Params::load(config, false)
+            .ok()
+            .and_then(|params| params.bus.calibration_path().map(Path::to_path_buf)),
+    };
+    let base = match &base_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                Failure::new(exit::FAILED, format!("cannot read {}: {e}", path.display()))
+            })?;
+            serde_json::from_str(&text).map_err(|e| {
+                Failure::new(
+                    exit::REFUSED,
+                    format!("{} is not JSON: {e}", path.display()),
+                )
+            })?
+        }
+        None => serde_json::json!({ "joints": [] }),
+    };
+
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.set_read_timeout(Duration::from_secs(2))?;
+    client.hello()?;
+    let info: proto::CalibrationInfo = decode(&result_of(
+        client.call(&proto::Call::RobotCalibrationInfo)?,
+    )?)?;
+    let current = info.body_imu_mount.ok_or_else(|| {
+        Failure::new(
+            exit::REFUSED,
+            "this robotd does not report its IMU mount (it predates API v42); update it first"
+                .into(),
+        )
+    })?;
+    drop(client);
+
+    println!("Two poses, two seconds each. The legs can be limp; only the trunk matters.");
+    wait_for_enter("1/2  Hold the trunk upright, as it stands")?;
+    let upright = still_sensor_gravity(socket, current)?;
+    wait_for_enter("2/2  Pitch it nose-down 20–40°, straight forward with no roll")?;
+    let nose_down = still_sensor_gravity(socket, current)?;
+    let mount = proto::mount::mount_from_gravity(upright, nose_down)
+        .map_err(|e| Failure::new(exit::REFUSED, e.to_string()))?;
+
+    let candidate = with_mount(base, mount)?;
+    let mut data = serde_json::to_vec_pretty(&candidate)
+        .map_err(|e| Failure::new(exit::FAILED, format!("could not encode calibration: {e}")))?;
+    data.push(b'\n');
+    persist_candidate(parent, output, &data)?;
+    println!(
+        "measured body IMU mount {mount:?} (tilt {:.1}°, {:.1}° from the mount in effect): {}",
+        angle_deg(upright, nose_down),
+        mount_change_deg(mount, current),
+        output.display()
+    );
+    match &base_path {
+        Some(path) => println!("joint zeroes carried over from {}", path.display()),
+        None => {
+            println!("no calibration to carry joint zeroes from; this file holds the mount only")
+        }
+    }
     println!(
         "candidate only; set bus.calibration with robotctl configure and restart robotd to apply it"
     );
@@ -294,6 +514,61 @@ mod tests {
         assert_eq!(file.joints[3].zero_tick, 1980.0);
         assert_eq!(file.joints[3].homing_offset_tick, Some(-585));
         assert!((file.joints[9].zero_tick - 2100.888888888889).abs() < 1e-9);
+    }
+
+    #[test]
+    fn recapturing_zeroes_keeps_a_calibrated_imu_mount_and_only_that() {
+        let frames = (1..=FRAMES)
+            .map(|i| Frame {
+                t_ns: i as u64,
+                policy: "held".into(),
+                joints: [0.0; 15],
+            })
+            .collect::<Vec<_>>();
+        let mut info = proto::CalibrationInfo {
+            zero_ticks: [2048.0; 15],
+            homing_offset_ticks: [0; 15],
+            single_turn_compatible: [true; 15],
+            policy_enabled: false,
+            homed: false,
+            body_imu_mount: Some([0.5, -0.5, 0.5, -0.5]),
+            body_imu_mount_calibrated: true,
+        };
+        let (file, _) = candidate(&info, &frames).unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(file.body_imu.map(|b| b.mount), Some([0.5, -0.5, 0.5, -0.5]));
+        // A mount from robotd.toml or the default is not this robot's measurement.
+        info.body_imu_mount_calibrated = false;
+        let (file, _) = candidate(&info, &frames).unwrap_or_else(|e| panic!("{}", e.message));
+        assert!(file.body_imu.is_none());
+    }
+
+    #[test]
+    fn the_measured_mount_joins_the_existing_calibration_untouched() {
+        let base = serde_json::json!({
+            "joints": [{"name": "left_knee", "id": 23, "zero_tick": 1976.0, "homing_offset_tick": -585}],
+            "body_imu": {"mount": [1.0, 0.0, 0.0, 0.0]},
+        });
+        let out = with_mount(base.clone(), [0.5, -0.5, 0.5, -0.5])
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(out["joints"], base["joints"]);
+        assert_eq!(
+            out["body_imu"]["mount"],
+            serde_json::json!([0.5, -0.5, 0.5, -0.5])
+        );
+        let empty = with_mount(serde_json::json!({}), [1.0, 0.0, 0.0, 0.0])
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(empty["joints"], serde_json::json!([]));
+        assert!(with_mount(serde_json::json!([]), [1.0, 0.0, 0.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn mount_change_and_spread_are_angles() {
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        assert!(mount_change_deg([1.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0]).abs() < 1e-6);
+        assert!((mount_change_deg([1.0, 0.0, 0.0, 0.0], [h, 0.0, h, 0.0]) - 90.0).abs() < 1e-6);
+        assert!((angle_deg([0.0, 0.0, -1.0], [1.0, 0.0, 0.0]) - 90.0).abs() < 1e-9);
+        let mean = average_direction(&[[0.0, 0.0, -2.0], [0.0, 0.0, -1.0]]).unwrap();
+        assert!((mean[2] + 1.0).abs() < 1e-12);
     }
 
     #[test]
