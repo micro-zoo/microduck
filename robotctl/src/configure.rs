@@ -50,7 +50,9 @@ use std::path::Path;
 // The editing model itself lives in `robotd-params`, beside the schema it validates against —
 // see that module's header for why. Re-exported rather than imported privately because the rest
 // of `robotctl` reaches for `configure::Model` and should not have to know it moved.
-pub use robotd_params::edit::{Edit, Model, Row, bind_pad, pad_bindings, render, sections};
+pub use robotd_params::edit::{
+    Edit, Model, Row, audio_volume, bind_pad, pad_bindings, render, sections, set_audio_volume,
+};
 
 /// What a written key needs before the daemon that reads it is running on it.
 ///
@@ -119,6 +121,11 @@ fn apply_for(key: &str) -> Option<Apply> {
         // - `enabled` is read once into `RobotState`, and the reload call is *refused* while it
         //   is false — so the one direction anybody cares about, off to on, cannot be a reload.
         "policy" if name != "mode" && name != "enabled" => Apply::Reload("robotd"),
+        // Loudness is the one `[audio]` key `robotd` takes back without a restart: it stats the file
+        // once a second and re-sets the codec's PCM control when `audio.volume` moves
+        // (`robotd/src/volume.rs`). Restarting for it would be the expensive way to be quieter — the
+        // motors stop being driven, and a standing robot falls.
+        "audio" if name == "volume" => Apply::Live("robotd"),
         "bus" | "body_imu" | "control" | "update_gate" | "policy" | "safety" | "chorale"
         | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
         _ => return None,
@@ -1185,6 +1192,30 @@ mod tests {
         let plan = plan_for(&m);
         assert_eq!(plan.restart, vec!["robotd"]);
         assert_eq!(plan.live, vec!["padd"]);
+    }
+
+    /// `audio.volume` is live: `robotd` stats the file once a second and re-sets the mixer.
+    ///
+    /// The rest of `[audio]` is read once, so the section is not of one mind — which is why the
+    /// classification is by key. Restarting `robotd` to be quieter would stop driving the motors,
+    /// and a standing robot would fall.
+    #[test]
+    fn the_volume_applies_live_and_the_rest_of_audio_still_restarts() {
+        let mut m = model("");
+        m.edit(entry("audio.volume"), "60").expect("valid");
+        let plan = plan_for(&m);
+        assert!(
+            plan.is_quiet(),
+            "a volume change asks for nothing: {plan:?}"
+        );
+        assert_eq!(plan.live, vec!["robotd"]);
+        assert!(plan.restart.is_empty());
+
+        let mut m = model("");
+        m.edit(entry("audio.greet"), "false").expect("valid");
+        let plan = plan_for(&m);
+        assert_eq!(plan.restart, vec!["robotd"], "greet is read at startup");
+        assert!(plan.live.is_empty());
     }
 
     /// `[policy]` reloads instead of restarting — except the two keys a reload does not carry.

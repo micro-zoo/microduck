@@ -170,6 +170,19 @@ enum Namespace {
     /// its own — is the one you're SSH'd into.
     Quack,
 
+    /// How loud the speaker is, 0 to 100 — shown, or set.
+    ///
+    /// `robotctl volume` says the level; `sudo robotctl volume 60` sets it. It is `audio.volume` in
+    /// `robotd.toml`, on the card's perceptual scale, so 50 sounds about half as loud as 100.
+    /// `robotd` notices within a second: nothing restarts, and a standing robot stays standing.
+    Volume {
+        /// The new level. Omit it to read the current one.
+        #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
+        level: Option<u8>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Sing with other ducks: two in a room start a piece between themselves, and more join.
     ///
     /// Starts *listening* — the robot goes on the air saying it is willing and watches for others.
@@ -3776,6 +3789,11 @@ fn slot_of(name: &str) -> Result<Slot, Failure> {
 /// The probe is the write `save` actually performs: create the staged file beside the target,
 /// which is what both the rename and the create need permission for.
 fn ensure_recordable(config: &Path) -> Result<(), Failure> {
+    ensure_writable(config, "a policy change has to be recorded, not just made")
+}
+
+/// [`ensure_recordable`]'s probe, for a command with its own reason to need root.
+fn ensure_writable(config: &Path, why: &str) -> Result<(), Failure> {
     let staged = config.with_extension("toml.new");
     match std::fs::File::create(&staged) {
         Ok(_) => {
@@ -3784,11 +3802,7 @@ fn ensure_recordable(config: &Path) -> Result<(), Failure> {
         }
         Err(e) => Err(Failure::new(
             exit::DENIED,
-            format!(
-                "cannot write {}: {e}\ntry sudo — a policy change has to be recorded, \
-                 not just made",
-                config.display()
-            ),
+            format!("cannot write {}: {e}\ntry sudo — {why}", config.display()),
         )),
     }
 }
@@ -4900,6 +4914,34 @@ fn run_pad_bindings(
     Ok(())
 }
 
+/// Show or set the speaker volume. The whole change is one key in the config file, so there is
+/// no daemon to ask: `robotd` is the reader, and it picks the new value up by itself.
+fn run_volume(config: &Path, level: Option<u8>, json: bool) -> Result<(), Failure> {
+    let Some(level) = level else {
+        let current = configure::audio_volume(config).map_err(|e| Failure::new(exit::FAILED, e))?;
+        if json {
+            println!("{}", compact(&serde_json::json!({ "volume": current })));
+        } else {
+            println!("volume {current}");
+        }
+        return Ok(());
+    };
+
+    ensure_writable(
+        config,
+        "the volume is a key in the robot's config, which is root's",
+    )?;
+    configure::set_audio_volume(config, level).map_err(|e| Failure::new(exit::FAILED, e))?;
+
+    if json {
+        println!("{}", compact(&serde_json::json!({ "volume": level })));
+        return Ok(());
+    }
+    println!("volume {level}");
+    println!("  robotd picks this up within a second");
+    Ok(())
+}
+
 /// The one-shot skills the robot says it has, or `None` if it is not answering.
 ///
 /// From `robot.subscribe`'s acknowledgement, which is where a client learns what a robot can do
@@ -5427,6 +5469,9 @@ fn run(cli: Cli) -> Result<(), Failure> {
         }
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
+        }
+        Namespace::Volume { level, json } => {
+            return run_volume(&cli.pad_config, level, json);
         }
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);

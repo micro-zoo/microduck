@@ -867,7 +867,16 @@ pub struct AudioParams {
     /// Probability above which petting starts, and below which it ends (hysteresis).
     pub pet_enter_threshold: f32,
     pub pet_exit_threshold: f32,
+    /// Speaker loudness, 0–100 on the card's perceptual (dB) scale. `robotd` sets the codec's PCM
+    /// control to it at start and again whenever the file changes, so `robotctl configure
+    /// audio.volume` takes effect within a second and survives a reboot. 100 is the boot
+    /// script's own default, so leaving it unset changes nothing.
+    pub volume: u8,
 }
+
+/// `audio.volume` is a percentage; anything above is a typo for something else, and a value
+/// that wrapped into the mixer's raw range would be a surprise at full blast.
+pub const AUDIO_VOLUME_MAX: u8 = 100;
 
 impl Default for AudioParams {
     fn default() -> Self {
@@ -880,6 +889,7 @@ impl Default for AudioParams {
             pet_model: None,
             pet_enter_threshold: 0.95,
             pet_exit_threshold: 0.85,
+            volume: AUDIO_VOLUME_MAX,
         }
     }
 }
@@ -2087,6 +2097,8 @@ pub enum ParamsError {
     },
     #[error("{path}: body_imu mount must be a finite unit quaternion, got norm {got}")]
     BodyImuMount { path: String, got: f64 },
+    #[error("{path}: audio.volume is a percentage from 0 to {max}, got {got}")]
+    AudioVolume { path: String, got: u8, max: u8 },
     #[error(
         "{path}: pad_drive.{axis}_min must be zero or negative and pad_drive.{axis}_max zero or \
          positive, got {min} and {max} — the bounds are signed, so full stick back at 0.2 m/s is \
@@ -2211,6 +2223,13 @@ impl Params {
                 got: norm,
             });
         }
+        if self.audio.volume > AUDIO_VOLUME_MAX {
+            return Err(ParamsError::AudioVolume {
+                path: path.display().to_string(),
+                got: self.audio.volume,
+                max: AUDIO_VOLUME_MAX,
+            });
+        }
         // Signed bounds, so a positive `_min` is somebody who wrote a magnitude: full stick
         // back would then walk the robot *forward*. Refused rather than taken as its absolute
         // value, because the editor should say which of the two readings it was not going to
@@ -2330,6 +2349,19 @@ mod tests {
                 0.0
             ]
         );
+    }
+
+    #[test]
+    fn audio_volume_defaults_to_full_and_is_a_percentage() {
+        assert_eq!(super::Params::default().audio.volume, 100);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "[audio]\nvolume = 35\n").unwrap();
+        assert_eq!(super::Params::load(&path, true).unwrap().audio.volume, 35);
+        for bad in ["101", "200", "-1"] {
+            std::fs::write(&path, format!("[audio]\nvolume = {bad}\n")).unwrap();
+            assert!(super::Params::load(&path, true).is_err(), "{bad}");
+        }
     }
 
     #[test]

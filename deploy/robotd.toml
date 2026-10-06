@@ -315,6 +315,13 @@ mode = "walk"
 # daemon often enough to be tired of it.
 # greet = true
 
+# How loud, 0–100 on the card's perceptual scale. `robotd` sets the codec's PCM control to this
+# at start and whenever the file changes — a second after `sudo robotctl volume 60`, with no
+# restart, so a standing robot stays standing. 100 is what the boot script leaves the
+# card at, so leaving this out changes nothing; the boot script brings the hardware up, this
+# holds the preference on top.
+# volume = 100
+
 # Listen for petting on the onboard mic and coo about it. Unset means off — the always-on
 # coo wore thin — so this is an opt-in. The model ships in the release
 # (models/pet_detect.onnx); thresholds are the classifier's hysteresis (enter above, leave

@@ -2,6 +2,10 @@
 # TLV320AIC3104 mixer setup. The kernel codec driver handles PLL / DAC / line
 # output configuration via the devicetree overlay; this script only applies the
 # default mixer levels and microphone routing on top.
+#
+# These are bring-up defaults, at full. The user's loudness is `[audio] volume` in robotd.toml:
+# robotd runs after this (aic3104-init.service is Before=robotd) and sets the PCM control to it,
+# so the PCM line below is the level of a robot whose owner never asked for another.
 
 sleep 2
 

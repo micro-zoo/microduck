@@ -649,6 +649,18 @@ sudo robotctl configure
 
 Set `audio.greet = false` and take the restart it offers on save. That silences the one
 quack and leaves the triggers and the mic alone, which `audio.enabled = false` does not.
+
+The speaker's loudness is `audio.volume`, 0 to 100. `robotctl volume` says the level, and
+setting it is one command:
+
+```
+sudo robotctl volume 60
+```
+
+Unlike the rest of `[audio]` it needs no restart: `robotd` re-sets the mixer within a second of the
+file changing, so the robot keeps standing, and the value is the one the next boot starts at. It
+is the card's own PCM control on the perceptual scale, so 50 sounds about half as loud. (In
+`robotctl configure` it is the same key, and the editor knows it is live.)
 Audio hardware bring-up — codec driver, overlays, mixer — is `setup-board.sh`'s audio
 section, once per board.
 

@@ -459,6 +459,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "…and ends below this one (hysteresis)",
     ),
+    entry(
+        "audio.volume",
+        Kind::Integer,
+        "Speaker loudness, 0–100; applies within a second, no restart",
+    ),
     // ── [media] ──────────────────────────────────────────────────────────────
     feature(
         "media.source",

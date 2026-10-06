@@ -997,6 +997,7 @@ intents the loop already arbitrates.
 | in the process | what it is | where the reasoning lives |
 |---|---|---|
 | `sound.rs` | the voice at play time — one `aplay` child, and a new sound kills the old one, because the codec's PCM is exclusive | the module header |
+| `volume.rs` | `[audio] volume` → the codec's PCM control: set at start, and again within a second of the file changing — the one `[audio]` key that needs no restart; `amixer` runs on a worker thread, never the 50 Hz loop | the module header |
 | `theremin.rs` | depth from `tofd` at 15 Hz → a note, a mouth opening, and a line of state, sampled by the 50 Hz loop and never waited on | the module header |
 | `chorale.rs` | several ducks singing one piece: the lowest id conducts, the conductor owns the seating, `btd` carries the beacons and does no thinking | the module header |
 | `pet-detect/` | a ~20 KB CNN over a 40-band log-mel window from the onboard mic, in its own worker | the crate header |

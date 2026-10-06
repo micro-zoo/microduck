@@ -649,6 +649,31 @@ pub fn bind_pad(path: &Path, button: &str, skill: &str) -> Result<(), String> {
     model.save()
 }
 
+/// The speaker volume as the daemon resolves it — config over the default, 0–100.
+pub fn audio_volume(path: &Path) -> Result<u8, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    toml::from_str::<Params>(&text)
+        .map(|params| params.audio.volume)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Set `audio.volume`. `robotd` re-sets the mixer within a second of the file changing, so there
+/// is nothing to restart; the same document and validation as every other edit, so a percentage
+/// out of range is refused here rather than at the daemon, and 100 — the default — removes the key.
+pub fn set_audio_volume(path: &Path, percent: u8) -> Result<(), String> {
+    let mut model = Model::load(path)?;
+    let entry = REGISTRY
+        .iter()
+        .find(|e| e.key == "audio.volume")
+        .ok_or_else(|| "audio.volume is not a key robotd knows".to_owned())?;
+    model.edit(entry, &percent.to_string())?;
+    model.save()
+}
+
 /// Record which file a policy slot runs — or clear the key, which is what a reset is.
 ///
 /// **The daemon's half of `robot.loadPolicy`.** A slot is `[policy] <slot>` in the config file
@@ -1001,6 +1026,46 @@ mod tests {
         assert_eq!(
             bindings.lb, "kick_left",
             "the rest resolve to their defaults"
+        );
+    }
+
+    /// The volume is one key, written through the same document: comments survive, a level
+    /// reads back, and full — the default — is not pinned.
+    #[test]
+    fn the_volume_round_trips_and_full_is_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "# hand-written\n[audio]\ngreet = false\n").unwrap();
+        assert_eq!(super::audio_volume(&path).unwrap(), 100, "unset is full");
+
+        super::set_audio_volume(&path, 40).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("volume = 40"), "{written}");
+        assert!(
+            written.contains("# hand-written") && written.contains("greet = false"),
+            "{written}"
+        );
+        assert_eq!(super::audio_volume(&path).unwrap(), 40);
+
+        super::set_audio_volume(&path, 100).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("volume"),
+            "the default is not pinned: {written}"
+        );
+        assert_eq!(super::audio_volume(&path).unwrap(), 100);
+    }
+
+    #[test]
+    fn a_volume_past_a_hundred_percent_is_refused_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("robotd.toml");
+        std::fs::write(&path, "[audio]\ngreet = true\n").unwrap();
+        let err = super::set_audio_volume(&path, 150).expect_err("not a percentage");
+        assert!(err.contains("audio.volume"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[audio]\ngreet = true\n"
         );
     }
 

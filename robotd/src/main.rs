@@ -26,6 +26,7 @@ mod pickup;
 mod soc;
 mod sound;
 mod theremin;
+mod volume;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -2139,6 +2140,14 @@ async fn control_loop<T: RobotIo>(
         tracing::warn!("chorale: this robot will sing with others");
     }
 
+    // The speaker level, before the greet so that plays at the configured loudness. Re-checked every
+    // RATE_WINDOW below: `audio.volume` is the one `[audio]` key that never needs a restart.
+    let mut volume = params
+        .audio
+        .enabled
+        .then(|| volume::Volume::new(&params_path, &params.audio.device, params.audio.volume))
+        .flatten();
+
     // Say hello in this robot's own voice as the control loop comes up, as the prototype
     // does — the greet is also the audible "robotd is running" on a headless board. Its
     // own switch, because the reason to want it gone (restarting the daemon all day) is
@@ -3527,6 +3536,9 @@ async fn control_loop<T: RobotIo>(
             window_ticks = 0;
 
             publish_slow_sensors(&mut safety, &state);
+            if let Some(volume) = volume.as_mut() {
+                volume.poll();
+            }
 
             if last_summary.elapsed() >= LOOP_SUMMARY_INTERVAL {
                 tracing::info!(
