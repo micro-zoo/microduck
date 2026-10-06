@@ -56,6 +56,7 @@ impl Volume {
     }
 
     fn with_setter(path: &Path, initial: u8, mut set: Box<dyn FnMut(u8) + Send>) -> Self {
+        tracing::info!(volume = initial, "speaker volume set at start");
         set(initial);
         Self {
             path: path.to_owned(),
