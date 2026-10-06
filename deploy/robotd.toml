@@ -3,9 +3,9 @@
 # Installed to /etc/robot/robotd.toml. Mostly read once at startup and not watched, so
 # mostly a change needs a restart — of the daemon that reads the section, which is not
 # always robotd: [media] and [duck_detector] are mediad's and [head_imu] is tofd's. The two
-# exceptions: padd re-reads [pad_imu_head_control] a second after the file changes, and robotd
-# re-reads [policy] when asked. `robotctl configure` knows which is which and offers it
-# (docs/design/robotd-design.md §4.2).
+# exceptions: padd re-reads [pad], [pad_imu_head_control] and [pad_drive] a second after the
+# file changes, and robotd re-reads [policy] when asked. `robotctl configure` knows which is
+# which and offers it (docs/design/robotd-design.md §4.2).
 #
 # It lives here, and not under /opt/robot/daemon/releases/<ver>/, on purpose: this is
 # per-robot configuration rather than a shipped default, so it must survive an update
@@ -313,6 +313,30 @@ mode = "walk"
 # pet_enter_threshold = 0.95
 # pet_exit_threshold = 0.85
 
+[pickup]
+# Pause the policy while somebody holds the robot, and resume it when the robot is put back
+# down — instead of the legs thrashing in the hand until somebody presses Start. A small
+# classifier reads the last second of what the loop already reads (gyro, gravity, joints,
+# what it commanded); paused, the robot ramps to the walking policy's own standing stance at
+# the policy gain, and the policy takes it back the moment it is on the floor.
+#
+# **On by default.** The model is trained in simulation only, and held up on the robot however it
+# was handled — by the body or the head, upside down, spun round. Off means nothing loaded and
+# nothing run. Only the walking and standing networks are watched — a skill, a sit or a
+# limp-fall is never paused. If it ever pauses a robot that is walking normally, this is the
+# switch.
+# enabled = true
+
+# The classifier. Ships in the release (models/pickup_detector.onnx); "none" disables it.
+# model = ".../current/models/pickup_detector.onnx"
+
+# The hysteresis on p(held): pause above pause_threshold for 100 ms, resume below
+# resume_threshold for 80 ms once the pause is 300 ms old. Resume is the quick side on purpose:
+# a paused robot set down on the floor is holding a fixed pose, and a fixed pose tips — the
+# sooner the policy has it back, the less often it does.
+# pause_threshold = 0.8
+# resume_threshold = 0.35
+
 [theremin]
 # The ToF theremin: a hand's distance in front of the beak becomes a note, and the mouth
 # opens with the pitch. Picked up with `robotctl theremin` (or `robot.theremin`) — this
@@ -496,3 +520,21 @@ mode = "walk"
 # Head radians per pad radian. 1 follows the pad exactly; more turns a small wrist movement into
 # a large head movement. The head's own travel limit still applies.
 # gain = 1.0
+
+# ── Pad walking speeds ──────────────────────────────────────────────────────────────────────
+#
+# Read by `padd`, which picks up a change within a second. What full stick deflection asks for
+# while walking, per axis and per direction; the stick is linear between centre and each bound.
+# Signed in the robot's frame — vx forward, vy left, vyaw counter-clockwise from above — so each
+# `_min` is negative, and zero switches that direction off. A positive `_min` is refused rather
+# than guessed at. Roller mode keeps its own shaping.
+#
+# This is what the pad asks for, not a limit on the robot: the policy only follows commands
+# inside the range it was trained on.
+# [pad_drive]
+# vx_max = 0.3
+# vx_min = -0.3
+# vy_max = 0.3
+# vy_min = -0.3
+# vyaw_max = 1.5
+# vyaw_min = -1.5

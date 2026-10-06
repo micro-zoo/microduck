@@ -143,8 +143,8 @@ Three properties worth trusting:
 
 Saving offers what the change actually needs, from the daemon that actually reads it: a restart
 for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
-*reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]` and
-`[pad_imu_head_control]`, which `padd` picks up within a second. `sudo`, because the file
+*reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]`,
+`[pad_imu_head_control]` and `[pad_drive]`, which `padd` picks up within a second. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
 `--file` points it elsewhere for a bench copy. The shipped `deploy/robotd.toml` stays the
 reference for *why* each knob exists; this is for flipping them.
@@ -474,6 +474,28 @@ and says so.
 or `fall_recover` in `robotd.toml` arms the gate: there a fallen robot goes limp and refuses
 `init`/`enable`/skills until it is stood up.
 
+### Picking the robot up
+
+A robot picked up mid-walk notices: about 0.2 s after it is lifted the legs settle into a standing
+stance and stay there, however you hold it — by the body or the head, upside down, spun round — and
+about 0.2 s after it is set down on its feet the policy takes it back. `[pickup] enabled = false`
+(`sudo robotctl configure`, then let it restart `robotd`) turns it off, and the legs keep walking in
+your hand until you press Start, as they used to.
+
+```
+journalctl -u robotd -f | grep -E 'picked up|put down|pickup'
+```
+
+`picked up — pausing the policy` and `put down — handing the robot back to the policy` are the two
+edges, each with the probability that crossed. While paused, `robotctl monitor` shows `PICKED UP`
+where it otherwise says `upright` (the policy reads `held`), and `robot.state` carries
+`safety.picked_up`. Only walking and standing are watched — a skill, a sit or a fall is never paused.
+
+**On by default.** The classifier was trained in simulation only; what would mean it is wrong is a
+pause while the robot is walking normally (the walk freezes for a moment, then resumes), or a robot
+that stays paused after being put down. `pause_threshold` and `resume_threshold` in the
+same section move the two edges; the design is [`robotd-design.md` §2.4.2](../design/robotd-design.md).
+
 ### Gamepad (`configd`)
 
 What each button *does* — and how to change it — is under **Policies and skills** above
@@ -518,7 +540,7 @@ mapping is the prototype's, so muscle memory carries over:
 | **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
 | **DPad-Right** | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
 | **Select**, short press | torque off (`robot.relax`) **on release**: the emergency stop. The robot drops, so hold it. Then Start stands it up again |
-| **Select**, held 2 s | sit down, torque off, power off — the release afterwards does nothing more |
+| **Select**, held 2 s | sit down, ease into the rest pose, torque off, power off — the release afterwards does nothing more |
 
 **Drive the head with the pad itself.** A Pro Controller carries an IMU, and with
 
@@ -554,15 +576,9 @@ pad     Xbox Wireless Controller 78:86:2E:BB:13:28  connected
 padd    active — driving whatever pad connects
 ```
 
-To drive with non-default limits, stop the service first or two processes fight over the sticks:
-
-```
-sudo systemctl stop padd
-```
-
-```
-sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
-```
+To drive with non-default speeds, set them in `[pad_drive]` — `vx_max`/`vx_min` forward and back,
+`vy_max`/`vy_min` strafe, `vyaw_max`/`vyaw_min` turning, each `_min` negative — with
+`sudo robotctl configure`. `padd` picks the change up within a second, no restart.
 
 When the link itself is the suspect, watch it live — `robotctl monitor`, then `p`. That works with
 no robot too: on a board whose servos are unpowered or whose `robotd` is stopped, the monitor opens

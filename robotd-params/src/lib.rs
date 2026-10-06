@@ -70,6 +70,7 @@ pub struct Params {
     pub safety: SafetyParams,
     pub audio: AudioParams,
     pub theremin: ThereminParams,
+    pub pickup: PickupParams,
     pub head_imu: HeadImuParams,
     pub chorale: ChoraleParams,
     pub media: MediaParams,
@@ -89,6 +90,72 @@ pub struct Params {
     /// editor renames the section the next time it saves that file.
     #[serde(alias = "imu_head")]
     pub pad_imu_head_control: PadImuHeadControlParams,
+    /// How fast full stick deflection drives the robot. `padd` reads this as well.
+    pub pad_drive: PadDriveParams,
+}
+
+/// The pad's walking speed limits: what full stick deflection asks for, per axis and per
+/// direction.
+///
+/// Each axis has a bound per direction, signed in the robot's own frame — `vx` forward, `vy` to
+/// the left, `vyaw` counter-clockwise seen from above — so a `_min` is the bound in the negative
+/// direction and is itself negative (or zero, to forbid that direction). The stick is linear
+/// between centre and either bound. Walk mode only: roller mode keeps its own shaping.
+///
+/// This is what the *pad* asks for, not a limit on the robot. A `robot.move` from anywhere else
+/// is not bounded by it, and the policy only follows commands inside the range it was trained
+/// on — asking for more than that is asking, not getting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PadDriveParams {
+    /// Full stick forward, m/s.
+    pub vx_max: f64,
+    /// Full stick back, m/s — negative.
+    pub vx_min: f64,
+    /// Full stick left, m/s.
+    pub vy_max: f64,
+    /// Full stick right, m/s — negative.
+    pub vy_min: f64,
+    /// Full right stick left (turn left), rad/s.
+    pub vyaw_max: f64,
+    /// Full right stick right (turn right), rad/s — negative.
+    pub vyaw_min: f64,
+}
+
+impl Default for PadDriveParams {
+    /// The prototype's alpha defaults, which were `padd`'s command-line defaults until they
+    /// moved here.
+    fn default() -> Self {
+        Self {
+            vx_max: 0.3,
+            vx_min: -0.3,
+            vy_max: 0.3,
+            vy_min: -0.3,
+            vyaw_max: 1.5,
+            vyaw_min: -1.5,
+        }
+    }
+}
+
+impl PadDriveParams {
+    /// Each axis as `(name, min, max)`, for validation and logging.
+    pub fn axes(&self) -> [(&'static str, f64, f64); 3] {
+        [
+            ("vx", self.vx_min, self.vx_max),
+            ("vy", self.vy_min, self.vy_max),
+            ("vyaw", self.vyaw_min, self.vyaw_max),
+        ]
+    }
+
+    /// A stick deflection in `[-1, 1]` scaled onto `[min, max]`: positive deflection towards
+    /// `max`, negative towards `min`, linear on each side of centre.
+    pub fn scale(deflection: f64, min: f64, max: f64) -> f64 {
+        if deflection >= 0.0 {
+            deflection * max
+        } else {
+            -deflection * min
+        }
+    }
 }
 
 /// Controller-IMU head control: pose the head by tilting the pad.
@@ -690,6 +757,50 @@ impl Default for ThereminParams {
             min_zones: hand.min_zones,
             statuses: hand.statuses,
             hold_ms: hand.hold.as_millis() as u64,
+        }
+    }
+}
+
+/// `[pickup]`: pause the policy while somebody holds the robot, resume when it is put down.
+///
+/// A classifier over the last second of what the loop already reads (`duck_control::pickup`,
+/// `docs/design/robotd-design.md` §2.4.2). **On by default** since the v2 model held up on the
+/// robot in every way it was handled (lifted by the body or the head, turned upside down, spun).
+/// Turned off, nothing is loaded and nothing runs — the loop is exactly what it was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PickupParams {
+    /// Master switch.
+    pub enabled: bool,
+    /// The classifier. Absent means the release's copy; the literal `"none"` disables it.
+    pub model: Option<PathBuf>,
+    /// Pause once p(held) has stayed above this for 100 ms.
+    pub pause_threshold: f32,
+    /// Resume once p(held) has stayed below this for 80 ms (and the pause is 300 ms old).
+    /// Higher resumes sooner after a put-down — which is what keeps a paused robot, holding a
+    /// fixed pose, from tipping before the policy has it back — at the price of more false
+    /// resumes in the hand.
+    pub resume_threshold: f32,
+}
+
+impl Default for PickupParams {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: None,
+            pause_threshold: 0.8,
+            resume_threshold: 0.35,
+        }
+    }
+}
+
+impl PickupParams {
+    /// The classifier path, or `None` when disabled with the `"none"` sentinel.
+    pub fn model_resolved(&self) -> Option<PathBuf> {
+        match &self.model {
+            Some(p) if is_none_sentinel(p) => None,
+            Some(p) => Some(p.clone()),
+            None => Some(PathBuf::from(RELEASE_DIR).join("models/pickup_detector.onnx")),
         }
     }
 }
@@ -1931,6 +2042,26 @@ pub enum ParamsError {
         min: u32,
         max: u32,
     },
+    #[error(
+        "{path}: pad_drive.{axis}_min must be zero or negative and pad_drive.{axis}_max zero or \
+         positive, got {min} and {max} — the bounds are signed, so full stick back at 0.2 m/s is \
+         vx_min = -0.2"
+    )]
+    PadDrive {
+        path: String,
+        axis: &'static str,
+        min: f64,
+        max: f64,
+    },
+    #[error(
+        "{path}: pickup.resume_threshold ({resume}) must be below pickup.pause_threshold \
+         ({pause}), and both between 0 and 1 — they are a hysteresis band on a probability"
+    )]
+    Pickup {
+        path: String,
+        pause: f32,
+        resume: f32,
+    },
 }
 
 /// The band `media.bitrate` is accepted in, bits per second.
@@ -2017,6 +2148,29 @@ impl Params {
                 got: bitrate,
                 min: BITRATE_MIN,
                 max: BITRATE_MAX,
+            });
+        }
+        // Signed bounds, so a positive `_min` is somebody who wrote a magnitude: full stick
+        // back would then walk the robot *forward*. Refused rather than taken as its absolute
+        // value, because the editor should say which of the two readings it was not going to
+        // guess.
+        for (axis, min, max) in self.pad_drive.axes() {
+            if !(min.is_finite() && max.is_finite() && min <= 0.0 && max >= 0.0) {
+                return Err(ParamsError::PadDrive {
+                    path: path.display().to_string(),
+                    axis,
+                    min,
+                    max,
+                });
+            }
+        }
+        // An inverted band would pause and resume on the same probability, every tick.
+        let (pause, resume) = (self.pickup.pause_threshold, self.pickup.resume_threshold);
+        if !(0.0 < resume && resume < pause && pause < 1.0) {
+            return Err(ParamsError::Pickup {
+                path: path.display().to_string(),
+                pause,
+                resume,
             });
         }
         Ok(())
@@ -3030,6 +3184,74 @@ mod tests {
         );
     }
 
+    /// A `_min` written as a magnitude would turn full stick back into walking forward. Refused,
+    /// and so `robotctl configure` cannot write it.
+    #[test]
+    fn a_positive_pad_drive_min_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "[pad_drive]\nvx_min = 0.2\n");
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("pad_drive.vx_min"), "{error}");
+
+        let path = write(dir.path(), "[pad_drive]\nvyaw_max = -1.0\n");
+        assert!(Params::load(&path, true).is_err());
+
+        // Zero is a direction switched off, which is a thing somebody might want.
+        let path = write(dir.path(), "[pad_drive]\nvx_min = 0.0\nvy_min = -0.1\n");
+        let params = Params::load(&path, true).expect("valid");
+        assert_eq!(params.pad_drive.vx_min, 0.0);
+        assert_eq!(params.pad_drive.vy_min, -0.1);
+    }
+
+    /// On by default, from the release's own copy of the model — a robot nobody configured stops
+    /// thrashing in the hand. `"none"` is the way to keep the switch on and load nothing.
+    #[test]
+    fn pickup_detection_ships_on_and_resolves_the_releases_model() {
+        let pickup = Params::default().pickup;
+        assert!(pickup.enabled);
+        assert_eq!(
+            pickup.model_resolved(),
+            Some(PathBuf::from(RELEASE_DIR).join("models/pickup_detector.onnx"))
+        );
+        let none = PickupParams {
+            model: Some(PathBuf::from("none")),
+            ..pickup
+        };
+        assert_eq!(none.model_resolved(), None);
+    }
+
+    /// The two thresholds are a hysteresis band. Inverted, the latch would pause and resume on
+    /// the same probability — refused, so `robotctl configure` cannot write it.
+    #[test]
+    fn an_inverted_pickup_band_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "[pickup]\npause_threshold = 0.3\nresume_threshold = 0.5\n",
+        );
+        let error = Params::load(&path, true).expect_err("refused").to_string();
+        assert!(error.contains("pickup.resume_threshold"), "{error}");
+        let path = write(dir.path(), "[pickup]\npause_threshold = 1.0\n");
+        assert!(Params::load(&path, true).is_err());
+        let path = write(
+            dir.path(),
+            "[pickup]\nenabled = true\nresume_threshold = 0.5\n",
+        );
+        assert!(Params::load(&path, true).unwrap().pickup.enabled);
+    }
+
+    /// Each side of centre scales onto its own bound.
+    #[test]
+    fn pad_drive_scales_each_direction_onto_its_own_bound() {
+        let scale = PadDriveParams::scale;
+        assert_eq!(scale(1.0, -0.2, 0.4), 0.4);
+        assert_eq!(scale(-1.0, -0.2, 0.4), -0.2);
+        assert_eq!(scale(0.5, -0.2, 0.4), 0.2);
+        assert_eq!(scale(-0.5, -0.2, 0.4), -0.1);
+        assert_eq!(scale(0.0, -0.2, 0.4), 0.0);
+        assert_eq!(scale(-1.0, 0.0, 0.4), 0.0);
+    }
+
     /// A bitrate in the wrong unit is the mistake this band exists to catch: `2000` is somebody
     /// who meant kilobits, and it would produce a stream with no picture in it.
     #[test]
@@ -3080,6 +3302,7 @@ mod tests {
         );
         assert_eq!(from_file.policy.resolved(), built_in.policy.resolved());
         assert_eq!(from_file.safety.limp_fall, built_in.safety.limp_fall);
+        assert_eq!(from_file.pickup, built_in.pickup);
         assert_eq!(
             from_file.safety.battery_empty_shutdown,
             built_in.safety.battery_empty_shutdown
@@ -3088,6 +3311,7 @@ mod tests {
             from_file.update_gate.min_achieved_hz,
             built_in.update_gate.min_achieved_hz
         );
+        assert_eq!(from_file.pad_drive, built_in.pad_drive);
         assert_eq!(
             from_file.update_gate.stall_periods,
             built_in.update_gate.stall_periods

@@ -54,6 +54,31 @@ pub const DEFAULT_POSITION: [f64; NUM_JOINTS] = [
     -0.4530, // right_ankle
 ];
 
+/// Rest pose: where a seated robot settles with its torque off. Recorded on graphite-bang
+/// sitting stably untorqued (2026-10-03), averaged over a second of samples.
+///
+/// The shutdown eases the joints here from the policy's seat before cutting torque. The seat
+/// the sitstand network holds is not where the robot comes to rest once nothing holds it, so
+/// cutting torque straight from the seat let the robot sag forward. Arriving here first, it
+/// is already where it would fall to.
+pub const REST_POSITION: [f64; NUM_JOINTS] = [
+    0.3129,  // left_hip_yaw
+    0.4050,  // left_hip_roll
+    -0.2338, // left_hip_pitch
+    1.5493,  // left_knee
+    0.5522,  // left_ankle
+    0.9572,  // neck_pitch
+    1.4787,  // head_pitch
+    -0.0129, // head_yaw
+    -0.0522, // head_roll
+    -0.0121, // mouth
+    0.0353,  // right_hip_yaw
+    -0.5660, // right_hip_roll
+    0.2853,  // right_hip_pitch
+    -1.4696, // right_knee
+    -0.4096, // right_ankle
+];
+
 /// Mouth travel, radians: closed and fully open. The alpha reuses the v1.6 range,
 /// −5°..+30°, from `microduck_runtime`'s `variant.rs`.
 ///

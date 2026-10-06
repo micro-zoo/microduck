@@ -22,6 +22,7 @@ mod chorale;
 mod control;
 mod intents;
 mod params;
+mod pickup;
 mod soc;
 mod sound;
 mod theremin;
@@ -115,11 +116,18 @@ const HOME_RAMP: Duration = Duration::from_secs(2);
 /// `microduck_runtime`.
 const BATTERY_EMA_ALPHA: f64 = 0.1;
 
-/// How long the shutdown sit gets before torque is cut and the machine powers off, when no
-/// controller is there to say. The sitstand descent is a deliberate ~2 s glide; the prototype
-/// gives it four seconds, and a running controller derives the same from the set's `ramp_s`
+/// How long the policy holds the shutdown sit before the rest ramp, when no controller is there
+/// to say. The sitstand descent is a deliberate ~2 s glide and the robot then sits still for a
+/// second; a running controller derives the same from the set's `ramp_s`
 /// (`Controller::shutdown_sit_secs`).
-const SHUTDOWN_SIT: Duration = Duration::from_secs(4);
+const SHUTDOWN_SIT: Duration = Duration::from_secs(3);
+
+/// The shutdown's last leg, after the sit: a linear ramp from the seat to
+/// [`duck_control::REST_POSITION`], then a hold there, then torque off. Cutting torque straight
+/// from the policy's seat let the robot sag forward; from the rest pose there is nowhere left to
+/// sag to. Slow on purpose — the robot is on the floor and nothing is in a hurry.
+const REST_RAMP: Duration = Duration::from_secs(1);
+const REST_HOLD: Duration = Duration::from_secs(1);
 
 /// How many consecutive failed bus reads the policy may drive through on the last good
 /// sample before it stops.
@@ -1392,6 +1400,33 @@ impl Bringup {
     }
 }
 
+/// The shutdown's ramp from the seat to the rest pose — see [`REST_RAMP`].
+struct RestRamp {
+    /// The last targets the sit commanded, so the ramp starts where the servos were being held
+    /// rather than where gravity had them: no step on the first tick.
+    from: [f64; NUM_JOINTS],
+    /// The gain the sit was running at, kept through the ramp and the hold.
+    gain: u16,
+    since: Instant,
+}
+
+impl RestRamp {
+    /// This tick's target: along the ramp, then the rest pose itself for the hold.
+    fn target(&self, now: Instant) -> [f64; NUM_JOINTS] {
+        let t = (now.duration_since(self.since).as_secs_f64() / REST_RAMP.as_secs_f64()).min(1.0);
+        let mut target = [0.0; NUM_JOINTS];
+        for (i, slot) in target.iter_mut().enumerate() {
+            *slot = self.from[i] + (duck_control::REST_POSITION[i] - self.from[i]) * t;
+        }
+        target
+    }
+
+    /// Ramped and held: torque can go.
+    fn done(&self, now: Instant) -> bool {
+        now.duration_since(self.since) >= REST_RAMP + REST_HOLD
+    }
+}
+
 /// One low-pass step toward `target`.
 ///
 /// A non-finite target is dropped, not folded in: `ema += α·(inf − ema)` is `inf` on this
@@ -1894,8 +1929,12 @@ async fn control_loop<T: RobotIo>(
     // bus pressure the spasms investigation taught this loop not to add.
     let mut odometry = odometry::Odometry::alpha();
 
-    // The sit-then-power-off sequence.
+    // The sit-then-power-off sequence: the policy sits, then `shutdown_rest` eases the joints
+    // into the rest pose before torque is cut.
     let mut shutdown_sit: Option<Instant> = None;
+    let mut shutdown_rest: Option<RestRamp> = None;
+    // What the previous tick commanded, which is where the rest ramp starts.
+    let mut last_targets = DEFAULT_POSITION;
     let mut powered_off = false;
     let mut warned_imu_warming = false;
 
@@ -1949,6 +1988,11 @@ async fn control_loop<T: RobotIo>(
         // model, or audio off. Quietly so on purpose — the mic is optional equipment.
         None
     };
+
+    // Pick-up detection (`[pickup]`). Off by default, and then this is `None` and nothing in
+    // the loop below loads, scores or pauses anything. A model that will not load is a
+    // warning, not unhealthy: the classifier is a convenience, and the robot walks without it.
+    let mut pickup_watch = pickup::Watch::build(&params.pickup);
 
     // The theremin. `[theremin] enabled` is off by default, so on most ducks this is `None`
     // and nothing here subscribes to depth at all — `tofd` keeps its own counsel, and
@@ -2510,14 +2554,26 @@ async fn control_loop<T: RobotIo>(
         });
         if let Some(started) = shutdown_sit
             && !powered_off
-            && tick_start.duration_since(started) >= shutdown_sit_hold
         {
-            tracing::warn!("sit complete: cutting torque and powering off");
-            cut_torque_before_poweroff(&mut safety);
-            intents.set_enabled(false);
-            bringup = Bringup::Limp;
-            powered_off = true;
-            poweroff();
+            match shutdown_rest.as_ref() {
+                None if tick_start.duration_since(started) >= shutdown_sit_hold => {
+                    tracing::warn!("sit complete: easing into the rest pose");
+                    shutdown_rest = Some(RestRamp {
+                        from: last_targets,
+                        gain: safety.gain().unwrap_or(policy_cfg.gain),
+                        since: tick_start,
+                    });
+                }
+                Some(rest) if rest.done(tick_start) => {
+                    tracing::warn!("at rest: cutting torque and powering off");
+                    cut_torque_before_poweroff(&mut safety);
+                    intents.set_enabled(false);
+                    bringup = Bringup::Limp;
+                    powered_off = true;
+                    poweroff();
+                }
+                _ => {}
+            }
         }
 
         // Limp-fall (`[safety] limp_fall`): catch the fall on the way down.
@@ -2640,6 +2696,51 @@ async fn control_loop<T: RobotIo>(
             }
         }
         let in_limp_fall = limp_fall != LimpFall::Idle;
+
+        // Pick-up detection (`[pickup]`): pause the walking/standing networks while somebody
+        // holds the robot, hand it back when it is on the floor. Watches only while those two
+        // networks have the robot — everything that owns it outright (a skill, a sit, the
+        // limp-fall, a disable, the shutdown sit) ends a pause and resets the watch. Roller mode
+        // is not watched: the model has never seen wheels.
+        let pickup_paused = match pickup_watch.as_mut() {
+            Some(watch) => {
+                let watching = policy_cfg.mode == Mode::Walk
+                    && snapshot.enabled
+                    && bringup == Bringup::Ready
+                    && !in_limp_fall
+                    && safety.imu_ready()
+                    && shutdown_sit.is_none()
+                    && shutdown_rest.is_none()
+                    && !powered_off
+                    && controller
+                        .as_ref()
+                        .is_some_and(|c| !c.busy() && !c.is_sitting());
+                let p_held = watch.p_held().map(|p| format!("{p:.2}"));
+                match watch.tick(watching, fresh.as_ref(), period) {
+                    Some(pickup::Edge::Pause) => {
+                        tracing::warn!(
+                            p_held = watch.p_held().map(|p| format!("{p:.2}")),
+                            "picked up — pausing the policy"
+                        )
+                    }
+                    Some(pickup::Edge::Resume) if watching => {
+                        tracing::warn!(
+                            p_held = watch.p_held().map(|p| format!("{p:.2}")),
+                            "put down — handing the robot back to the policy"
+                        )
+                    }
+                    Some(pickup::Edge::Resume) => {
+                        tracing::warn!(
+                            p_held,
+                            "pickup pause released: something else has the robot"
+                        )
+                    }
+                    None => {}
+                }
+                watch.paused()
+            }
+            None => false,
+        };
 
         // Smooth the command. The limp-fall sequence holds the twist at zero outright, so
         // the robot is not handed back mid-command; and leaving body-pose mode snaps the
@@ -2896,6 +2997,10 @@ async fn control_loop<T: RobotIo>(
             // The limp-fall sequence owns the robot for its duration: the whole point is
             // that the policy is *not* driving while the robot falls, lands and is posed.
             && !in_limp_fall
+            // Held in somebody's hand: the robot holds the pause pose until it is put down.
+            && !pickup_paused
+            // The rest ramp has the robot for the end of a shutdown.
+            && shutdown_rest.is_none()
             && sensors.is_some()
             && imu_warm
             && !powered_off;
@@ -2983,6 +3088,27 @@ async fn control_loop<T: RobotIo>(
                 ),
                 LimpFall::Idle => unreachable!("in_limp_fall excludes Idle"),
             },
+            // The end of a shutdown, from the seat to the rest pose. `driving` is false while it
+            // runs, so the policy is not stepped under it.
+            _ if !powered_off && shutdown_rest.is_some() => {
+                let rest = shutdown_rest.as_ref().expect("just checked it is Some");
+                (rest.target(tick_start), rest.gain, true, "rest".into())
+            }
+            // Picked up: ramp from the policy's last target to the pause pose, at the policy gain —
+            // the gain the pose was chosen and evaluated at. `moving` while the ramp travels.
+            // Labelled `held` like any other tick the policy does not drive: being picked up is
+            // a state of the robot, and it goes out as one (`safety.picked_up`).
+            _ if pickup_paused => {
+                let watch = pickup_watch
+                    .as_ref()
+                    .expect("pickup_paused implies a watch");
+                (
+                    watch.target(),
+                    policy_cfg.gain,
+                    watch.ramping(),
+                    "held".into(),
+                )
+            }
             (true, Some(sensors)) => {
                 let controller = controller.as_mut().expect("driving implies a controller");
                 match controller.step(sensors, &command, snapshot.pose.active, dt, scale_mult) {
@@ -3194,6 +3320,12 @@ async fn control_loop<T: RobotIo>(
                 duck_control::model::mouth_target(snapshot.mouth);
         }
 
+        // The next feature row pairs its reading with this command.
+        if let Some(watch) = pickup_watch.as_mut() {
+            watch.commanded(&targets);
+        }
+
+        last_targets = targets;
         match safety.apply(targets, hold, gain) {
             Ok(applied) => limits.extend(applied.limits),
             Err(e) => tracing::warn!(error = %e, "bus write failed"),
@@ -3222,6 +3354,7 @@ async fn control_loop<T: RobotIo>(
                     limp: matches!(limp_fall, LimpFall::Limp { .. }),
                     gravity: sensors.imu.gravity,
                     gain: safety.gain(),
+                    picked_up: pickup_paused,
                 },
                 control_loop: proto::LoopState {
                     hz: f64::from_bits(state.achieved_hz.load(Ordering::Relaxed)),
@@ -8506,6 +8639,40 @@ mod tests {
             intents.take_power_request(),
             Some(intents::PowerRequest::Relax)
         );
+    }
+
+    /// The shutdown's rest ramp: no step at the start, the rest pose at the end, and torque held
+    /// through [`REST_HOLD`] before `done`. Tested directly for the home ramp's reason — the sit
+    /// that precedes it needs a loaded policy.
+    #[test]
+    fn the_rest_ramp_starts_at_the_seat_and_holds_the_rest_pose() {
+        let since = Instant::now();
+        let rest = RestRamp {
+            from: DEFAULT_POSITION,
+            gain: 30,
+            since,
+        };
+
+        assert_eq!(rest.target(since), DEFAULT_POSITION);
+        let mid = rest.target(since + REST_RAMP / 2);
+        for i in 0..NUM_JOINTS {
+            let want = (DEFAULT_POSITION[i] + duck_control::REST_POSITION[i]) / 2.0;
+            assert!(
+                (mid[i] - want).abs() < 1e-9,
+                "joint {i}: {} vs {want}",
+                mid[i]
+            );
+        }
+        assert_eq!(rest.target(since + REST_RAMP), duck_control::REST_POSITION);
+        assert_eq!(
+            rest.target(since + REST_RAMP + REST_HOLD / 2),
+            duck_control::REST_POSITION,
+            "the hold stays at rest"
+        );
+
+        assert!(!rest.done(since + REST_RAMP));
+        assert!(!rest.done(since + REST_RAMP + REST_HOLD - Duration::from_millis(1)));
+        assert!(rest.done(since + REST_RAMP + REST_HOLD));
     }
 
     /// The ramp itself, which is the part that decides whether a robot stands up or snaps.

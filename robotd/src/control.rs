@@ -92,7 +92,8 @@ pub struct SkillTuning {
     /// 1 s is enough on the robot — velstand owns the tail of the rise fine.
     pub sitstand_rise_s: f64,
     /// How long the seat takes to settle after the posture flag flips: the ~2 s glide the
-    /// network is trained on. The shutdown sit waits twice this before cutting torque.
+    /// network is trained on. The shutdown sit waits this plus a second before easing into the
+    /// rest pose.
     pub sitstand_ramp_s: f64,
     /// The one-shot skills, in priority order — name, duration, whether holding chains, and
     /// what each changes about the robot while it runs. Config, resolved over the built-ins.
@@ -303,10 +304,10 @@ impl Controller {
         self.policy.has_sitstand()
     }
 
-    /// How long a shutdown sit gets before torque is cut: twice the seat's settle time, which
-    /// is the prototype's four seconds over its ~2 s glide.
+    /// How long the policy holds the shutdown sit before the joints ease into the rest pose:
+    /// the seat's settle time, then a second sitting still.
     pub fn shutdown_sit_secs(&self) -> f64 {
-        2.0 * self.skills.sitstand_ramp_s
+        self.skills.sitstand_ramp_s + 1.0
     }
 
     pub fn is_sitting(&self) -> bool {

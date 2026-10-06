@@ -35,7 +35,7 @@
 //! video setting is an edit that reads as having done nothing at all.
 //!
 //! Mostly, not always, and the exceptions are where offering a restart is worst. `padd` re-reads
-//! `[pad]` and `[pad_imu_head_control]` a second after the file changes, so a restart there drops the pad
+//! `[pad]`, `[pad_imu_head_control]` and `[pad_drive]` a second after the file changes, so a restart there drops the pad
 //! session — and robotd's deadman with it — to apply what would have applied by itself. `robotd`
 //! re-reads `[policy]` on a call, so a restart there takes motor control away from a standing
 //! robot to change a number it would have taken standing up.
@@ -106,7 +106,7 @@ fn apply_for(key: &str) -> Option<Apply> {
         // "padd picks this up within a second".
         //
         // `pad_imu_head_control` is the *controller's* IMU steering the head. Not `head_imu` below.
-        "pad" | "pad_imu_head_control" => Apply::Live("padd"),
+        "pad" | "pad_imu_head_control" | "pad_drive" => Apply::Live("padd"),
         // `tofd` reads `[head_imu]` out of robotd's file — see `tof/src/config.rs` for why it
         // reads that file rather than one of its own — and reads it once, at startup.
         "head_imu" => Apply::Restart("tofd"),
@@ -120,7 +120,7 @@ fn apply_for(key: &str) -> Option<Apply> {
         //   is false — so the one direction anybody cares about, off to on, cannot be a reload.
         "policy" if name != "mode" && name != "enabled" => Apply::Reload("robotd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "theremin"
-        | "audio" => Apply::Restart("robotd"),
+        | "pickup" | "audio" => Apply::Restart("robotd"),
         _ => return None,
     })
 }
@@ -1127,7 +1127,7 @@ mod tests {
         assert!(plan.restart.is_empty(), "and it needs no restart");
     }
 
-    /// `[pad]` and `[pad_imu_head_control]` are live: padd re-reads them, so there is nothing to offer.
+    /// `[pad]`, `[pad_imu_head_control]` and `[pad_drive]` are live: padd re-reads them, so there is nothing to offer.
     ///
     /// The inverse of the `[head_imu]` bug and the same mistake — a mapping that does not
     /// describe the daemon. `padd` stats the file every second and re-reads both sections when
@@ -1142,11 +1142,14 @@ mod tests {
             "pad.dpad_down",
             "pad_imu_head_control.enabled",
             "pad_imu_head_control.gain",
+            "pad_drive.vx_max",
+            "pad_drive.vyaw_min",
         ] {
             let mut m = model("");
             let value = match key {
                 "pad_imu_head_control.enabled" => "true",
-                "pad_imu_head_control.gain" => "0.5",
+                "pad_imu_head_control.gain" | "pad_drive.vx_max" => "0.5",
+                "pad_drive.vyaw_min" => "-1.0",
                 _ => "walk",
             };
             m.edit(entry(key), value).expect("valid");

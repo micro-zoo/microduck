@@ -1072,6 +1072,7 @@ mod tests {
                 "safety",
                 "duck_detector",
                 "chorale",
+                "pickup",
                 "theremin",
                 "head_imu",
                 "audio",
@@ -1079,7 +1080,8 @@ mod tests {
                 // Last, and the editor shows sections in this order: the pad is what a robot's
                 // buttons do, which is the thing somebody browses for rather than tunes.
                 "pad",
-                "pad_imu_head_control"
+                "pad_imu_head_control",
+                "pad_drive"
             ]
         );
     }

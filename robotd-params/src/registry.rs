@@ -341,6 +341,27 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Bool,
         "Sing with nearby ducks — off means silent AND invisible on the air",
     ),
+    // ── [pickup] ─────────────────────────────────────────────────────────────
+    feature(
+        "pickup.enabled",
+        Kind::Bool,
+        "Pause the policy while the robot is held, resume when put down",
+    ),
+    entry(
+        "pickup.model",
+        Kind::OptionalPath,
+        "Pick-up classifier; unset = the release's copy",
+    ),
+    entry(
+        "pickup.pause_threshold",
+        Kind::Float,
+        "Pause above this p(held), held for 100 ms",
+    ),
+    entry(
+        "pickup.resume_threshold",
+        Kind::Float,
+        "Resume below this p(held), held for 80 ms — higher resumes sooner after a put-down",
+    ),
     // ── [theremin] ───────────────────────────────────────────────────────────
     feature(
         "theremin.enabled",
@@ -467,6 +488,32 @@ pub const REGISTRY: &[Entry] = &[
         "pad_imu_head_control.gain",
         Kind::Float,
         "Head radians per pad radian — 1 follows the pad exactly, more amplifies the wrist",
+    ),
+    // ── [pad_drive] ──────────────────────────────────────────────────────────
+    //
+    // What full stick deflection asks for while walking. Read by `padd`, like `[pad]`. Signed
+    // bounds in the robot's frame: a `_min` is negative.
+    entry("pad_drive.vx_max", Kind::Float, "Full stick forward, m/s"),
+    entry(
+        "pad_drive.vx_min",
+        Kind::Float,
+        "Full stick back, m/s — negative (-0.2 is 0.2 m/s backward)",
+    ),
+    entry(
+        "pad_drive.vy_max",
+        Kind::Float,
+        "Full stick left (strafe), m/s",
+    ),
+    entry(
+        "pad_drive.vy_min",
+        Kind::Float,
+        "Full stick right (strafe), m/s — negative",
+    ),
+    entry("pad_drive.vyaw_max", Kind::Float, "Full turn left, rad/s"),
+    entry(
+        "pad_drive.vyaw_min",
+        Kind::Float,
+        "Full turn right, rad/s — negative",
     ),
 ];
 
@@ -667,6 +714,7 @@ mod tests {
                 "safety.limp_fall",
                 "duck_detector.enabled",
                 "chorale.accept",
+                "pickup.enabled",
                 "theremin.enabled",
                 "head_imu.enabled",
                 "audio.enabled",

@@ -136,14 +136,14 @@ Then from this clone, in another terminal:
 cargo run -p padd -- --socket /tmp/robotd.sock
 ```
 
-`systemctl start padd` puts the robot's own back. This is also where `padd`'s flags are worth
-having — `--max-linear` (m/s), `--max-angular` (rad/s), `--max-head` (radians) and `--deadzone`,
-which exists because analogue sticks rarely rest at exactly zero and the robot creeps without it.
-The unit runs with the defaults, so trying other values means running the binary yourself, here or
-on the board:
+`systemctl start padd` puts the robot's own back. The walking speeds are not flags: they are
+`[pad_drive]` in `robotd.toml`, set with `sudo robotctl configure` and picked up within a second.
+What is left on the command line is `--max-head` (radians) and `--deadzone`, which exists because
+analogue sticks rarely rest at exactly zero and the robot creeps without it. The unit runs with
+the defaults, so trying other values means running the binary yourself, here or on the board:
 
 ```bash
-sudo -u padd /opt/robot/daemon/current/bin/padd --max-linear 0.25
+sudo -u padd /opt/robot/daemon/current/bin/padd --deadzone 0.15
 ```
 
 ## From a laptop — `duckctl`

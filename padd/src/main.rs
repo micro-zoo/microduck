@@ -155,18 +155,6 @@ struct Args {
     #[arg(long, default_value_t = 0.1)]
     deadzone: f64,
 
-    /// Full-deflection forward/strafe speed, m/s. The prototype's alpha default.
-    #[arg(long, default_value_t = 0.3)]
-    max_linear: f64,
-
-    /// Full-deflection backward speed, m/s — the prototype caps reverse separately.
-    #[arg(long, default_value_t = 0.3)]
-    max_linear_backward: f64,
-
-    /// Full-deflection turn rate, rad/s.
-    #[arg(long, default_value_t = 1.5)]
-    max_angular: f64,
-
     /// Full-deflection head travel, radians. The head command feeds the policy's
     /// observation rather than a servo directly, so this is the prototype's generous 2.5 —
     /// the network itself decides how far the head actually goes.
@@ -288,7 +276,7 @@ enum Mode {
 /// How often to look for a rewritten config. See the loop.
 const BINDINGS_POLL: Duration = Duration::from_secs(1);
 
-/// The button bindings and the IMU head switch, or the defaults.
+/// The button bindings, the IMU head switch and the walking speeds, or the defaults.
 ///
 /// A file that will not parse is never a reason to leave somebody without a pad: the defaults
 /// are a working robot, and the reason is logged. That matters more here than elsewhere because
@@ -299,18 +287,22 @@ fn read_bindings(
 ) -> (
     robotd_params::PadParams,
     robotd_params::PadImuHeadControlParams,
+    robotd_params::PadDriveParams,
 ) {
     match robotd_params::Params::load(path, false) {
         Ok(params) => {
             let pad = params.pad;
             let imu_head = params.pad_imu_head_control;
+            let drive = params.pad_drive;
             tracing::info!(
                 a = %pad.a, x = %pad.x, lb = %pad.lb, rb = %pad.rb,
                 dpad_down = %pad.dpad_down,
                 pad_imu_head_control = imu_head.enabled, pad_imu_head_gain = imu_head.gain,
+                vx = ?(drive.vx_min, drive.vx_max), vy = ?(drive.vy_min, drive.vy_max),
+                vyaw = ?(drive.vyaw_min, drive.vyaw_max),
                 "button bindings"
             );
-            (pad, imu_head)
+            (pad, imu_head, drive)
         }
         Err(e) => {
             tracing::warn!(
@@ -321,6 +313,7 @@ fn read_bindings(
             (
                 robotd_params::PadParams::default(),
                 robotd_params::PadImuHeadControlParams::default(),
+                robotd_params::PadDriveParams::default(),
             )
         }
     }
@@ -449,7 +442,7 @@ fn main() -> std::process::ExitCode {
     // The button bindings, read once like every other daemon reads its config. A file that will
     // not parse is not a reason to leave somebody without a pad: the mapping the prototype had is
     // the fallback, and the reason is logged.
-    let (mut bindings, mut imu_head_cfg) = read_bindings(&args.config);
+    let (mut bindings, mut imu_head_cfg, mut drive) = read_bindings(&args.config);
     // When the file was last written, so a change is picked up without a restart. `padd` holds
     // no motor control and no session state — the whole of it is this table — so re-reading is a
     // swap between two ticks rather than anything to sequence.
@@ -489,7 +482,7 @@ fn main() -> std::process::ExitCode {
             let now = config_mtime(&args.config);
             if now != bindings_at {
                 bindings_at = now;
-                (bindings, imu_head_cfg) = read_bindings(&args.config);
+                (bindings, imu_head_cfg, drive) = read_bindings(&args.config);
                 tracing::warn!("button bindings reloaded");
             }
         }
@@ -897,17 +890,17 @@ fn main() -> std::process::ExitCode {
                 vy: 0.0,
                 vyaw: -right_x * ROLLER_YAW,
             })),
+            // `[pad_drive]`: each direction of each axis scales onto its own signed bound.
             Mode::Drive => frame.push(proto::Call::RobotMove(proto::MoveParams {
-                vx: left_y
-                    * if left_y >= 0.0 {
-                        args.max_linear
-                    } else {
-                        args.max_linear_backward
-                    },
+                vx: robotd_params::PadDriveParams::scale(left_y, drive.vx_min, drive.vx_max),
                 // `vy` is positive to the left; stick-left reads negative on every pad
                 // gilrs normalises.
-                vy: -left_x * args.max_linear,
-                vyaw: -right_x * args.max_angular,
+                vy: robotd_params::PadDriveParams::scale(-left_x, drive.vy_min, drive.vy_max),
+                vyaw: robotd_params::PadDriveParams::scale(
+                    -right_x,
+                    drive.vyaw_min,
+                    drive.vyaw_max,
+                ),
             })),
             Mode::Head => {
                 // The body must not keep its last velocity while the sticks are posing the

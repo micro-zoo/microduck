@@ -54,7 +54,7 @@ a policy only on a claim that is present and wrong.
 | `chain` | bool | skills | a held button starts another run when this one ends |
 | `action_scale` | float | skills | its own output scale while it runs |
 | `unwind_s` | float | skills, sitstand | seconds driving `command.idle` before handing back; for the sit↔stand, the rise |
-| `ramp_s` | float | sitstand | seconds the seat takes to settle; the shutdown sit waits twice this |
+| `ramp_s` | float | sitstand | seconds the seat takes to settle; the shutdown sit waits this plus 1 s, then eases into the rest pose |
 | `mode` | str | set | `walk` (default) or `roller`; which mode's ground pick a phase entry is |
 | `slot` | str | display | for a perpetual gait: the slot it is for (`walk`, `stand`, …), so `policy load <slot> <repo>` is the install line |
 | `entry_pose` | str | display | the pose the policy expects to start from, e.g. `standing` |
