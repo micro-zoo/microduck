@@ -314,17 +314,12 @@ saying so:
   measurably softer at the *same* kP. Not a tuning choice anyone made, so it is pinned rather
   than exposed.
 
-The IMU board's `[body_imu]` sensor-to-trunk mounting quaternion is validated from
-`robotd.toml` at startup and passed into the existing SFLP decoder. Its default is
-the original board's +90° Y mounting; a differently assembled robot keeps its
-measured rotation in its own config. Gyro, projected gravity and
-`robot.state.imu.quat` then leave the bus layer in trunk coordinates, so a
-read-only viewer does not repeat the mounting conversion.
-An upright pose alone cannot establish the sensor's forward axis: verify signed
-pitch and roll with controlled manual tilts as well as gravity near `[0, 0, -1]`
-when upright. The mounting is loaded at daemon startup, so a config change needs
-a restart. This also corrects the gyro and gravity blocks consumed by the policy;
-levelling only the viewer leaves those inputs and fall detection unchanged.
+The IMU board's sensor-to-trunk mounting quaternion comes from the robot's calibration file
+when it records one, and otherwise from `[body_imu]` in `robotd.toml`, which defaults to the
+original board's +90° Y mounting. It is validated at startup and passed into the SFLP decoder,
+so gyro, projected gravity and `robot.state.imu.quat` leave the bus layer in trunk coordinates —
+for the policy and fall detection as much as for a viewer. Measuring and recording it is
+[`joint-calibration.md`](../robot/joint-calibration.md).
 
 **Two bus transactions per tick, and a third once a second.** The tick reads a contiguous
 block at 124–136 (pwm, current, velocity, position). Voltage and temperature sit at 144–146,

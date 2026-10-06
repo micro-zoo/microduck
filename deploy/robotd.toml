@@ -37,9 +37,11 @@ port = "/dev/ttyS2"
 
 [body_imu]
 # Sensor-to-trunk rotation for the IMU at Dynamixel ID 200. The default is the
-# original board's +90° Y mount. A different physical installation may set its
-# measured unit quaternion here; robotd applies it before publishing gravity,
-# gyro and orientation to policies, health and robot.state. Restart robotd.
+# original board's +90° Y mount. A robot whose board sits differently records its
+# measured mount in its calibration file instead (`robotctl calibrate imu`,
+# docs/robot/joint-calibration.md), which takes precedence over these keys; they
+# remain for a robot without one. robotd applies the mount before publishing
+# gravity, gyro and orientation to policies, health and robot.state. Restart robotd.
 # mount_w = 0.7071067811865476
 # mount_x = 0.0
 # mount_y = 0.7071067811865476

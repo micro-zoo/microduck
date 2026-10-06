@@ -1,8 +1,16 @@
-//! Per-robot encoder zeroes, applied only at the hardware I/O boundary.
+//! Per-robot hardware calibration: encoder zeroes, and how the body IMU board is mounted.
 //!
-//! Policies, home poses, IPC and kinematics keep their model-space radians. A constant
-//! zero shift changes measured and commanded positions in opposite directions; it does
-//! not change velocity, gains, action scales or the policy's default pose.
+//! Both are measured once on the bench for one particular robot and are true of that robot
+//! only, so they live in one file rather than one in this file and one in `robotd.toml`.
+//!
+//! The zeroes are applied only at the hardware I/O boundary. Policies, home poses, IPC and
+//! kinematics keep their model-space radians. A constant zero shift changes measured and
+//! commanded positions in opposite directions; it does not change velocity, gains, action
+//! scales or the policy's default pose.
+//!
+//! The mount is the sensor-to-trunk rotation the IMU decoder applies; `robotctl calibrate imu`
+//! derives it from two still poses. A file without one leaves `[body_imu]` in `robotd.toml`
+//! (or the original board's default) in charge.
 
 use std::f64::consts::PI;
 use std::path::Path;
@@ -27,6 +35,15 @@ pub struct HardwareCalibrationInfo {
 #[serde(deny_unknown_fields)]
 struct File {
     joints: Vec<JointZero>,
+    #[serde(default)]
+    body_imu: Option<BodyImu>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BodyImu {
+    /// Sensor-to-trunk rotation, scalar-first `[w, x, y, z]`.
+    mount: [f64; 4],
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +78,7 @@ pub struct JointCalibration {
     offsets: [f64; NUM_JOINTS],
     configured: [bool; NUM_JOINTS],
     homing_offsets: [i32; NUM_JOINTS],
+    body_imu_mount: Option<[f64; 4]>,
 }
 
 impl JointCalibration {
@@ -101,7 +119,22 @@ impl JointCalibration {
             calibration.configured[index] = true;
             calibration.homing_offsets[index] = joint.homing_offset_tick;
         }
+        if let Some(BodyImu { mount }) = file.body_imu {
+            let norm = mount.iter().map(|v| v * v).sum::<f64>().sqrt();
+            // The same band `[body_imu]` in robotd.toml is held to: a typo, not roundoff.
+            if mount.iter().any(|v| !v.is_finite()) || !(0.99..=1.01).contains(&norm) {
+                return Err(CalibrationError::Invalid(format!(
+                    "body_imu.mount must be a finite unit quaternion, got norm {norm}"
+                )));
+            }
+            calibration.body_imu_mount = Some(mount.map(|v| v / norm));
+        }
         Ok(calibration)
+    }
+
+    /// The body IMU's sensor-to-trunk rotation, when this robot's calibration records one.
+    pub fn body_imu_mount(&self) -> Option<[f64; 4]> {
+        self.body_imu_mount
     }
 
     pub fn configured_names(&self) -> Vec<&'static str> {
@@ -305,6 +338,33 @@ mod tests {
         .unwrap();
         assert_eq!(calibration.expected_homing_offset(3), -585);
         assert_eq!(calibration.expected_homing_offset(4), 0);
+    }
+
+    #[test]
+    fn the_body_imu_mount_is_optional_normalised_and_checked() {
+        assert_eq!(calibration().body_imu_mount(), None);
+        let c = JointCalibration::from_json(
+            r#"{"joints":[],"body_imu":{"mount":[0.5,-0.5,0.5,-0.5]}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.body_imu_mount(), Some([0.5, -0.5, 0.5, -0.5]));
+        let c = JointCalibration::from_json(
+            r#"{"joints":[],"body_imu":{"mount":[0.7072,0,0.7072,0]}}"#,
+        )
+        .unwrap();
+        let m = c.body_imu_mount().unwrap();
+        assert!((m.iter().map(|v| v * v).sum::<f64>() - 1.0).abs() < 1e-12);
+        for text in [
+            r#"{"joints":[],"body_imu":{"mount":[0,0,0,0]}}"#,
+            r#"{"joints":[],"body_imu":{"mount":[1,1,0,0]}}"#,
+            r#"{"joints":[],"body_imu":{"mount":[1,0,0]}}"#,
+            r#"{"joints":[],"body_imu":{"mount":[1,0,0,0],"head":true}}"#,
+        ] {
+            assert!(
+                JointCalibration::from_json(text).is_err(),
+                "accepted {text}"
+            );
+        }
     }
 
     #[test]

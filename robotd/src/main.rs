@@ -587,6 +587,9 @@ struct RobotState {
     /// One startup readback from the real motor bus. Fake and simulated bodies
     /// have no encoder or EEPROM coordinates to offer a fixture capture.
     hardware_calibration: ArcSwapOption<duck_control::calibration::HardwareCalibrationInfo>,
+    /// The body IMU mount the bus decodes with, and whether this robot's calibration file
+    /// recorded it (rather than `robotd.toml` or the default). Set once at startup.
+    body_imu_mount: std::sync::OnceLock<([f64; 4], bool)>,
     /// What `btd` should be advertising, published when it changes.
     ///
     /// A broadcast channel like the state stream, and for the same reason: `btd` subscribes, and a
@@ -726,6 +729,7 @@ impl RobotState {
             shutdown: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             hardware_calibration: ArcSwapOption::empty(),
+            body_imu_mount: std::sync::OnceLock::new(),
             chorale_tx: tokio::sync::broadcast::Sender::new(8),
             policy_error: ArcSwapOption::empty(),
             policy_change_error: ArcSwapOption::empty(),
@@ -1029,6 +1033,10 @@ async fn main() -> ExitCode {
         args.busy,
     ));
 
+    let _ = state
+        .body_imu_mount
+        .set(body_imu_mount(&params, &calibration));
+
     if args.unhealthy {
         tracing::warn!("--unhealthy: will report unhealthy, so updates will roll back");
     }
@@ -1095,7 +1103,12 @@ fn run_init(params: &Params, calibration: &JointCalibration, duration: Duration)
     // The same open as the daemon's, replacement adoption included: `init` is what someone
     // reaches for right after a motor swap, and it must not be the one path that refuses the
     // new servo.
-    let Some(mut io) = open_bus(&params.bus, params.body_imu.mount(), 0, calibration) else {
+    let Some(mut io) = open_bus(
+        &params.bus,
+        body_imu_mount(params, calibration).0,
+        0,
+        calibration,
+    ) else {
         return ExitCode::FAILURE;
     };
     if let Err(e) = io.set_torque(true) {
@@ -1147,7 +1160,12 @@ fn spawn_control_thread(
     let fake = args.fake;
     let sim = args.sim.clone();
     let bus = params.bus.clone();
-    let imu_mount = params.body_imu.mount();
+    let imu_mount = state
+        .body_imu_mount
+        .get()
+        .copied()
+        .unwrap_or_else(|| body_imu_mount(params, calibration))
+        .0;
     let calibration = *calibration;
     let params = params.clone();
     // So a reload can re-read `[policy]` without a restart. The path rather than the loaded
@@ -1222,6 +1240,34 @@ fn spawn_control_thread(
 type BusIo = duck_control::bus::DynamixelIo;
 #[cfg(not(target_os = "linux"))]
 type BusIo = FakeIo;
+
+/// The body IMU mount to decode with: this robot's calibration file when it records one, then
+/// `[body_imu]` in `robotd.toml`, which defaults to the original board's. The flag says whether
+/// it came from the calibration.
+///
+/// A `[body_imu]` that differs from both the default and the calibration is named in the journal:
+/// somebody set it by hand, and it no longer does anything.
+fn body_imu_mount(params: &Params, calibration: &JointCalibration) -> ([f64; 4], bool) {
+    let configured = params.body_imu.mount();
+    match calibration.body_imu_mount() {
+        Some(mount) => {
+            let default = params::BodyImuParams::default().mount();
+            let same = |a: [f64; 4], b: [f64; 4]| {
+                (a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>().abs() - 1.0).abs() < 1e-6
+            };
+            if !same(configured, default) && !same(configured, mount) {
+                tracing::warn!(
+                    calibration = ?mount,
+                    robotd_toml = ?configured,
+                    "[body_imu] in robotd.toml is ignored: this robot's calibration records the IMU mount"
+                );
+            }
+            tracing::info!(mount = ?mount, "body IMU mount from the calibration file");
+            (mount, true)
+        }
+        None => (configured, false),
+    }
+}
 
 /// Open and verify the bus, waiting for a robot to answer.
 ///
@@ -4706,6 +4752,11 @@ fn dispatch(
                     single_turn_compatible: info.single_turn_compatible,
                     policy_enabled: state.policy_enabled,
                     homed: state.homed.load(Ordering::Relaxed),
+                    body_imu_mount: state.body_imu_mount.get().map(|(mount, _)| *mount),
+                    body_imu_mount_calibrated: state
+                        .body_imu_mount
+                        .get()
+                        .is_some_and(|(_, calibrated)| *calibrated),
                 },
             )
         }

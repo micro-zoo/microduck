@@ -428,7 +428,10 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// and a command to relax do not prove the volatile register actually changed.
 /// v41 adds optional head-IMU acquisition timing. t_ns keeps read-completion semantics;
 /// timing.accel_data_ready_ns identifies the accelerometer kernel INT1 edge.
-pub const API_VERSION: u32 = 41;
+/// v42 adds the body IMU mount to `robot.calibrationInfo`, and whether the robot's calibration
+/// file records it: the mount moved from `robotd.toml` into that file, and `robotctl calibrate
+/// imu` reads the one in effect to turn trunk-frame gravity back into what the sensor measured.
+pub const API_VERSION: u32 = 42;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -557,6 +560,14 @@ pub struct CalibrationInfo {
     pub single_turn_compatible: [bool; JOINT_NAMES.len()],
     pub policy_enabled: bool,
     pub homed: bool,
+    /// The body IMU's sensor-to-trunk mount the bus decodes with, scalar-first `[w, x, y, z]`.
+    /// `None` from a robotd older than v42.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_imu_mount: Option<[f64; 4]>,
+    /// Whether that mount is recorded in this robot's calibration file, rather than taken from
+    /// `[body_imu]` in `robotd.toml` or the default.
+    #[serde(default)]
+    pub body_imu_mount_calibrated: bool,
 }
 
 /// Method names, as they go on the wire. Namespaced so a new namespace cannot collide

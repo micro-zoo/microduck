@@ -271,6 +271,8 @@ mod tests {
             single_turn_compatible: [true; 15],
             policy_enabled: false,
             homed: false,
+            body_imu_mount: None,
+            body_imu_mount_calibrated: false,
         };
         info.zero_ticks[3] = 1976.0;
         info.homing_offset_ticks[3] = -585;
@@ -302,6 +304,8 @@ mod tests {
             single_turn_compatible: [true; 15],
             policy_enabled: false,
             homed: false,
+            body_imu_mount: None,
+            body_imu_mount_calibrated: false,
         };
         let mut frames = (1..=FRAMES)
             .map(|i| Frame {
@@ -359,6 +363,8 @@ mod tests {
                     single_turn_compatible: [true; 15],
                     policy_enabled: false,
                     homed: false,
+                    body_imu_mount: None,
+                    body_imu_mount_calibrated: false,
                 },
             );
             answer(
@@ -420,6 +426,8 @@ mod tests {
                     single_turn_compatible: [true; 15],
                     policy_enabled: false,
                     homed: false,
+                    body_imu_mount: None,
+                    body_imu_mount_calibrated: false,
                 },
             );
         });
