@@ -14,7 +14,10 @@ fails the push rather than losing commits; the fork's `main` is not merged or up
 
 The workflow needs a dedicated write-enabled deploy key on this repository, with its
 private key stored in the Actions secret `UPSTREAM_SYNC_SSH_KEY`. The default `GITHUB_TOKEN`
-cannot push upstream changes to workflow files. `actions/checkout` configures SSH host
+cannot push upstream changes to workflow files. Register the public key through the
+repository's **Settings → Deploy keys**, with **Allow write access** enabled. API registration
+through an OAuth token without the `workflow` scope can still reject workflow changes even
+when the deploy key has write access. `actions/checkout` configures SSH host
 verification and removes the temporary key during its post-job cleanup. To revoke sync
 access, remove the public deploy key from the repository.
 
