@@ -5,6 +5,19 @@ Status: draft · Date: 2026-07-28 · Owner: pierre
 One-time setup for the release pipeline. See [`updater-design.md`](../design/updater-design.md)
 §5.4 for key custody and §16.3 for the staging → stable model.
 
+## Fork upstream synchronization
+
+In `micro-zoo/microduck`, `sync-upstream.yml` fast-forwards the `upstream` branch from
+`pollen-robotics/microduck`'s `main` daily at 09:23 UTC+0. It can also
+be run with `gh workflow run sync-upstream.yml -R micro-zoo/microduck`. A divergent branch
+fails the push rather than losing commits; the fork's `main` is not merged or updated.
+
+The workflow needs a dedicated write-enabled deploy key on this repository, with its
+private key stored in the Actions secret `UPSTREAM_SYNC_SSH_KEY`. The default `GITHUB_TOKEN`
+cannot push upstream changes to workflow files. `actions/checkout` configures SSH host
+verification and removes the temporary key during its post-job cleanup. To revoke sync
+access, remove the public deploy key from the repository.
+
 ## Decision: two keys, two triggers, and no gate on this plan
 
 **Decided 2026-07-29.** Branch pushes are signed with `team.dev`; tagged releases and

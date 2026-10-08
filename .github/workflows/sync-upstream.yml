@@ -1,0 +1,43 @@
+# Keep the fork's upstream branch available as a clean copy of the source main.
+name: sync-upstream
+
+on:
+  schedule:
+    # Daily at 09:23 UTC+0, away from the busiest minute.
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: ${{ github.repository == 'micro-zoo/microduck' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require repository sync credentials
+        env:
+          SYNC_KEY: ${{ secrets.UPSTREAM_SYNC_SSH_KEY }}
+        run: |
+          if [ -z "$SYNC_KEY" ]; then
+            echo "::error::Add UPSTREAM_SYNC_SSH_KEY and its public deploy key with write access to this repository. GITHUB_TOKEN cannot sync upstream workflow changes."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          # A repository-only deploy key also permits syncing upstream workflow files.
+          ssh-key: ${{ secrets.UPSTREAM_SYNC_SSH_KEY }}
+
+      - name: Fast-forward upstream from pollen-robotics main
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/pollen-robotics/microduck.git
+          git fetch --no-tags upstream refs/heads/main
+          # No force: a divergent branch must fail instead of losing local work.
+          git push origin FETCH_HEAD:refs/heads/upstream
