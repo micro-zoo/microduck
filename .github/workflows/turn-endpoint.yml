@@ -23,6 +23,10 @@ on:
 
 jobs:
   credentials:
+    # Forks do not inherit HF_TOKEN. Keep the daily monitor on the source repository;
+    # a fork can still run it explicitly after configuring its own token. Missing
+    # credentials must remain a failure when the check is actually requested.
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.repository.fork }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
