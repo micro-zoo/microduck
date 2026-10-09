@@ -1654,6 +1654,15 @@ impl View {
                 .collect();
             lines.push(Line::from(""));
             lines.push(self.power(rest.width.saturating_sub(2)));
+            // A robot with some servos unplugged is waiting too, and the power row's one
+            // sentence clips on a narrow terminal. The census is what someone goes and finds
+            // the servos with.
+            if let Some(health) = &self.health
+                && health.bus.partly_missing()
+            {
+                lines.push(Line::from(""));
+                lines.extend(servo_census(&health.bus));
+            }
             frame.render_widget(
                 Paragraph::new(lines).block(Block::bordered().title(" monitor ")),
                 rest,
@@ -3104,6 +3113,38 @@ fn joint_rows(state: &proto::RobotState) -> usize {
 /// another crate. Anything unrecognised is passed through verbatim: a `robotd` newer than this
 /// `robotctl` may have limits this build has never heard of, and printing the raw name is
 /// strictly better than hiding it.
+/// Every servo by ID, in the robot's three groups, with the silent ones in red and named below.
+///
+/// For a robot waiting on a bus where some servos answer: the IDs are what is printed on the
+/// servos, and the groups are where on the robot to look.
+fn servo_census(bus: &proto::BusHealth) -> Vec<Line<'static>> {
+    const GROUPS: [&str; 3] = ["left leg", "head", "right leg"];
+    let mut lines = vec![Line::from(format!(
+        "servos — {} of {} not answering",
+        bus.missing.len(),
+        proto::JOINT_IDS.len()
+    ))];
+    for (group, ids) in GROUPS.iter().zip(proto::JOINT_IDS.chunks(5)) {
+        let mut spans = vec![Span::raw(format!("  {group:<10}"))];
+        for &id in ids {
+            spans.push(if bus.missing.contains(&id) {
+                Span::styled(
+                    format!(" {id} ✗"),
+                    Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(format!(" {id} ✓")).dim()
+            });
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  missing: {}", bus.describe_missing()),
+        Style::new().fg(Color::Red),
+    )));
+    lines
+}
+
 /// The first line of a reason, for somewhere that has one line to put it.
 ///
 /// A connect failure is a paragraph — the `systemctl status` hint below it is the useful half,
@@ -3769,6 +3810,7 @@ mod tests {
             bus: proto::BusHealth {
                 consecutive_errors: 0,
                 startup_failures: 3,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -3778,6 +3820,42 @@ mod tests {
         assert!(screen.contains("waiting for robot.state"), "{screen}");
         assert!(screen.contains("degraded"), "{screen}");
         assert!(screen.contains("is servo power on"), "{screen}");
+        assert!(
+            !screen.contains("not answering"),
+            "no census when no servo answers: {screen}"
+        );
+    }
+
+    /// Some servos answering: the waiting screen lays out all fifteen by group, so the missing
+    /// ones can be found on the robot, and names them in full below.
+    #[test]
+    fn a_board_with_servos_missing_shows_which_ones() {
+        let mut view = View::new(20, None);
+        let health = proto::HealthResult {
+            healthy: false,
+            degraded: true,
+            reason: Some("servos 32 head_yaw, 33 head_roll, 34 mouth not answering".to_owned()),
+            bus: proto::BusHealth {
+                startup_failures: 3,
+                missing: vec![32, 33, 34],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(view.absorb(Update::Health(Box::new(health))).is_ok());
+
+        let screen = render_to(&mut view, 110, 32);
+        assert!(
+            screen.contains("servos — 3 of 15 not answering"),
+            "{screen}"
+        );
+        assert!(screen.contains("left leg"), "{screen}");
+        assert!(screen.contains("20 ✓"), "{screen}");
+        assert!(screen.contains("32 ✗"), "{screen}");
+        assert!(
+            screen.contains("missing: 32 head_yaw, 33 head_roll, 34 mouth"),
+            "{screen}"
+        );
     }
 
     /// A frozen IMU is invisible everywhere else: the board keeps answering, so the bus reports
@@ -3790,6 +3868,7 @@ mod tests {
                 ready: true,
                 stale_blocks: 400,
                 consecutive_stale_blocks: proto::ImuHealth::FROZEN_RUN,
+                ..Default::default()
             }),
             ..a_health()
         };
@@ -3803,6 +3882,7 @@ mod tests {
                 ready: true,
                 stale_blocks: 9,
                 consecutive_stale_blocks: 1,
+                ..Default::default()
             }),
             ..a_health()
         };

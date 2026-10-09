@@ -47,7 +47,7 @@ recipe, and the export to ONNX that this repo loads.
 </tr>
 <tr>
 <td><b>It walks.</b> Pick up a gamepad and drive.</td>
-<td><b>It rolls.</b> Put wheels on, hold D-pad up, and it loads the other brain.</td>
+<td><b>It rolls.</b> Put wheels on, ask for roller mode, and it loads the other brain.</td>
 </tr>
 <tr>
 <td width="50%">

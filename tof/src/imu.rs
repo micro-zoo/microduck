@@ -36,7 +36,7 @@ use bmi088::{Bmi088, Bmi088Ahrs, Config};
 use linux_embedded_hal::I2cdev;
 
 #[cfg(target_os = "linux")]
-use crate::BUS_CANDIDATES;
+use tof::link::BUS_CANDIDATES;
 
 #[cfg(target_os = "linux")]
 #[path = "imu_interrupt.rs"]
@@ -107,6 +107,15 @@ impl ImuStatus {
             "the head IMU is off — `[head_imu] enabled = true` in robotd.toml, then restart tofd"
                 .to_owned(),
         );
+    }
+
+    /// Served by another daemon on this board — the `beta`'s head IMU is `robotd`'s. Named,
+    /// for the same reason [`Self::off`] names its key: a subscriber that only hears silence
+    /// goes looking at the hardware.
+    pub fn elsewhere(&self, daemon: &str) {
+        self.lost(format!(
+            "on this board the head IMU is read by {daemon}: subscribe to head_imu.stream on its socket"
+        ));
     }
 
     fn lost(&self, why: String) {

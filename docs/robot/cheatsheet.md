@@ -142,7 +142,7 @@ Three properties worth trusting:
   daemon's own loader first, atomically (temp file + rename), and rejected with the reason.
 
 Saving offers what the change actually needs, from the daemon that actually reads it: a restart
-for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s), a `robotd`
+for most keys (`[media]` and `[duck_detector]` are `mediad`'s, `[head_imu]` is `tofd`'s on a zero3 and `robotd`'s on a beta), a `robotd`
 *reload* for `[policy]` — the motors stay powered — and nothing at all for `[pad]`,
 `[pad_imu_head_control]` and `[pad_drive]`, which `padd` picks up within a second. `sudo`, because the file
 is root-owned — without it the editor opens read-only and says so on the first write.
@@ -314,11 +314,12 @@ is refused saying so.
 robotctl pad bindings
 ```
 ```text
-a           ground_pick
-x           roulade
+a           sit_toggle
+b           ground_pick
+x             (nothing)
+y             (nothing)
 lb          kick_left
 rb          kick_right
-dpad_down   sit_toggle
 
 `robotctl pad bind <button> <skill>` changes one; padd picks it up within a second.
 ```
@@ -327,11 +328,12 @@ dpad_down   sit_toggle
 sudo robotctl pad bind x polite-bow
 ```
 ```text
-a           ground_pick
+a           sit_toggle
+b           ground_pick
 x           polite-bow
+y             (nothing)
 lb          kick_left
 rb          kick_right
-dpad_down   sit_toggle
 ```
 
 That writes one line, and only the button you named:
@@ -352,13 +354,13 @@ sudo robotctl pad reset
 A binding naming a skill this robot does not have is marked in the listing rather than
 silently doing nothing when you press it.
 
-Five buttons are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. **`lb`/`rb` are the bumpers**, not
+Six buttons are bindable: `a`, `b`, `x`, `y`, `lb`, `rb`. **`lb`/`rb` are the bumpers**, not
 the analog triggers, which are the mouth and the quack. An empty name switches a button off, and
-`pad reset <button>` puts one back. The defaults are the mapping the prototype had, so a robot
-with no `[pad]` section behaves exactly as it always has.
+`pad reset <button>` puts one back. X and Y ship empty, so they are the place for a new skill; X
+re-sends while held, which is what a chaining skill like the roulade wants.
 
-The rest of the pad is not bindable: Start toggles the policy, Y and B change what the sticks
-mean, and held Select powers the robot off — the button that stops a robot is the one worth not
+The rest of the pad is not bindable: Start stands the robot up and toggles the policy, the D-pad
+picks what the sticks mean, and held Select cuts torque and powers the robot off — the button that stops a robot is the one worth not
 being able to lose to a config edit. A name is checked against what the robot actually has, so a
 typo is refused with the list rather than becoming a dead button.
 
@@ -522,25 +524,35 @@ Pairing is once per pad and has a page of its own —
 pad without forgetting the first, and what to do when it will not bond (the `Privacy` setting in
 `/etc/bluetooth/main.conf` is the answer more often than anything else).
 
-`padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. The
-mapping is the prototype's, so muscle memory carries over:
+`padd.service` runs from boot and drives whatever pad connects, so pairing is the only step. Each
+part of the pad has one job — face buttons and bumpers run skills, the D-pad picks what the sticks
+mean, and the two small middle buttons are holds, so nothing that cuts torque fires on a brush of
+the thumb:
 
 | control | does |
 | --- | --- |
-| left stick | drive: forward/back and strafe · head: head yaw and pitch · body pose: up and crouch |
-| right stick | drive: turn · head: neck pitch and head roll · body pose: pitch and roll |
-| **Start** | first press: torque on and a 2 s ramp to the home pose, then hold. Second press: the policy drives. After that it toggles the policy |
-| **Y** / triangle | head mode: sticks pose the head (body holds still). With `[pad_imu_head_control] enabled` and a pad that has an IMU: the pad's tilt poses the head and the sticks keep driving — see below |
-| **B** / circle | body-pose mode: sticks lean and crouch the standing robot |
-| **A** / cross | ground pick |
-| **X** / square | roulade — one forward roll; hold to chain rolls |
+| **A** / cross | sit ↔ stand |
+| **B** / circle | ground pick |
+| **X**, **Y** | nothing — free for a skill of your own (`robotctl pad bind`) |
 | **LB / RB** | left / right kick |
-| **DPad-Down** | sit ↔ stand |
 | **RT / LT** | mouth (either trigger) — RT also quacks; LT rides the "wheee" while held |
-| **DPad-Up**, held 3 s | switch drive mode, walk ⇄ roller |
-| **DPad-Right** | reboot every servo: the way back from a tripped overload without pulling the battery. Torque off, then Start |
-| **Select**, short press | torque off (`robot.relax`) **on release**: the emergency stop. The robot drops, so hold it. Then Start stands it up again |
-| **Select**, held 2 s | sit down, ease into the rest pose, torque off, power off — the release afterwards does nothing more |
+| **D-pad left** | move mode: left stick forward/back and strafe, right stick turns. The mode a pad starts in |
+| **D-pad up** | head mode: left stick head yaw and pitch, right stick neck pitch and head roll. The body holds still |
+| **D-pad right** | head + move: left stick forward/back and turn, right stick looks around (head yaw and pitch). With `[pad_imu_head_control] enabled` and a pad that has an IMU, the pad's tilt poses the head instead and the sticks keep the move mapping — see below |
+| **D-pad down** | body + head: left stick up/down rises and crouches, left/right leans the body sideways; right stick looks around (head yaw and pitch). The body does not walk |
+| **Start**, press | first press: torque on and a 2 s ramp — to the seat if the robot is sitting (or nearly), to the home pose otherwise. Second press: the robot is measured again — seated, the sitstand policy settles it into its seat for ~2 s, rises, and then walks; anything else, the policy walks straight away. The journal says what it saw each time. After that a press toggles the policy: stopping it returns the robot to its home pose, stiff (a seated robot stays seated) |
+| **Start**, held 1.5 s | home pose, motors stiff, policy off — the "put everything back" button, from anywhere. Sitting, it stays seated, stiff: A stands it up after the next Start |
+| **Select**, let go between 2 and 4 s | rest (`robot.rest`): a driving robot sits, eases into the rest pose, then torque goes off and every servo reboots — also the way back from a tripped overload without pulling the battery. A robot not driving is rebooted where it is. Start stands it up again |
+| **Select**, held 4 s | power off (`robot.shutdown`): the same sit and rest pose, then the board switches off. The release afterwards does nothing more |
+
+**One move at a time.** A kick, a pick or a sit is refused while another is running, and a
+seated robot only accepts A (stand up). Stopping the policy while it sits keeps it seated; cutting
+torque or rebooting the servos forgets the seat entirely.
+
+The D-pad selects rather than toggles: a press lands in the mode its arrow names, whatever mode
+you were in. Leaving a mode puts back what it moved — the body returns to nominal after body +
+head, and the head re-centres when you go back to plain move mode. A short press of Select does nothing to the
+robot; the journal says how long to hold it.
 
 **Drive the head with the pad itself.** A Pro Controller carries an IMU, and with
 
@@ -548,25 +560,39 @@ mapping is the prototype's, so muscle memory carries over:
 sudo robotctl configure      # Controller-IMU head control → enabled
 ```
 
-Y changes meaning on such a pad: the first press hands the head to the pad — tilt it and the head
-tilts, turn it and the head turns — while the sticks go on driving the body. Press Y again and the
-head holds where it is, sticks still driving. Press it a third time and the pad drives the head again
-**from wherever the pad is now**: its yaw is a gyro's word alone and drifts, and re-centring on every
-re-entry is how you beat the drift without a magnetometer. `gain` in the same section is head
-radians per pad radian, 1 by default. On an Xbox pad, or with the switch off, Y is the stick head
-mode above. `padd` picks the change up within a second; no restart.
+head + move (D-pad right) hands the head to the pad — tilt it and the head tilts, turn it and the
+head turns — while the sticks go on driving the body exactly as in move mode. Press D-pad right
+again and the pad drives the head **from wherever the pad is now**: its yaw is a gyro's word alone
+and drifts, and re-centring on every press is how you beat the drift without a magnetometer.
+`gain` in the same section is head radians per pad radian, 1 by default. On an Xbox pad, or with
+the switch off, the right stick poses the head in that mode. `padd` picks the change up within a
+second; no restart.
 
 There is no stop button: release the sticks and the robot stands, and `robotd`'s deadman stops it
-if `padd` dies. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
-shaping automatically — asymmetric push/brake, no strafe — and A triggers the crouch. The
-other skills ride along: sit, kicks and the roulade work on wheels too, as the prototype has it.
+if `padd` dies. **If the pad drops out while driving**, the robot asks where it went (a rising
+quack), and after a second sits down if it was standing — kicks and picks are let finish first.
+When the pad comes back it greets you with a quack; A stands the robot up.
 
-**Holding DPad-Up switches between the two**, for when you have just put wheels on the duck or
-taken them off: the robot quacks once for walking or twice for roller, returns to its home pose,
-loads that mode's policies there and drives again — a few seconds, torque on throughout, no
-restart. `robotd.toml` is not touched, so a reboot comes back in the configured mode; make it
-stick with `robotctl configure` (or `[policy] mode`). It is a hold rather than a press because
-D-pad up is easy to lean on while driving.
+**Left alone, the robot looks around.** After 2 s with the policy running, no motion asked for
+and nobody steering the head, it glances about every few seconds — mostly left and right, a
+little up and down, now and then with a curious tilt — holds each look, drifts very slightly
+while it does, and breathes (a millimetre of height, standing only). The longer nothing happens
+the calmer it gets. It fades in and out, and any stick or head command takes the head back. In
+the D-pad's head modes the pad keeps the head, so this only happens in move mode. On a roller robot (`mode = "roller"` in `robotd.toml`) the sticks take the roller
+shaping automatically — asymmetric push/brake, no strafe — and B triggers the crouch. The
+other skills ride along: sit and the kicks work on wheels too, as the prototype has it.
+
+**`robot.setMode` switches between the two**, for when you have just put wheels on the duck or
+taken them off:
+
+```
+duckctl call robot.setMode '{"mode":"roller"}'
+```
+
+The robot quacks once for walking or twice for roller, returns to its home pose, loads that mode's
+policies there and drives again — a few seconds, torque on throughout, no restart, and the pad's
+stick shaping follows within a second. `robotd.toml` is not touched, so a reboot comes back in the
+configured mode; make it stick with `robotctl configure` (or `[policy] mode`).
 
 `pad status` answers two questions separately, because a connected pad and a dead driver look
 identical from the outside:
@@ -804,16 +830,43 @@ interchangeable on the board, and the daemon picks the driver from an ID read.
 
 #### The head IMU (`head_imu.stream`)
 
-`tofd` also serves the head module's BMI088 — gyro, acceleration and a Madgwick
-orientation — and it is **off by default**: `[head_imu] enabled` in `robotd.toml`,
-set with `robotctl configure`, which offers the `tofd` restart. Reading it costs
-~4% of a core at 100 Hz and nothing subscribes yet, so a duck that is not mapping
-was paying that from boot. A subscriber while it is off gets a reason naming the
-key, not the silence an unfitted sensor gives. `tofd --imu` reads it for one
-session without touching the file, and `--imu-hz` trades rate for cost linearly.
+Gyro, acceleration and an orientation from the IMU in the head. Which chip, and
+which daemon serves the stream, depends on the board:
+
+- **zero3**: `tofd` reads the HAT's BMI088 with a Madgwick fusion, **off by
+  default**. It costs ~4% of a core at 100 Hz. `tofd --imu` reads it for one
+  session without touching the file, and `--imu-hz` trades rate for cost.
+- **beta**: `robotd` reads the face board's LSM6DSV16X at 60 Hz, **on by
+  default**. The chip fuses the orientation itself and batches samples, so it
+  costs a burst read 15 times a second and no fusion on the CPU.
+
+`[head_imu] enabled` in `robotd.toml` overrides either default; `robotctl
+configure` offers the restart of whichever daemon reads it. Ask the other
+daemon and the answer names the right one; while it is off, the answer names
+the key, not the silence an unfitted sensor gives.
 
 None of this touches depth: the ToF ranges either way, so the grid above works on
 a duck whose IMU has never been switched on.
+
+### The face LEDs
+
+```
+robotctl led list
+robotctl led set rgb:red on
+robotctl led set all off
+robotctl led blink cam:red
+robotctl led trigger green1:green heartbeat
+robotctl flashlight on --color cyan
+robotctl flashlight toggle
+```
+
+The beta board's face has twelve LEDs (`face:<place>:<colour>`, on a GPIO expander), and `led`
+switches them through the kernel's LED class — names with or without the `face:` prefix, or `all`.
+A board without a face board says so. Each LED has an owning daemon, and what it shows is
+[`architecture.md` §3.2](../design/architecture.md#32-the-face-leds); `led set` overrides it only
+until that daemon next has a change to show, so this is the bench tool. `flashlight` asks `robotd`,
+which owns that LED, and is what the pad's Home button does. A blink rate other than the default
+500/500 ms (`--on-ms`, `--off-ms`) needs `sudo`.
 
 ### The camera (`mediad`)
 

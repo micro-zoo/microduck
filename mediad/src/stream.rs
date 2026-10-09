@@ -523,6 +523,11 @@ impl Streamer {
         serde_json::json!({ "streaming": false, "was": was.as_ref().map(|l| l.config.url.clone()) })
     }
 
+    /// Whether frames are going out, for the camera LED.
+    pub fn is_streaming(&self) -> bool {
+        self.live.lock().expect("not poisoned").is_some()
+    }
+
     /// What is streaming and how it is going.
     pub fn status(&self) -> serde_json::Value {
         let live = self.live.lock().expect("not poisoned");
@@ -731,10 +736,19 @@ mod tests {
 
     impl Saturating for std::sync::atomic::AtomicU32 {
         fn fetch_saturating_sub(&self) -> bool {
-            self.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                Some(n.saturating_sub(1))
-            })
-            .is_ok_and(|previous| previous > 0)
+            // A compare-exchange loop, not `try_update`: see `wire_consumers` in pipeline.rs.
+            let mut n = self.load(Ordering::SeqCst);
+            loop {
+                match self.compare_exchange_weak(
+                    n,
+                    n.saturating_sub(1),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(previous) => return previous > 0,
+                    Err(actual) => n = actual,
+                }
+            }
         }
     }
 

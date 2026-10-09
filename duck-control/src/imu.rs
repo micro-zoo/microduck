@@ -73,14 +73,19 @@ impl Default for SflpDecoder {
 }
 
 impl SflpDecoder {
-    /// The board is mounted so that trunk = `[+raw_z, +raw_y, −raw_x]`, a +90° rotation
-    /// about Y.
+    /// The `zero3` robot's mount: the board is mounted so that trunk = `[+raw_z, +raw_y, −raw_x]`,
+    /// a +90° rotation about Y.
     pub const DEFAULT_MOUNT: [f64; 4] = [
         std::f64::consts::FRAC_1_SQRT_2,
         0.0,
         std::f64::consts::FRAC_1_SQRT_2,
         0.0,
     ];
+
+    /// The `beta` robot's mount: the power board lies flat, its axes already the trunk's
+    /// (`x` forward, `y` left, `z` up). Read off a beta standing straight (2026-10-06): under
+    /// [`Self::DEFAULT_MOUNT`] its trunk read `x` up, a 90° rotation about Y away from this.
+    pub const BETA_MOUNT: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
 
     pub fn new(mount: [f64; 4]) -> Self {
         Self {

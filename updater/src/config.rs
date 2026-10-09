@@ -35,12 +35,17 @@ pub struct Config {
     /// see `docs/design/updater-design.md` §5.4.
     pub trusted_keys_dir: PathBuf,
 
-    /// Single forward-compatibility guard. An artifact declaring a higher
-    /// `min_hw_rev` than this is refused.
+    /// The hardware revision a release's `min_hw_rev` is checked against, for a robot whose
+    /// `robotd.toml` declares no board.
     ///
-    /// v1 targets one hardware configuration, so this is deliberately one
-    /// integer and not a capability matrix (`docs/design/updater-design.md` §5.6).
-    pub hw_rev: u32,
+    /// The board is the answer when there is one ([`Config::hw_rev`]). This is what every robot
+    /// installed before the board was a setting carries — `hw_rev = 1`, which is what its board
+    /// is — and what a board provisioned against a release that still shipped it carries too,
+    /// which is why it cannot win: a beta would be revision 1 for good, since the installer never
+    /// rewrites this file. One integer and not a capability matrix
+    /// (`docs/design/updater-design.md` §5.6).
+    #[serde(default)]
+    pub hw_rev: Option<u32>,
 
     /// Engine-owned state: lock file, update log, boot counter. Must NOT be
     /// inside any component's `install_dir` — it has to survive every swap and
@@ -376,6 +381,24 @@ impl Config {
         // this one's.
         config.loaded_from = Some(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         Ok(config)
+    }
+
+    /// The hardware revision this robot is: the board `robotd.toml` declares, else this file's
+    /// `hw_rev`, else `zero3`'s.
+    ///
+    /// Read from the file every time rather than once at startup, so `robotctl configure`
+    /// applies without restarting `updaterd`.
+    pub fn hw_rev(&self) -> u32 {
+        self.hw_rev_given(robotd_params::board::Board::declared(std::path::Path::new(
+            robotd_params::DEFAULT_PATH,
+        )))
+    }
+
+    fn hw_rev_given(&self, declared: Option<robotd_params::board::Board>) -> u32 {
+        declared
+            .map(robotd_params::board::Board::hw_rev)
+            .or(self.hw_rev)
+            .unwrap_or_else(|| robotd_params::board::Board::default().hw_rev())
     }
 
     /// Bounds applied when extracting an artifact.
@@ -800,6 +823,29 @@ mod tests {
 
         assert!(AutoApply::All.permits(true), "all must include mandatory");
         assert!(AutoApply::All.permits(false));
+    }
+
+    /// A declared board is the answer, whatever `hw_rev` says: a beta provisioned against a
+    /// release whose `updater.toml` still carried `hw_rev = 1` must not stay revision 1. Without
+    /// a board, `hw_rev` is the answer, and without either it is the zero3.
+    #[test]
+    fn the_declared_board_wins_over_hw_rev() {
+        use robotd_params::board::Board;
+        let base = r#"
+            trusted_keys_dir = "/etc/robot/keys"
+            state_dir = "/var/lib/robot/updater"
+            [component.daemon]
+            install_dir = "/opt/robot/daemon"
+            source = { type = "local_dir", path = "/var/tmp/rel" }
+            on_apply = { action = "none" }
+        "#;
+        let bare = Config::from_toml(base).unwrap();
+        assert_eq!(bare.hw_rev_given(None), Board::Zero3.hw_rev());
+        assert_eq!(bare.hw_rev_given(Some(Board::Beta)), Board::Beta.hw_rev());
+
+        let legacy = Config::from_toml(&format!("hw_rev = 1\n{base}")).unwrap();
+        assert_eq!(legacy.hw_rev_given(None), 1);
+        assert_eq!(legacy.hw_rev_given(Some(Board::Beta)), Board::Beta.hw_rev());
     }
 
     /// A board's config says nothing about the policy library and must keep getting the board's

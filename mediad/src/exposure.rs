@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::pipeline::{CAPTURE_FORMAT, Frame, Frames};
+use crate::sensor::Exposure;
 
 /// How often to look. Twice a second: fast enough to follow a robot walking from a window into a
 /// corridor, slow enough that the damped step never rings.
@@ -68,32 +69,32 @@ const TARGET_Y: f64 = 90.0;
 /// sensor noise alone, which is visible as a picture that breathes.
 const DEADBAND: f64 = 0.12;
 
-/// The IMX219 in the mode [`crate::pipeline`] pins (1920x1080, one line ≈ 19.05 µs).
-///
-/// **The two shutter caps are the whole reason this steers three controls rather than one.**
-/// Brightness is spent in noise order: shutter up to the soft cap first (cheapest and cleanest, and
-/// 11 ms is short enough that a walking robot's picture is not smeared), then sensor analogue gain
-/// (clean amplification), then shutter up to the hard cap, and ISP digital gain — the noisiest —
-/// only when there is nothing else left.
-///
-/// `HARD_LINES` is a real ceiling, not a preference: the driver responds to an exposure longer than
-/// the frame length by *stretching the frame time* to fit it rather than clamping, so asking for
-/// 3500 lines silently halves the frame rate. The mode is 1766 lines total; measured on the
-/// prototype, 1762 lines held 29.96 fps and 3500 collapsed to 15.1.
-const SOFT_LINES: f64 = 600.0; // ≈ 11.4 ms
-const HARD_LINES: f64 = 1200.0; // ≈ 22.9 ms
-/// Sensor analogue gain ceiling, in multiples. The register is this × 256.
-const MAX_ANALOGUE: f64 = 11.0;
-/// ISP digital gain ceiling, in multiples. Well under what the sensor will accept, because past
-/// this the picture is brighter and no more legible.
+// The sensor's own limits — the two shutter caps, the analogue gain ceiling and the unit it is
+// written in — come from its [`crate::sensor::Exposure`], because they are in its units.
+//
+// **The two shutter caps are the whole reason this steers three controls rather than one.**
+// Brightness is spent in noise order: shutter up to the soft cap first (cheapest and cleanest, and
+// 11 ms is short enough that a walking robot's picture is not smeared), then sensor analogue gain
+// (clean amplification), then shutter up to the hard cap, and ISP digital gain — the noisiest —
+// only when there is nothing else left.
+//
+// The hard cap is a real ceiling, not a preference: the driver responds to an exposure longer than
+// the frame length by *stretching the frame time* to fit it rather than clamping, so asking the
+// IMX219 for 3500 lines silently halves the frame rate. Its mode is 1766 lines total; measured on
+// the prototype, 1762 lines held 29.96 fps and 3500 collapsed to 15.1.
+
+/// ISP digital gain ceiling, in multiples. Well under what the ISP will accept, because past this
+/// the picture is brighter and no more legible. The ISP's, not the sensor's, so it is the same on
+/// every sensor — and so is its unit: 256 is 1x.
 const MAX_DIGITAL: f64 = 16.0;
+const DIGITAL_UNITY: f64 = 256.0;
 
 /// What the loop writes to the sensor, in the sensor's own units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Controls {
     /// Exposure in sensor lines.
     pub exposure: u32,
-    /// Analogue gain, where 256 is 1x.
+    /// Analogue gain, where the sensor's [`Exposure::unity_gain`] is 1x.
     pub analogue_gain: u32,
     /// ISP digital gain, where 256 is 1x.
     pub gain: u32,
@@ -102,6 +103,7 @@ pub struct Controls {
 /// The loop's state: one brightness budget, split across three controls.
 #[derive(Debug, Clone, Copy)]
 pub struct Ae {
+    limits: Exposure,
     exposure: f64,
     analogue: f64,
     digital: f64,
@@ -112,13 +114,23 @@ pub struct Ae {
 impl Ae {
     /// Starting from what `mediad` already wrote to the sensor, so the first step is relative to the
     /// picture on screen rather than to a number this module invented.
-    pub fn starting_at(exposure_lines: u32, analogue_gain_reg: u32) -> Self {
+    pub fn starting_at(limits: Exposure, exposure_lines: u32, analogue_gain_reg: u32) -> Self {
         Self {
-            exposure: (exposure_lines as f64).clamp(4.0, HARD_LINES),
-            analogue: (analogue_gain_reg as f64 / 256.0).clamp(1.0, MAX_ANALOGUE),
+            limits,
+            exposure: (exposure_lines as f64).clamp(4.0, limits.hard_lines),
+            analogue: (analogue_gain_reg as f64 / f64::from(limits.unity_gain))
+                .clamp(1.0, limits.max_analogue),
             digital: 1.0,
             written: None,
         }
+    }
+
+    /// Whether every control the sensor has is at its ceiling — the one state in which a dark
+    /// picture is the room's fault rather than the loop's.
+    fn at_ceiling(&self, at: Controls) -> bool {
+        at.exposure as f64 >= self.limits.hard_lines
+            && at.analogue_gain as f64
+                >= self.limits.max_analogue * f64::from(self.limits.unity_gain)
     }
 
     /// One step towards the setpoint. `None` inside the deadband, and `None` when the step lands on
@@ -143,12 +155,18 @@ impl Ae {
             return None;
         }
 
+        let Exposure {
+            soft_lines,
+            hard_lines,
+            max_analogue,
+            ..
+        } = self.limits;
         let budget = (self.exposure * self.analogue * self.digital * ratio.powf(0.6))
-            .clamp(4.0, HARD_LINES * MAX_ANALOGUE * MAX_DIGITAL);
+            .clamp(4.0, hard_lines * max_analogue * MAX_DIGITAL);
 
-        self.exposure = budget.min(SOFT_LINES);
-        self.analogue = (budget / self.exposure).clamp(1.0, MAX_ANALOGUE);
-        self.exposure = (budget / self.analogue).clamp(self.exposure, HARD_LINES);
+        self.exposure = budget.min(soft_lines);
+        self.analogue = (budget / self.exposure).clamp(1.0, max_analogue);
+        self.exposure = (budget / self.analogue).clamp(self.exposure, hard_lines);
         self.digital = (budget / (self.exposure * self.analogue)).clamp(1.0, MAX_DIGITAL);
 
         let next = self.controls();
@@ -170,8 +188,8 @@ impl Ae {
     fn controls(&self) -> Controls {
         Controls {
             exposure: self.exposure as u32,
-            analogue_gain: (self.analogue * 256.0) as u32,
-            gain: (self.digital * 256.0) as u32,
+            analogue_gain: (self.analogue * f64::from(self.limits.unity_gain)) as u32,
+            gain: (self.digital * DIGITAL_UNITY) as u32,
         }
     }
 }
@@ -212,22 +230,29 @@ impl Stop {
 /// `device` is the *capture* node rather than the sensor subdev, because rkisp proxies the sensor's
 /// controls through it — which is also how the starting exposure gets there, as `v4l2src`'s
 /// `extra-controls`. One node to open, and it is the one we already know we can.
-pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_reg: u32) -> Stop {
+pub fn spawn(
+    device: String,
+    frames: Frames,
+    limits: Exposure,
+    exposure_lines: u32,
+    analogue_gain_reg: u32,
+) -> Stop {
     let stop = Stop::default();
     let mine = stop.clone();
 
     tracing::info!(
         %device,
         target_luma = TARGET_Y,
-        shutter_lines = format!("{SOFT_LINES:.0}/{HARD_LINES:.0}"),
-        analogue_max = MAX_ANALOGUE,
+        shutter_lines = format!("{:.0}/{:.0}", limits.soft_lines, limits.hard_lines),
+        analogue_max = limits.max_analogue,
+        analogue_unity = limits.unity_gain,
         "software auto-exposure"
     );
 
     std::thread::Builder::new()
         .name("auto-exposure".into())
         .spawn(move || {
-            let mut ae = Ae::starting_at(exposure_lines, analogue_gain_reg);
+            let mut ae = Ae::starting_at(limits, exposure_lines, analogue_gain_reg);
             let mut proven = false;
             // What this run knows about the ISP's digital gain. See `Digital`.
             let mut digital = Digital::Unknown;
@@ -278,8 +303,7 @@ pub fn spawn(device: String, frames: Frames, exposure_lines: u32, analogue_gain_
                         gain = at.gain,
                         // Named, because "the numbers are not moving" has two very different causes
                         // and this is the one that tells them apart.
-                        at_ceiling = at.exposure as f64 >= HARD_LINES
-                            && at.analogue_gain as f64 >= MAX_ANALOGUE * 256.0,
+                        at_ceiling = ae.at_ceiling(at),
                         "metering"
                     );
                 }
@@ -481,6 +505,7 @@ fn read_exposure(device: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sensor::{GC2093, IMX219};
 
     fn frame(luma: u8) -> Frame {
         // UYVY, so half the bytes are chroma; they are set to something that would be a *different*
@@ -512,7 +537,7 @@ mod tests {
 
     #[test]
     fn a_picture_at_the_setpoint_is_left_alone() {
-        let mut ae = Ae::starting_at(600, 1024);
+        let mut ae = Ae::starting_at(IMX219.exposure, 600, 1024);
         assert_eq!(ae.step(TARGET_Y), None);
         // And within the deadband, either side.
         assert_eq!(ae.step(TARGET_Y * 1.1), None);
@@ -523,12 +548,12 @@ mod tests {
     fn a_dark_picture_gets_more_light_and_a_bright_one_less() {
         let brightness = |c: Controls| c.exposure as f64 * c.analogue_gain as f64 * c.gain as f64;
 
-        let mut ae = Ae::starting_at(600, 1024);
+        let mut ae = Ae::starting_at(IMX219.exposure, 600, 1024);
         let before = ae.controls();
         let darker = ae.step(20.0).expect("a step out of the deadband");
         assert!(brightness(darker) > brightness(before));
 
-        let mut ae = Ae::starting_at(600, 1024);
+        let mut ae = Ae::starting_at(IMX219.exposure, 600, 1024);
         let before = ae.controls();
         let brighter = ae.step(220.0).expect("a step out of the deadband");
         assert!(brightness(brighter) < brightness(before));
@@ -539,6 +564,7 @@ mod tests {
         // From the dimmest state there is, the first thing that grows is the shutter, and neither
         // gain moves off 1x until the soft cap is reached.
         let mut ae = Ae {
+            limits: IMX219.exposure,
             exposure: 4.0,
             analogue: 1.0,
             digital: 1.0,
@@ -546,7 +572,7 @@ mod tests {
         };
         let step = ae.step(2.0).expect("a step");
         assert!(step.exposure > 4);
-        assert!(step.exposure as f64 <= SOFT_LINES);
+        assert!(step.exposure as f64 <= IMX219.exposure.soft_lines);
         assert_eq!((step.analogue_gain, step.gain), (256, 256));
     }
 
@@ -555,7 +581,7 @@ mod tests {
         // The bug this catches, seen on a robot in a dark room: pinned at every ceiling, the ratio
         // stays outside the deadband for ever because the setpoint is unreachable — so the loop kept
         // writing the same three numbers twice a second, and each write is a process.
-        let mut ae = Ae::starting_at(600, 1024);
+        let mut ae = Ae::starting_at(IMX219.exposure, 600, 1024);
         let mut steps = 0;
         for _ in 0..200 {
             if ae.step(1.0).is_some() {
@@ -568,8 +594,11 @@ mod tests {
         );
         // And it is at the ceiling, not merely quiet.
         let pinned = ae.controls();
-        assert_eq!(pinned.exposure as f64, HARD_LINES);
-        assert_eq!(pinned.analogue_gain as f64, MAX_ANALOGUE * 256.0);
+        assert_eq!(pinned.exposure as f64, IMX219.exposure.hard_lines);
+        assert_eq!(
+            pinned.analogue_gain as f64,
+            IMX219.exposure.max_analogue * 256.0
+        );
 
         // Light returns: the next step must write again rather than stay stuck on "unchanged".
         assert!(
@@ -580,7 +609,7 @@ mod tests {
 
     #[test]
     fn the_re_assert_writes_the_same_values_and_restarts_the_heartbeat() {
-        let mut ae = Ae::starting_at(600, 1024);
+        let mut ae = Ae::starting_at(IMX219.exposure, 600, 1024);
         for _ in 0..50 {
             ae.step(1.0);
         }
@@ -597,14 +626,17 @@ mod tests {
     fn the_shutter_never_asks_for_a_longer_frame_than_the_sensor_has() {
         // Pitch dark, for as long as it takes: the shutter must stop at the hard cap, or the driver
         // stretches the frame time and the stream halves its rate.
-        let mut ae = Ae::starting_at(600, 1024);
+        let mut ae = Ae::starting_at(IMX219.exposure, 600, 1024);
         for _ in 0..200 {
             ae.step(1.0);
         }
         let pinned = ae.controls();
-        assert!(pinned.exposure as f64 <= HARD_LINES, "{pinned:?}");
         assert!(
-            pinned.analogue_gain as f64 <= MAX_ANALOGUE * 256.0,
+            pinned.exposure as f64 <= IMX219.exposure.hard_lines,
+            "{pinned:?}"
+        );
+        assert!(
+            pinned.analogue_gain as f64 <= IMX219.exposure.max_analogue * 256.0,
             "{pinned:?}"
         );
         assert!(pinned.gain as f64 <= MAX_DIGITAL * 256.0, "{pinned:?}");
@@ -665,7 +697,7 @@ mod tests {
     /// Dark enough and it reaches for digital gain, bright enough and it hands it back.
     #[test]
     fn a_room_that_gets_brighter_asks_for_1x_digital_gain_back() {
-        let mut ae = Ae::starting_at(600, 1024);
+        let mut ae = Ae::starting_at(IMX219.exposure, 600, 1024);
         let mut put_up = false;
         for _ in 0..50 {
             if let Some(step) = ae.step(1.0) {
@@ -704,7 +736,7 @@ mod tests {
             (TARGET_Y / 8.0) * (product / reference).powf(1.0 / 0.45)
         };
 
-        let mut ae = Ae::starting_at(600, 1024);
+        let mut ae = Ae::starting_at(IMX219.exposure, 600, 1024);
         let mut seen = ae.controls();
         let mut steps = 0;
         for _ in 0..60 {
@@ -722,5 +754,29 @@ mod tests {
             "settled at {settled:.0} after {steps} steps"
         );
         assert!(steps < 30, "took {steps} steps to settle");
+    }
+
+    /// The GC2093 writes gain in 64ths. The loop has to speak that: 4x is 256 there, and an IMX219
+    /// number written to it would be 16x — a picture blown out before the first frame is metered.
+    #[test]
+    fn the_gc2093_is_steered_in_its_own_units() {
+        let limits = GC2093.exposure;
+        let mut ae = Ae::starting_at(limits, limits.start_lines, limits.start_gain());
+        assert_eq!(ae.controls().analogue_gain, 256, "4x, in 64ths");
+
+        for _ in 0..200 {
+            ae.step(1.0);
+        }
+        let pinned = ae.controls();
+        assert_eq!(pinned.exposure as f64, limits.hard_lines, "{pinned:?}");
+        assert!(pinned.exposure < 1121, "inside the frame the driver offers");
+        assert_eq!(pinned.analogue_gain, 11 * 64, "11x, in 64ths");
+        assert!(ae.at_ceiling(pinned));
+
+        // And from the dimmest state, the shutter is spent first and the gain stays at 1x.
+        let mut ae = Ae::starting_at(limits, 4, limits.unity_gain);
+        let step = ae.step(2.0).expect("a step");
+        assert!(step.exposure as f64 <= limits.soft_lines);
+        assert_eq!(step.analogue_gain, 64);
     }
 }

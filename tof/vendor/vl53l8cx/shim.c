@@ -35,6 +35,19 @@ int vl8_open(const char *dev_path, uint8_t addr_7bit)
     return dev.platform.fd < 0 ? -1 : 0;
 }
 
+/* vendor/probe.c: opens a spidev and sets ST's mode, word size and clock. */
+int tof_spi_open(const char *dev_path);
+
+/* The sensor on a spidev instead: no address, and the platform layer frames
+ * every access for SPI (../platform.c). */
+int vl8_open_spi(const char *dev_path)
+{
+    memset(&dev, 0, sizeof(dev));
+    dev.platform.spi = 1;
+    dev.platform.fd = tof_spi_open(dev_path);
+    return dev.platform.fd < 0 ? -1 : 0;
+}
+
 void vl8_close(void)
 {
     if (dev.platform.fd >= 0) {

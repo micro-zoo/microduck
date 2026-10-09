@@ -39,28 +39,32 @@
 //! every alpha robot publishes a measurement: `robotd-params` ships the family's solve as the
 //! `[media.intrinsics]` default (the camera and lens are one part), and a robot with its own solve
 //! written there publishes that. The nominal path is the fallback for a camera nobody has solved.
+//!
+//! # Every number above is the IMX219's
+//!
+//! The field of view and the family solve belong to a sensor behind a lens, so they live on its
+//! [`Sensor`] entry rather than here. A sensor with neither — the beta board's GC2093, until someone
+//! calibrates it — publishes no geometry unless the robot carries its own `[media.intrinsics]`.
 
-/// The head camera's horizontal field of view, degrees — the full IMX219 array (3.67 mm wide)
-/// behind the ~3.05 mm M12 lens. The one physical number the nominal geometry rests on, and the one
-/// the family calibration confirms (it solves to 62.2°). See the module header.
-const FULL_FIELD_HFOV_DEG: f64 = 62.0;
+use crate::sensor::Sensor;
 
 /// The MuJoCo twin head camera's vertical field of view. The MJCF sets no `fovy`, so MuJoCo's
 /// default 45° applies; see [`Intrinsics::sim`].
 const SIM_VFOV_DEG: f64 = 45.0;
 
-/// Horizontal focal length in pixels for a delivered frame `width` wide, from [`FULL_FIELD_HFOV_DEG`].
-/// The delivered field of view is the sensor's full width in every mode this driver offers, so this
+/// Horizontal focal length in pixels for a delivered frame `width` wide, from the sensor's field of
+/// view ([`Sensor::hfov_deg`]: 62° for the IMX219, the full array behind its lens). The delivered
+/// field of view is the sensor's full width in every mode the IMX219's driver offers, so this
 /// depends only on the output width, not on which sensor mode fed it.
-fn nominal_focal_px(width: u32) -> f64 {
-    f64::from(width) / 2.0 / (FULL_FIELD_HFOV_DEG / 2.0).to_radians().tan()
+fn nominal_focal_px(width: u32, hfov_deg: f64) -> f64 {
+    f64::from(width) / 2.0 / (hfov_deg / 2.0).to_radians().tan()
 }
 
-/// The sensor readout mode `pipeline::pin_sensor_mode` puts the IMX219 in — carried so
-/// [`Intrinsics::nominal`] can tell "the mode we pinned" from "we could not confirm it", and refuse
-/// a delivered frame whose aspect ratio is not the mode's.
+/// A sensor readout mode — what `pipeline::pin_sensor_mode` puts the sensor in, carried on its
+/// [`Sensor`] so [`Intrinsics::nominal`] can refuse a delivered frame whose aspect ratio is not the
+/// mode's.
 ///
-/// # Both modes this driver offers are the full ~62° field
+/// # On the IMX219, both modes its driver offers are the full ~62° field
 ///
 /// The IMX219's full array is 3280×2464 at a 1.12 µm pitch behind the ~3.05 mm M12 lens — `2·atan(
 /// 3280·1.12µm / 2 / 3.05mm)` ≈ **62°** horizontally. On this board's Rockchip driver `1920×1080`
@@ -79,14 +83,6 @@ fn nominal_focal_px(width: u32) -> f64 {
 pub struct SensorMode {
     pub width: u32,
     pub height: u32,
-}
-
-impl SensorMode {
-    /// The mode `pipeline::pin_sensor_mode` asks for: the full field at 30 fps.
-    pub const PINNED: Self = Self {
-        width: 1920,
-        height: 1080,
-    };
 }
 
 /// Where the optical axis is and how long the focal length is, in pixels of a delivered frame.
@@ -134,10 +130,14 @@ pub struct Intrinsics {
 impl Intrinsics {
     /// The design figures for a delivered frame, or `None` when the geometry is not known.
     ///
-    /// `None` has one cause and it is worth surfacing rather than papering over: the sensor is not
-    /// in the mode this code pins, so how much of the sensor a frame covers is unknown.
-    pub fn nominal(mode: Option<SensorMode>, width: u32, height: u32) -> Option<Self> {
-        let mode = mode?;
+    /// `pinned` is the sensor, when it is confirmed in the mode this code pins. `None` has two
+    /// causes and both are worth surfacing rather than papering over: the sensor is not in that
+    /// mode, so how much of it a frame covers is unknown; or nobody has measured the sensor's
+    /// field of view behind its lens.
+    pub fn nominal(pinned: Option<&Sensor>, width: u32, height: u32) -> Option<Self> {
+        let sensor = pinned?;
+        let hfov = sensor.hfov_deg?;
+        let mode = sensor.mode;
         if width == 0 || height == 0 || mode.width == 0 || mode.height == 0 {
             return None;
         }
@@ -151,9 +151,10 @@ impl Intrinsics {
             return None;
         }
 
-        // The focal length is fixed by the field of view and the delivered width. The field of view
-        // is the sensor's full ~62° in every mode, so it does not depend on which mode fed the frame.
-        let focal = nominal_focal_px(width);
+        // The focal length is fixed by the field of view and the delivered width. On the IMX219 the
+        // field of view is the sensor's full ~62° in every mode, so it does not depend on which
+        // mode fed the frame.
+        let focal = nominal_focal_px(width, hfov);
         Some(Self {
             fx: focal,
             fy: focal,
@@ -221,18 +222,15 @@ impl Intrinsics {
     /// one part across a revision, so this is a real solve of the same optics — just not of this
     /// particular unit, which is why it is published as `Source::Family` rather than `Robot`.
     ///
-    /// Gated on a known sensor mode for the same reason [`Intrinsics::nominal`] is: the solve was
-    /// taken in the pinned mode, and an unconfirmed one (the boot mode — the same ~62° field, but a
-    /// different 4:3→16:9 framing and principal point) would place it slightly wrong — so an
-    /// unconfirmed mode publishes nothing rather than the family's numbers off by that framing.
-    pub fn family(mode: Option<SensorMode>, width: u32, height: u32) -> Option<Self> {
-        mode?;
-        Self::scaled(
-            &robotd_params::CameraIntrinsics::alpha(),
-            width,
-            height,
-            Source::Family,
-        )
+    /// The solve is the sensor's own ([`Sensor::family`]), so a sensor nobody has calibrated has
+    /// none, rather than borrowing another lens's. And gated on a confirmed mode for the same
+    /// reason [`Intrinsics::nominal`] is: the solve was taken in the pinned mode, and an
+    /// unconfirmed one (the IMX219's boot mode — the same ~62° field, but a different 4:3→16:9
+    /// framing and principal point) would place it slightly wrong — so an unconfirmed mode
+    /// publishes nothing rather than the family's numbers off by that framing.
+    pub fn family(pinned: Option<&Sensor>, width: u32, height: u32) -> Option<Self> {
+        let solve = pinned?.family?;
+        Self::scaled(&solve(), width, height, Source::Family)
     }
 
     /// The MuJoCo twin's head camera. The MJCF sets no `fovy` on the camera, so MuJoCo's default
@@ -262,20 +260,21 @@ impl Intrinsics {
     /// carries its [`Source`], so "calibrated" never has to stand in for "measured on *this* robot".
     pub fn published(
         configured: Option<&robotd_params::CameraIntrinsics>,
-        mode: Option<SensorMode>,
+        pinned: Option<&Sensor>,
         width: u32,
         height: u32,
     ) -> Option<Self> {
         configured
             .and_then(|measured| Self::scaled_from(measured, width, height))
-            .or_else(|| Self::family(mode, width, height))
-            .or_else(|| Self::nominal(mode, width, height))
+            .or_else(|| Self::family(pinned, width, height))
+            .or_else(|| Self::nominal(pinned, width, height))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sensor::{GC2093, IMX219};
 
     fn measured(width: u32, height: u32) -> robotd_params::CameraIntrinsics {
         robotd_params::CameraIntrinsics {
@@ -295,19 +294,19 @@ mod tests {
         // 62° across a 1280-wide frame. Written out so a wrong constant is a failing test rather
         // than a plausible-looking number in an SDP nobody checks.
         assert!(
-            (nominal_focal_px(1280) - 1065.14).abs() < 0.1,
+            (nominal_focal_px(1280, 62.0) - 1065.14).abs() < 0.1,
             "{}",
-            nominal_focal_px(1280)
+            nominal_focal_px(1280, 62.0)
         );
         // And it implies the 62° it was built from.
-        let hfov = 2.0 * (640.0 / nominal_focal_px(1280)).atan().to_degrees();
+        let hfov = 2.0 * (640.0 / nominal_focal_px(1280, 62.0)).atan().to_degrees();
         assert!((hfov - 62.0).abs() < 0.01, "{hfov}");
     }
 
     /// 1280x720 out of the pinned 1920x1080 mode: the 62° field at that width.
     #[test]
     fn the_pinned_mode_scales_to_what_is_streamed() {
-        let at_720p = Intrinsics::nominal(Some(SensorMode::PINNED), 1280, 720).expect("known");
+        let at_720p = Intrinsics::nominal(Some(&IMX219), 1280, 720).expect("known");
         assert!((at_720p.fx - 1065.14).abs() < 0.1, "{}", at_720p.fx);
         assert_eq!(at_720p.fy, at_720p.fx, "square pixels, uniform scale");
         assert_eq!((at_720p.cx, at_720p.cy), (640.0, 360.0));
@@ -321,8 +320,8 @@ mod tests {
         );
 
         // The field of view is the same at the mode's own resolution — only the pixel count grows.
-        let at_1080p = Intrinsics::nominal(Some(SensorMode::PINNED), 1920, 1080).expect("known");
-        assert!((at_1080p.fx - nominal_focal_px(1920)).abs() < 0.01);
+        let at_1080p = Intrinsics::nominal(Some(&IMX219), 1920, 1080).expect("known");
+        assert!((at_1080p.fx - nominal_focal_px(1920, 62.0)).abs() < 0.01);
         let hfov = 2.0 * (960.0 / at_1080p.fx).atan().to_degrees();
         assert!((hfov - 62.0).abs() < 0.01, "{hfov}");
     }
@@ -347,7 +346,7 @@ mod tests {
     fn the_delivered_field_of_view_is_the_full_62_degrees() {
         for w in [640_u32, 1280, 1920] {
             let h = w * 9 / 16;
-            let k = Intrinsics::nominal(Some(SensorMode::PINNED), w, h).expect("known");
+            let k = Intrinsics::nominal(Some(&IMX219), w, h).expect("known");
             let hfov = 2.0 * (f64::from(w) / 2.0 / k.fx).atan().to_degrees();
             assert!((hfov - 62.0).abs() < 0.5, "{w}w -> {hfov}");
         }
@@ -364,28 +363,43 @@ mod tests {
         assert!(Intrinsics::published(None, None, 1280, 720).is_none());
     }
 
+    /// **A sensor nobody has measured publishes nothing either**, even in its pinned mode: the
+    /// IMX219's 62° and its family solve describe another lens, and borrowing them would be a
+    /// plausible geometry that is wrong.
+    #[test]
+    fn an_uncalibrated_sensor_borrows_no_other_lens() {
+        assert!(Intrinsics::nominal(Some(&GC2093), 1280, 720).is_none());
+        assert!(Intrinsics::family(Some(&GC2093), 1280, 720).is_none());
+        assert!(Intrinsics::published(None, Some(&GC2093), 1280, 720).is_none());
+    }
+
+    /// And a robot that has calibrated its own GC2093 publishes that, which is how a beta board
+    /// gets geometry before there is a family solve.
+    #[test]
+    fn a_robot_calibration_serves_a_sensor_with_no_family() {
+        let published = Intrinsics::published(Some(&measured(1280, 720)), Some(&GC2093), 1280, 720)
+            .expect("the robot's own solve");
+        assert_eq!(published.source, Source::Robot);
+        assert_eq!(published.fx, 1800.0);
+    }
+
     /// A frame whose aspect ratio is not the mode's has been cropped or squashed on the way out,
     /// and which of those cannot be told from the size.
     #[test]
     fn a_changed_aspect_ratio_is_refused_rather_than_guessed() {
         assert!(
-            Intrinsics::nominal(Some(SensorMode::PINNED), 640, 480).is_none(),
+            Intrinsics::nominal(Some(&IMX219), 640, 480).is_none(),
             "4:3 out of a 16:9 mode is not a resize"
         );
-        assert!(Intrinsics::nominal(Some(SensorMode::PINNED), 1280, 0).is_none());
+        assert!(Intrinsics::nominal(Some(&IMX219), 1280, 0).is_none());
     }
 
     /// A calibration wins, and scales.
     #[test]
     fn a_calibration_is_preferred_and_carried_to_the_streamed_size() {
         // Measured at 1280x720, delivered at 640x360: everything halves.
-        let published = Intrinsics::published(
-            Some(&measured(1280, 720)),
-            Some(SensorMode::PINNED),
-            640,
-            360,
-        )
-        .expect("a calibration");
+        let published = Intrinsics::published(Some(&measured(1280, 720)), Some(&IMX219), 640, 360)
+            .expect("a calibration");
         assert!(published.calibrated);
         assert!((published.fx - 900.0).abs() < 0.01);
         assert!((published.cx - 323.0).abs() < 0.01);
@@ -409,13 +423,8 @@ mod tests {
     /// own record was unusable and someone should fix it.
     #[test]
     fn an_unusable_robot_calibration_falls_back_to_the_family() {
-        let published = Intrinsics::published(
-            Some(&measured(640, 480)),
-            Some(SensorMode::PINNED),
-            1280,
-            720,
-        )
-        .expect("the family calibration");
+        let published = Intrinsics::published(Some(&measured(640, 480)), Some(&IMX219), 1280, 720)
+            .expect("the family calibration");
         assert_eq!(published.source, Source::Family);
         assert!(
             published.calibrated,
@@ -429,8 +438,8 @@ mod tests {
     /// so a consumer can tell it is not this unit's own solve.
     #[test]
     fn the_family_fills_in_when_the_robot_has_no_table() {
-        let published = Intrinsics::published(None, Some(SensorMode::PINNED), 640, 360)
-            .expect("the family calibration");
+        let published =
+            Intrinsics::published(None, Some(&IMX219), 640, 360).expect("the family calibration");
         assert_eq!(published.source, Source::Family);
         assert!(published.calibrated);
         // Half of the 1280x720 solve.
@@ -445,8 +454,7 @@ mod tests {
     #[test]
     fn the_wire_shape_names_what_it_is() {
         let json =
-            serde_json::to_value(Intrinsics::nominal(Some(SensorMode::PINNED), 1280, 720).unwrap())
-                .unwrap();
+            serde_json::to_value(Intrinsics::nominal(Some(&IMX219), 1280, 720).unwrap()).unwrap();
         assert_eq!(json["calibrated"], false);
         assert_eq!(json["source"], "nominal");
         assert!((json["fx"].as_f64().unwrap() - 1065.14).abs() < 0.1);

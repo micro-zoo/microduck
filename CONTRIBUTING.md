@@ -5,8 +5,14 @@ For working on the daemons themselves. To use a robot rather than change it, see
 
 ## Building and testing
 
-Needs Rust **1.99+** (stable). The robot is aarch64 Linux; you develop on Linux or macOS, and
+Needs Rust **1.89+** (stable). The robot is aarch64 Linux; you develop on Linux or macOS, and
 the two are not quite the same checkout — see below.
+
+That number is a ceiling too. The Yocto image (`microduck_yocto`) builds each release from
+source with the Rust its OpenEmbedded release ships, **1.94.1** on wrynose, so code here must not
+need anything newer — even when stable has a nicer API and deprecates the old one, which with
+CI's `-D warnings` is how 0.15.1 came to require 1.99 and could not be built into an image.
+`cargo +1.94.1 check --workspace` is the check.
 
 ```bash
 cargo test --workspace
@@ -77,6 +83,7 @@ the daemons — one crate each, one unit each, all in the same release artifact
   padd/           gamepad → intents — an ordinary socket client, no privileged access
   mediad/         camera, mic, WebRTC, the remote gateway, and the console it serves
   tof/            tofd: the head's 8×8 depth sensor. Publishes frames, reads nothing
+  nfc/            nfcd: the NFC reader. A touched tag names a gamepad, and configd pairs it
 
 the libraries they drive — no sockets, no systemd, nothing starts them
   duck-ipc-proto/ the wire contract

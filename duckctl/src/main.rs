@@ -31,6 +31,7 @@
 //! cargo run -p duckctl -- wifi scan
 //! cargo run -p duckctl -- wifi connect "Pollen" --psk secret
 //! cargo run -p duckctl -- name "Ducky"
+//! cargo run -p duckctl -- --name duck-d041 quack
 //! cargo run -p duckctl -- call robot.health
 //! cargo run -p duckctl -- logs robotd -n 100
 //! ```
@@ -1071,6 +1072,11 @@ enum Command {
     Update(Update),
     /// Name, serial and uptime.
     Info,
+    /// Play this robot's quack — the loudest way to tell ducks apart.
+    ///
+    /// `robotctl quack` on the robot. Every voice is generated from the SoC serial, so the duck
+    /// that answers, in a voice that is only its own, is the one `--name` reached.
+    Quack,
     /// Is the control loop healthy?
     Health,
     /// Wifi.
@@ -1141,7 +1147,7 @@ enum Command {
 /// that is the daemon with it.
 #[derive(Subcommand)]
 enum Pad {
-    /// What each of the five one-shot buttons runs.
+    /// What each of the six one-shot buttons runs.
     ///
     /// `overridden` marks what somebody changed; `error` marks a button bound to a skill this
     /// robot does not have, which is a button that will do nothing when pressed.
@@ -1152,7 +1158,7 @@ enum Pad {
     /// checked against this robot's skills first, so a typo is refused with the real list rather
     /// than becoming a dead button.
     Bind {
-        /// `a`, `x`, `lb`, `rb` or `dpad_down` — the bumpers, not the analog triggers.
+        /// `a`, `b`, `x`, `y`, `lb` or `rb` — the bumpers, not the analog triggers.
         button: String,
         /// A skill this robot has, or `""` to leave the button doing nothing.
         skill: String,
@@ -2213,6 +2219,14 @@ fn request_line(command: &Command) -> Result<(String, Duration), Box<dyn std::er
         ),
         Command::Update(update) => return update_request_line(update),
         Command::Info => ("system.info", serde_json::json!({}), REPLY_TIMEOUT),
+        Command::Quack => (
+            proto::method::ROBOT_SOUND,
+            serde_json::to_value(proto::SoundParams {
+                tag: proto::SoundTag::Chirp,
+                hold: None,
+            })?,
+            REPLY_TIMEOUT,
+        ),
         // A journal read is a `journalctl` spawn on the robot plus a reply several times larger
         // than any other, chunked at 20 bytes a notification — seconds rather than milliseconds,
         // so it gets the slow budget for the same reason `wifi scan` does.

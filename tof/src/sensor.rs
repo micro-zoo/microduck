@@ -20,7 +20,6 @@
 
 #[cfg(target_os = "linux")]
 use std::ffi::CString;
-use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,9 +27,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Context, anyhow};
 use anyhow::{Result, bail};
 
-use crate::Frame;
 #[cfg(target_os = "linux")]
 use crate::{COLS, ROWS, ZONES};
+use crate::{Frame, Link};
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
@@ -41,8 +40,16 @@ unsafe extern "C" {
         device_id: *mut u8,
         revision_id: *mut u8,
     ) -> i32;
+    /// The same ID read over SPI.
+    fn tof_probe_id_spi(
+        dev_path: *const std::ffi::c_char,
+        device_id: *mut u8,
+        revision_id: *mut u8,
+    ) -> i32;
 
     fn vl8_open(dev_path: *const std::ffi::c_char, addr_7bit: u8) -> i32;
+    /// The VL53L8CX on a spidev: no address. The VL53L5CX has no SPI, so no `vl5_` twin.
+    fn vl8_open_spi(dev_path: *const std::ffi::c_char) -> i32;
     fn vl8_close();
     fn vl8_is_alive() -> i32;
     fn vl8_init() -> i32;
@@ -138,6 +145,15 @@ impl Driver {
         }
     }
 
+    /// `None` for a generation with no SPI interface.
+    fn open_spi(self, path: &CString) -> Option<i32> {
+        match self {
+            Self::L5 => None,
+            // SAFETY: as `open`; the shim opens the spidev and sets its mode and clock.
+            Self::L8 => Some(unsafe { vl8_open_spi(path.as_ptr()) }),
+        }
+    }
+
     fn close(self) {
         // SAFETY: closes the descriptor the shim owns; idempotent there.
         unsafe {
@@ -224,20 +240,22 @@ impl Sensor {
     /// Probe what is on the bus, then open it with the matching driver.
     ///
     /// The slow part is the firmware: ~90 KB over I²C, a few seconds at 400 kHz
-    /// (tens on a bit-banged bus). It happens once per process, before ranging,
-    /// which is why the daemon does it off the socket-serving task.
-    pub fn open(bus: &Path, address: u8) -> Result<Self> {
+    /// (tens on a bit-banged bus), and well under a second over SPI at 2 MHz. It
+    /// happens once per process, before ranging, which is why the daemon does it off
+    /// the socket-serving task.
+    pub fn open(link: &Link) -> Result<Self> {
         if TAKEN.swap(true, Ordering::AcqRel) {
             bail!("a sensor is already open in this process");
         }
         // From here on every early return must release the claim, or one failed
         // attempt would refuse every retry for the life of the process.
-        Self::open_inner(bus, address).inspect_err(|_| TAKEN.store(false, Ordering::Release))
+        Self::open_inner(link).inspect_err(|_| TAKEN.store(false, Ordering::Release))
     }
 
-    fn open_inner(bus: &Path, address: u8) -> Result<Self> {
-        let path = CString::new(bus.as_os_str().as_encoded_bytes())
-            .with_context(|| format!("{} is not a usable device path", bus.display()))?;
+    fn open_inner(link: &Link) -> Result<Self> {
+        let device = link.device();
+        let path = CString::new(device.as_os_str().as_encoded_bytes())
+            .with_context(|| format!("{} is not a usable device path", device.display()))?;
 
         // Ask what is there before loading anything: the two generations take
         // different firmware, and the upload is the expensive, slow step.
@@ -245,22 +263,42 @@ impl Sensor {
         let mut revision_id = 0u8;
         // SAFETY: `path` outlives the call; both out-pointers are live locals the
         // C writes one byte each into.
-        let probed =
-            unsafe { tof_probe_id(path.as_ptr(), address, &mut device_id, &mut revision_id) };
+        let probed = unsafe {
+            match link {
+                Link::I2c { address, .. } => {
+                    tof_probe_id(path.as_ptr(), *address, &mut device_id, &mut revision_id)
+                }
+                Link::Spi { .. } => {
+                    tof_probe_id_spi(path.as_ptr(), &mut device_id, &mut revision_id)
+                }
+            }
+        };
         if probed != 0 {
-            bail!("nothing answered at {address:#04x} on {}", bus.display());
+            bail!("nothing answered at {link}");
         }
 
         let generation = Generation::from_ids(device_id, revision_id);
         let Some(driver) = generation.driver() else {
+            // Over SPI this is also what an empty bus looks like: SPI has no
+            // acknowledge, so a missing sensor reads back as a stuck line.
             return Err(anyhow!(
-                "something at {address:#04x} answered with device {device_id:#04x} \
+                "something at {link} answered with device {device_id:#04x} \
                  revision {revision_id:#04x}, which is neither a VL53L5CX nor a VL53L8CX"
             ));
         };
 
-        if driver.open(&path, address) != 0 {
-            bail!("cannot open {}", bus.display());
+        let opened = match link {
+            Link::I2c { address, .. } => driver.open(&path, *address),
+            Link::Spi { .. } => match driver.open_spi(&path) {
+                Some(opened) => opened,
+                None => bail!(
+                    "a {} answered on {link}, but it has no SPI interface",
+                    generation.as_str()
+                ),
+            },
+        };
+        if opened != 0 {
+            bail!("cannot open {}", device.display());
         }
         if driver.is_alive() != 1 {
             driver.close();
@@ -355,10 +393,10 @@ pub struct Sensor(std::convert::Infallible);
 
 #[cfg(not(target_os = "linux"))]
 impl Sensor {
-    pub fn open(bus: &Path, _address: u8) -> Result<Self> {
+    pub fn open(link: &Link) -> Result<Self> {
         bail!(
-            "no i2c-dev on this platform, so {} cannot be opened — off a board, run `tofd --fake`",
-            bus.display()
+            "no i2c-dev or spidev on this platform, so {link} cannot be opened — off a board, \
+             run `tofd --fake`"
         )
     }
 
@@ -412,13 +450,19 @@ mod tests {
     /// one bad open into a permanently sensorless process.
     #[test]
     fn a_failed_open_releases_the_claim() {
-        let nowhere = Path::new("/dev/definitely-not-an-i2c-bus");
-        assert!(Sensor::open(nowhere, 0x29).is_err());
-        assert!(!TAKEN.load(Ordering::Acquire), "the claim must be released");
-        assert!(
-            Sensor::open(nowhere, 0x29).is_err(),
-            "a retry must be possible"
-        );
-        assert!(!TAKEN.load(Ordering::Acquire));
+        for nowhere in [
+            Link::I2c {
+                bus: "/dev/definitely-not-an-i2c-bus".into(),
+                address: 0x29,
+            },
+            Link::Spi {
+                device: "/dev/definitely-not-a-spidev".into(),
+            },
+        ] {
+            assert!(Sensor::open(&nowhere).is_err());
+            assert!(!TAKEN.load(Ordering::Acquire), "the claim must be released");
+            assert!(Sensor::open(&nowhere).is_err(), "a retry must be possible");
+            assert!(!TAKEN.load(Ordering::Acquire));
+        }
     }
 }

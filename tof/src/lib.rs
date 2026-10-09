@@ -1,9 +1,10 @@
 //! The head ToF sensor: an 8×8 matrix of distances, once per scan.
 //!
 //! A VL53L5CX or VL53L8CX on the HAT's I²C bus — the same `i2c3` bus the audio
-//! codec sits on — looking where the head looks. This crate is the driver and the
-//! frame shape; `tofd` (`src/main.rs`) is the daemon that owns the sensor and
-//! publishes frames on a socket.
+//! codec sits on — or, on the beta board, a VL53L8CX on SPI ([`link`]), looking
+//! where the head looks. This crate is the driver and the frame shape; `tofd`
+//! (`src/main.rs`) is the daemon that owns the sensor and publishes frames on a
+//! socket.
 //!
 //! **Both generations, decided at runtime.** The two are interchangeable on the
 //! board and differ only in firmware and a driver prefix, so which one is fitted
@@ -40,8 +41,10 @@
 //! combine `tof.frame` with joint state when the kinematics arrive; consumers
 //! that want to *look* at the sensor — `robotctl monitor` — need none of it.
 
+pub mod link;
 pub mod sensor;
 
+pub use link::Link;
 pub use sensor::{Generation, Sensor};
 
 /// The sensor's resolution. Pinned: 8×8 is what `start` configures and what the

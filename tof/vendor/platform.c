@@ -1,5 +1,5 @@
 /*
- * Linux i2c-dev platform layer for ST's VL53L5CX and VL53L8CX ULDs.
+ * Linux i2c-dev and spidev platform layer for ST's VL53L5CX and VL53L8CX ULDs.
  *
  * ONE implementation, compiled once per generation. Two things are supplied by
  * the build (see ../build.rs), because the two ULDs each want the hooks under
@@ -31,6 +31,7 @@ typedef TOF_PLATFORM Platform;
 #include <errno.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
+#include <linux/spi/spidev.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -49,9 +50,62 @@ static uint8_t xfer(Platform *p, struct i2c_msg *msgs, int n)
     return ioctl(p->fd, I2C_RDWR, &data) < 0 ? 255 : 0;
 }
 
+/*
+ * SPI, for the VL53L8CX on a spidev — the framing of ST's own Linux platform
+ * layer (STSW-IMG042, user/platform/platform.c): one full-duplex transfer per
+ * access, chip select low throughout, starting with the 16-bit register index
+ * big-endian, whose bit 15 is 0 for a read and 1 for a write. A read's data is
+ * what comes back after those two bytes. The mode, word size and clock are set
+ * once on the descriptor when it is opened (probe.c, tof_spi_open).
+ *
+ * SPI_CHUNK is spidev's default 4096-byte transfer limit less the two index
+ * bytes, as in ST's layer. Nothing else is on this bus, so unlike CHUNK above
+ * there is no neighbour to keep short.
+ */
+#define SPI_CHUNK (4096u - 2u)
+
+static uint8_t spi_tx[SPI_CHUNK + 2];
+static uint8_t spi_rx[SPI_CHUNK + 2];
+
+static uint8_t spi_xfer(Platform *p, uint16_t idx, uint32_t n)
+{
+    struct spi_ioc_transfer t;
+    memset(&t, 0, sizeof t);
+    t.tx_buf = (unsigned long)spi_tx;
+    t.rx_buf = (unsigned long)spi_rx;
+    t.len = n + 2;
+    spi_tx[0] = (uint8_t)(idx >> 8);
+    spi_tx[1] = (uint8_t)idx;
+    return ioctl(p->fd, SPI_IOC_MESSAGE(1), &t) < 0 ? 255 : 0;
+}
+
+static uint8_t spi_rd(Platform *p, uint16_t reg, uint8_t *values, uint32_t size)
+{
+    for (uint32_t off = 0; off < size;) {
+        uint32_t n = size - off > SPI_CHUNK ? SPI_CHUNK : size - off;
+        memset(spi_tx + 2, 0, n);
+        if (spi_xfer(p, (uint16_t)((reg + off) & 0x7FFF), n)) return 255;
+        memcpy(values + off, spi_rx + 2, n);
+        off += n;
+    }
+    return 0;
+}
+
+static uint8_t spi_wr(Platform *p, uint16_t reg, uint8_t *values, uint32_t size)
+{
+    for (uint32_t off = 0; off < size;) {
+        uint32_t n = size - off > SPI_CHUNK ? SPI_CHUNK : size - off;
+        memcpy(spi_tx + 2, values + off, n);
+        if (spi_xfer(p, (uint16_t)((reg + off) | 0x8000), n)) return 255;
+        off += n;
+    }
+    return 0;
+}
+
 uint8_t RdMulti(Platform *p, uint16_t reg, uint8_t *values,
                 uint32_t size)
 {
+    if (p->spi) return spi_rd(p, reg, values, size);
     uint32_t off = 0;
     while (off < size) {
         uint16_t idx = (uint16_t)(reg + off);
@@ -72,6 +126,7 @@ uint8_t RdMulti(Platform *p, uint16_t reg, uint8_t *values,
 uint8_t WrMulti(Platform *p, uint16_t reg, uint8_t *values,
                 uint32_t size)
 {
+    if (p->spi) return spi_wr(p, reg, values, size);
     uint32_t off = 0;
     while (off < size) {
         uint16_t idx = (uint16_t)(reg + off);

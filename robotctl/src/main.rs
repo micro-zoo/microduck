@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use duck_ipc_proto as proto;
 use robotd_params::Slot;
+use robotd_params::board::Board;
 
 mod camera;
 mod cells;
@@ -46,6 +47,7 @@ mod configure;
 mod duck;
 mod frame;
 mod imu_view;
+mod led;
 mod monitor;
 mod path_map;
 mod show;
@@ -151,10 +153,37 @@ enum Namespace {
         command: RobotCommand,
     },
 
+    /// The face board's LEDs: list them, switch them, blink them. Bench tool for now — see
+    /// `robotctl led --help` and the module doc for who owns an LED once a daemon does.
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Led {
+        #[command(subcommand)]
+        command: led::LedCommand,
+    },
+
+    /// Watch the head IMU live: roll, pitch and yaw of the head, and where it measures up.
+    ///
+    /// Head frame: `x` forward, `y` left, `z` up with the head level, so a level head reads
+    /// roll ≈ 0, pitch ≈ 0 and up ≈ (0, 0, 1). Yaw drifts from wherever the chip started: a game
+    /// rotation has no compass. Served by robotd on a beta; on a zero3 it is tofd's, and this
+    /// says so. Ctrl-C to stop.
+    HeadImu,
+
     /// Play this robot's quack. The loudest way to tell ducks apart: every robot's voice
     /// is generated from its SoC serial, so the one that answers — in a voice that is only
     /// its own — is the one you're SSH'd into.
     Quack,
+
+    /// Switch the flashlight — the beta face's RGB LED. `robotd` owns it, so this asks rather than
+    /// writing the LED (`robotctl led` is the bench tool that writes it directly).
+    Flashlight {
+        /// `on`, `off` or `toggle`.
+        #[arg(value_parser = ["on", "off", "toggle"])]
+        state: String,
+        /// white, red, green, blue, yellow, cyan or magenta.
+        #[arg(long, default_value = "white")]
+        color: String,
+    },
 
     /// Sing with other ducks: two in a room start a piece between themselves, and more join.
     ///
@@ -587,6 +616,34 @@ fn run_quack(socket: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `robotctl flashlight` — ask `robotd` to switch the flashlight.
+fn run_flashlight(socket: &Path, state: &str, color: &str) -> Result<(), Failure> {
+    let color: proto::FlashlightColor =
+        serde_json::from_value(serde_json::Value::String(color.to_owned())).map_err(|_| {
+            Failure::new(
+                exit::USAGE,
+                format!("{color:?} is not white, red, green, blue, yellow, cyan or magenta"),
+            )
+        })?;
+    let mut client = Client::connect_to("robotd", socket)?;
+    client.hello()?;
+    let result = result_of(client.call(&proto::Call::RobotFlashlight(
+        proto::FlashlightParams {
+            on: state == "on",
+            toggle: state == "toggle",
+            color,
+        },
+    ))?)?;
+    let outcome: proto::IntentResult = decode(&result)?;
+    if !outcome.accepted {
+        let reason = outcome
+            .reason
+            .unwrap_or_else(|| "the robot refused".to_owned());
+        return Err(Failure::new(exit::REFUSED, reason));
+    }
+    Ok(())
+}
+
 /// Set by the `SIGINT` handler so the theremin is put down on the way out rather than left
 /// sounding. A bare `AtomicBool` store is the only thing a signal handler may safely do.
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -836,9 +893,10 @@ enum PadCommand {
 
     /// What each of the pad's one-shot buttons runs.
     ///
-    /// Five are bindable: `a`, `x`, `lb`, `rb`, `dpad_down`. The rest are not skills — Start
-    /// toggles the policy, Y and B change what the sticks mean, held Select powers the robot
-    /// off — and the button that stops a robot is the one worth not being able to lose.
+    /// Six are bindable: `a`, `b`, `x`, `y`, `lb`, `rb`. The rest are not skills — Start stands
+    /// the robot up and toggles the policy, the D-pad changes what the sticks mean, held Select
+    /// cuts torque and powers the robot off — and the button that stops a robot is the one worth
+    /// not being able to lose.
     Bindings {
         #[arg(long)]
         json: bool,
@@ -850,8 +908,8 @@ enum PadCommand {
     /// policy list` names them — and an empty name switches the button off. `padd` notices
     /// within a second; nothing needs restarting.
     Bind {
-        /// `a`, `x`, `lb` or `rb` — the *bumpers*, since the analog triggers are the mouth and
-        /// the quack — or `dpad_down`.
+        /// `a`, `b`, `x`, `y`, `lb` or `rb` — the *bumpers*, since the analog triggers are the
+        /// mouth and the quack.
         button: String,
         /// A skill this robot has, or `""` to leave the button doing nothing.
         skill: String,
@@ -1285,6 +1343,77 @@ fn unreachable_hint(service: &str, path: &std::path::Path, e: &std::io::Error) -
     }
 }
 
+/// Roll, pitch and yaw (degrees, ZYX) of a scalar-first head→world quaternion, and the world's
+/// up expressed in the head frame.
+fn head_attitude(q: [f32; 4]) -> ([f32; 3], [f32; 3]) {
+    let [w, x, y, z] = q;
+    let roll = (2.0 * (w * x + y * z)).atan2(1.0 - 2.0 * (x * x + y * y));
+    let pitch = (2.0 * (w * y - z * x)).clamp(-1.0, 1.0).asin();
+    let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+    let up = [
+        2.0 * (x * z - w * y),
+        2.0 * (y * z + w * x),
+        1.0 - 2.0 * (x * x + y * y),
+    ];
+    (
+        [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()],
+        up,
+    )
+}
+
+/// `robotctl head-imu`: subscribe on robotd's socket and redraw one line ~10 times a second.
+fn run_head_imu(robot_socket: &Path) -> Result<(), Failure> {
+    let mut client = Client::connect_to("robotd", robot_socket)?;
+    let response = client.call(&proto::Call::HeadImuStream)?;
+    let answer: proto::HeadImuStreamResult = response
+        .result
+        .clone()
+        .and_then(|r| serde_json::from_value(r).ok())
+        .ok_or_else(|| Failure::new(exit::FAILED, format!("unexpected answer: {response:?}")))?;
+    let Some(sensor) = answer.sensor else {
+        let why = answer
+            .unavailable
+            .unwrap_or_else(|| "no reason given".to_owned());
+        return Err(Failure::new(exit::FAILED, format!("no head IMU: {why}")));
+    };
+    println!(
+        "{sensor} at {} Hz, head frame: x forward, y left, z up. Ctrl-C to stop.",
+        answer.hz
+    );
+    let mut last_drawn = Instant::now() - Duration::from_secs(1);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = client
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| Failure::new(exit::UNREACHABLE, format!("connection lost: {e}")))?;
+        if read == 0 {
+            println!();
+            return Err(Failure::new(
+                exit::UNREACHABLE,
+                "robotd closed the stream".into(),
+            ));
+        }
+        let Ok(note) = serde_json::from_str::<proto::Request>(line.trim()) else {
+            continue;
+        };
+        let Some(frame) = note.as_head_imu_frame() else {
+            continue;
+        };
+        if last_drawn.elapsed() < Duration::from_millis(100) {
+            continue;
+        }
+        last_drawn = Instant::now();
+        let ([roll, pitch, yaw], up) = head_attitude(frame.quat);
+        print!(
+            "\rroll {roll:+7.1}°  pitch {pitch:+7.1}°  yaw {yaw:+7.1}°   up ({:+.2}, {:+.2}, {:+.2})   gyro ({:+.2}, {:+.2}, {:+.2}) rad/s ",
+            up[0], up[1], up[2], frame.gyro[0], frame.gyro[1], frame.gyro[2]
+        );
+        let _ = std::io::stdout().flush();
+    }
+}
+
 /// A blocking JSON-RPC connection to `updaterd`.
 ///
 /// Deliberately `std::os::unix::net`, not tokio: this is a short-lived CLI issuing
@@ -1675,9 +1804,104 @@ struct HealthReport {
     /// software block already reports.
     #[serde(skip_serializing_if = "Option::is_none")]
     account: Option<proto::AccountStatusResult>,
+    board: BoardReport,
     /// This machine's clock when `remote` was read, so rendering stays pure.
     #[serde(skip)]
     read_at: i64,
+}
+
+/// Which board this robot is declared to be, and what its device tree says.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+struct BoardReport {
+    /// `[board] version` in `robotd.toml` — what everything that differs between boards reads.
+    /// `None` when the file does not say, which everything reads as `zero3`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    declared: Option<Board>,
+    /// What `/proc/device-tree/compatible` names, or `None` when it names nothing we know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detected: Option<Board>,
+}
+
+impl BoardReport {
+    fn read() -> Self {
+        Self {
+            declared: Board::declared(Path::new(robotd_params::DEFAULT_PATH)),
+            detected: Board::detected(),
+        }
+    }
+
+    /// What is worth saying about the board: a declaration the hardware contradicts, and a board
+    /// whose updates are about to end.
+    ///
+    /// The declaration is not corrected, only questioned: it is what provisioning wrote, and the
+    /// device tree is a hint — which is why nothing else reads it.
+    /// The board everything acts on: the declared one, or `zero3` when there is none.
+    fn board(&self) -> Board {
+        self.declared.unwrap_or_default()
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(detected) = self.detected.filter(|&d| d != self.board()) {
+            warnings.push(format!(
+                "robotd.toml declares a {declared} board, and the device tree looks like a \
+                 {detected}. The board decides which releases this robot can install. If the \
+                 device tree is right:\n  sudo robotctl configure  (board.version = \"{detected}\")",
+                declared = self.board(),
+            ));
+        }
+        if let Some(last) = self.board().last_release() {
+            warnings.push(format!(
+                "updates for the {} board end with release {last}: later releases will not \
+                 install on this robot.",
+                self.board()
+            ));
+        }
+        warnings
+    }
+}
+
+/// Offer to write the board the device tree names into a `robotd.toml` that declares none.
+///
+/// Only with a person at a terminal to answer, and only for a board the device tree names: the
+/// answer is theirs, and this asks once per run, from `robotctl health` and from `robotctl update
+/// apply`. A file this user cannot write gets a line saying how to be asked, rather than a
+/// question whose yes would fail. A missing file is not a robot to ask about.
+fn offer_to_declare_board(path: &Path) {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return;
+    }
+    if !path.exists() || Board::declared(path).is_some() {
+        return;
+    }
+    let Some(detected) = Board::detected() else {
+        return;
+    };
+    if std::fs::OpenOptions::new().append(true).open(path).is_err() {
+        eprintln!(
+            "\nThis robot does not declare its board; the device tree says {detected}. \
+             Run this as root to be asked to declare it."
+        );
+        return;
+    }
+    eprint!(
+        "\nThis robot does not declare its board in {}; the device tree says {detected}. \
+         Declare it a {detected}? [y/N] ",
+        path.display()
+    );
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer).is_err() {
+        return;
+    }
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return;
+    }
+    match robotd_params::edit::set_board(path, detected) {
+        Ok(()) => eprintln!("declared: board.version = \"{detected}\""),
+        Err(e) => eprintln!("could not declare it: {e}"),
+    }
 }
 
 impl HealthReport {
@@ -1724,6 +1948,7 @@ fn run_health(
             .ok()
             .and_then(|mut client| client.call(&proto::Call::AccountStatus).ok())
             .and_then(|response| response.result_as::<proto::AccountStatusResult>().ok()),
+        board: BoardReport::read(),
         read_at: unix_now(),
     };
     // Here rather than in `collect_version_report`, which `robotctl version` shares: `version`
@@ -1732,6 +1957,8 @@ fn run_health(
     let quiet = quiet_source_warnings(&report.software.components);
     report.software.warnings.extend(quiet);
     report.software.warnings.extend(not_checked);
+    let board = report.board.warnings();
+    report.software.warnings.extend(board);
 
     match Client::connect_to("robotd", robot_socket) {
         Err(failure) => report.robot_error = Some(failure.message),
@@ -1754,6 +1981,7 @@ fn run_health(
         );
     } else {
         print!("{}", render_health(&report));
+        offer_to_declare_board(Path::new(robotd_params::DEFAULT_PATH));
     }
 
     match report.healthy() {
@@ -1810,6 +2038,14 @@ fn render_health(report: &HealthReport) -> String {
 
             let bus = match (health.bus.consecutive_errors, health.bus.startup_failures) {
                 (0, 0) => "ok".to_owned(),
+                // The servos that answered are a robot; the line is about the ones that did not.
+                (0, n) if health.bus.partly_missing() => {
+                    format!("missing {}, {n} attempts", health.bus.describe_missing())
+                }
+                // Every servo answered, so there is a robot; the IMU row says what is missing.
+                (0, n) if health.imu.is_some_and(|imu| imu.missing) => {
+                    format!("servos ok, waiting for the IMU board, {n} attempts")
+                }
                 (0, n) => format!("waiting for a robot to answer, {n} attempts"),
                 (n, _) => format!("{n} consecutive read failures"),
             };
@@ -1847,7 +2083,11 @@ fn render_health(report: &HealthReport) -> String {
                     out,
                     "  {:<9} {}{stale}",
                     "imu",
-                    if imu.ready { "ready" } else { "not ready" },
+                    match (imu.missing, imu.ready) {
+                        (true, _) => "not answering on the motor bus — is it plugged in?",
+                        (false, true) => "ready",
+                        (false, false) => "not ready",
+                    },
                 );
             }
 
@@ -1907,6 +2147,17 @@ fn render_health(report: &HealthReport) -> String {
             let _ = writeln!(out, "robot     unavailable");
         }
     }
+
+    let _ = writeln!(
+        out,
+        "board     {}{}",
+        report.board.board(),
+        if report.board.declared.is_none() {
+            " (not declared)"
+        } else {
+            ""
+        }
+    );
 
     // Between the robot verdict and the software block, because it is a fact about the hardware
     // rather than about which release is installed. Omitted entirely when `mediad` has published
@@ -2724,6 +2975,7 @@ fn render_version(report: &VersionReport) -> String {
 }
 
 /// An error carrying the exit code it should produce.
+#[derive(Debug)]
 struct Failure {
     code: u8,
     message: String,
@@ -5081,6 +5333,15 @@ fn run(cli: Cli) -> Result<(), Failure> {
         Namespace::Quack => {
             return run_quack(&cli.robot_socket);
         }
+        Namespace::Flashlight { state, color } => {
+            return run_flashlight(&cli.robot_socket, &state, &color);
+        }
+        Namespace::HeadImu => {
+            return run_head_imu(&cli.robot_socket);
+        }
+        Namespace::Led { command } => {
+            return led::run(Path::new(led::LEDS_DIR), command);
+        }
         Namespace::Theremin { off } => {
             return run_theremin(&cli.robot_socket, off);
         }
@@ -5104,6 +5365,11 @@ fn run(cli: Cli) -> Result<(), Failure> {
     let component = |name: &str| proto::ComponentParams {
         component: proto::ComponentId::new(name),
     };
+    // Before the apply, not after: the board is the hardware revision this robot checks the
+    // release against.
+    if matches!(command, UpdateCommand::Apply { .. }) {
+        offer_to_declare_board(Path::new(robotd_params::DEFAULT_PATH));
+    }
     let call = match &command {
         UpdateCommand::Check { component: name } => {
             proto::Call::Check(component(name.as_deref().unwrap_or("daemon")))
@@ -5355,6 +5621,28 @@ fn journal_for(transcript: &proto::RunTranscript, skip: bool) -> String {
 fn compact(value: &impl serde::Serialize) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
+#[cfg(test)]
+mod head_imu_tests {
+    use super::head_attitude;
+
+    #[test]
+    fn a_level_head_reads_zero_and_up_is_z() {
+        let (rpy, up) = head_attitude([1.0, 0.0, 0.0, 0.0]);
+        assert!(rpy.iter().all(|a| a.abs() < 1e-4), "{rpy:?}");
+        assert!((up[2] - 1.0).abs() < 1e-6 && up[0].abs() < 1e-6 && up[1].abs() < 1e-6);
+    }
+
+    /// Nose down is positive pitch about y (right-handed, y left), and up then leans back, toward
+    /// -x: the forward axis now points partly down.
+    #[test]
+    fn nose_down_is_positive_pitch() {
+        let half = 15f32.to_radians();
+        let (rpy, up) = head_attitude([half.cos(), 0.0, half.sin(), 0.0]);
+        assert!((rpy[1] - 30.0).abs() < 1e-3, "{rpy:?}");
+        assert!((up[0] + 0.5).abs() < 1e-3, "{up:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -6283,8 +6571,50 @@ mod tests {
             camera: None,
             remote: None,
             account: None,
+            board: BoardReport {
+                declared: Some(Board::Zero3),
+                detected: Some(Board::Zero3),
+            },
             read_at: 1_000_000,
         }
+    }
+
+    #[test]
+    fn health_names_the_declared_board() {
+        let mut report = health_report(None, Some("no robotd"));
+        let out = render_health(&report);
+        assert!(out.contains("board     zero3\n"), "{out}");
+        report.board.declared = None;
+        let out = render_health(&report);
+        assert!(out.contains("board     zero3 (not declared)"), "{out}");
+    }
+
+    /// A board agreeing with its device tree, or one whose device tree names nothing we know, is
+    /// not worth a line. One the device tree contradicts is, with the command that fixes it.
+    #[test]
+    fn health_questions_a_board_the_device_tree_contradicts() {
+        let board = |declared, detected| BoardReport { declared, detected };
+        assert!(
+            board(Some(Board::Zero3), Some(Board::Zero3))
+                .warnings()
+                .is_empty()
+        );
+        assert!(board(None, Some(Board::Zero3)).warnings().is_empty());
+        assert!(board(Some(Board::Beta), None).warnings().is_empty());
+        assert_eq!(board(None, Some(Board::Beta)).warnings().len(), 1);
+
+        let warnings = board(Some(Board::Zero3), Some(Board::Beta)).warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("declares a zero3 board"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("board.version = \"beta\""),
+            "{}",
+            warnings[0]
+        );
     }
 
     /// `updaterd` saying the robot is signed in as `name`, or signed in to nothing.
@@ -6507,6 +6837,7 @@ mod tests {
                     ready: true,
                     stale_blocks: 0,
                     consecutive_stale_blocks: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6647,6 +6978,7 @@ mod tests {
                     ready: false,
                     stale_blocks: 0,
                     consecutive_stale_blocks: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6680,11 +7012,13 @@ mod tests {
                 bus: proto::BusHealth {
                     consecutive_errors: 7,
                     startup_failures: 0,
+                    ..Default::default()
                 },
                 imu: Some(proto::ImuHealth {
                     ready: true,
                     stale_blocks: 41,
                     consecutive_stale_blocks: 41,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6694,6 +7028,43 @@ mod tests {
         assert!(out.contains("7 consecutive read failures"), "{out}");
         assert!(out.contains("orientation frozen"), "{out}");
         assert!(out.contains("41 stale reads running"), "{out}");
+    }
+
+    /// A silent IMU board is named on its own row, and the bus row does not go looking for a robot
+    /// whose servos have all answered.
+    #[test]
+    fn health_renders_a_silent_imu_board() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                healthy: false,
+                degraded: true,
+                reason: Some(
+                    "the IMU board (id 200) is not answering on the motor bus after 4 attempts; \
+                     is it plugged in?"
+                        .into(),
+                ),
+                bus: proto::BusHealth {
+                    startup_failures: 4,
+                    ..Default::default()
+                },
+                imu: Some(proto::ImuHealth {
+                    missing: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            None,
+        ));
+
+        assert!(
+            out.contains("bus       servos ok, waiting for the IMU board, 4 attempts"),
+            "{out}"
+        );
+        assert!(
+            out.contains("imu       not answering on the motor bus"),
+            "{out}"
+        );
+        assert!(!out.contains("waiting for a robot"), "{out}");
     }
 
     /// A handful of stale reads over a long run is a healthy board, and must not wear an alarm.
@@ -6720,6 +7091,7 @@ mod tests {
                     stale_blocks: 9,
                     // The board refreshed on the most recent read, so nothing is frozen.
                     consecutive_stale_blocks: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6750,6 +7122,7 @@ mod tests {
                     ready: true,
                     stale_blocks: 2,
                     consecutive_stale_blocks: 1,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6772,6 +7145,7 @@ mod tests {
                     ready: true,
                     stale_blocks: 3,
                     consecutive_stale_blocks: 0,
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -6793,6 +7167,7 @@ mod tests {
                 bus: proto::BusHealth {
                     consecutive_errors: 0,
                     startup_failures: 4,
+                    ..Default::default()
                 },
                 ..Default::default()
             }),
@@ -6800,6 +7175,47 @@ mod tests {
         ));
 
         assert!(out.contains("degraded: no robot on the motor bus"), "{out}");
+        assert!(
+            out.contains("waiting for a robot to answer, 4 attempts"),
+            "{out}"
+        );
+    }
+
+    /// **Some servos answering is a robot, not "no robot".** What a beta with its head servos
+    /// unplugged showed as "no robot on the motor bus" while robotd's log named the three.
+    #[test]
+    fn health_names_the_servos_that_are_missing() {
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                degraded: true,
+                bus: proto::BusHealth {
+                    startup_failures: 4,
+                    missing: vec![32, 33, 34],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            None,
+        ));
+        assert!(
+            out.contains("missing 32 head_yaw, 33 head_roll, 34 mouth, 4 attempts"),
+            "{out}"
+        );
+        assert!(!out.contains("waiting for a robot to answer"), "{out}");
+
+        // All fifteen silent is still servo power, in the words people already know.
+        let out = render_health(&health_report(
+            Some(proto::HealthResult {
+                degraded: true,
+                bus: proto::BusHealth {
+                    startup_failures: 4,
+                    missing: proto::JOINT_IDS.to_vec(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            None,
+        ));
         assert!(
             out.contains("waiting for a robot to answer, 4 attempts"),
             "{out}"

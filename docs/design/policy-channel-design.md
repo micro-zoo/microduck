@@ -570,8 +570,8 @@ globally when it was squatting in the walk slot.
 ### 10.2 What stays in the daemon
 
 `walk` and `stand` are the fallback pair, chosen by command magnitude, and there is nothing below
-them to hand back to. `sitstand` is latched and driven internally by the shutdown sit and the
-seated-boot rise, not only by a button — `scripted`, in the manifest's word. `ground_pick`
+them to hand back to. `sitstand` is latched and driven internally by the shutdown sit, not only
+by a button — `scripted`, in the manifest's word. `ground_pick`
 writes a phase rather than a constant. None of the four is a generic one-shot, and a set entry
 may not answer to `ground_pick` or `sit_toggle` — a second network behind either name would be
 fed an all-zero command it never trained on. The guard is on the encoding as well as the name: a
@@ -587,19 +587,19 @@ inheriting.
 
 ### 10.3 The button
 
-`[pad]` says which of the five one-shot buttons runs which skill:
+`[pad]` says which of the six one-shot buttons runs which skill:
 
 ```toml
 [pad]
 x = "polite-bow"
 ```
 
-`robotctl pad bindings` shows them, `pad bind` changes one, `pad reset` puts them back. The
-defaults are the mapping the prototype had, so a robot with no `[pad]` behaves as it always has,
-and `padd` re-reads the file within a second — nothing restarts.
+`robotctl pad bindings` shows them, `pad bind` changes one, `pad reset` puts them back. By
+default A sits, B picks up, the bumpers kick and X and Y are free, and `padd` re-reads the file
+within a second — nothing restarts.
 
-Only those five. `Start`, the two stick-mode toggles, held `Select` and held `D-pad up` are not
-`robot.do` calls, and the button that powers a robot off is the one binding worth not being able
+Only those six — the face buttons and the bumpers. `Start`, the D-pad's stick modes and held
+`Select` are not `robot.do` calls, and the button that powers a robot off is the one binding worth not being able
 to lose to a config edit.
 
 **Over the wire, `pad.bindings` and `pad.bind` are `robotd`'s**, not `configd`'s, which owns the

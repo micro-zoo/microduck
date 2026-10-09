@@ -466,6 +466,36 @@ divergence: the prototype tracks the standing action scale by saving and restori
 `action_scale` across transitions, which can leave a stale value behind after a sit→stand cycle
 until the next walk; here scale and gain are recomputed from the active state every tick.
 
+**One move at a time, and none from the seat.** A ground pick, a skill, a sit or a rise is
+refused while any other is in flight — including the glide down into the seat — and only
+standing up is accepted from a seated robot. The one request a running skill takes is one for
+itself when it chains, which is the button being held. This is a second divergence: the
+prototype let a pick preempt a kick's tail and a roulade roll out of a kick or the seat, each a
+network handed a pose it was not trained from.
+
+The seat survives a deliberate stop and nothing else. Disabling the policy ends the move in
+flight and, on a seated robot, holds the seat where it is rather than sending the standing home
+pose, which a sitting robot can only reach by going over backwards; `robot.init` on a seated
+robot holds it too. A relax or a servo reboot forgets the seat and every move with it, so the
+next bring-up starts from a standing robot's state, as after a boot.
+
+**The robot is looked at twice** (`robotd/src/posture.rs`). When torque comes on, a robot that
+reads seated ramps to the seat — the sitstand policy's own trained SIT keyframe — instead of
+straight-legged to the standing home pose, which pulls it out of the seat and over backwards.
+And once per enable, before the policy takes over, because the ramp is open-loop: a robot that
+started folded can end it standing, sat back on its seat or on its back. That second look is
+taken even over a seat the controller already believes in. A seated verdict then runs the same
+sequence as a rise while the robot drives — the sitstand network holds the seat for its settle
+time, then rises — with its previous action and low-pass seeded from the held seat rather than
+zeroed: rising on the first tick, cold, from a seat the network had not chosen, went visibly
+worse than the same rise mid-session. The verdict comes from the trunk's height above the feet — the
+feet sites through the kinematic model, turned into the world by the IMU — and the trunk's tilt.
+Seated, the sitstand network rises first; standing, lying down (tilt past 45°) or in between,
+the gait takes over as it always has. The check picks how the policy starts, never whether: a
+Start is the person deciding the robot should drive. The
+height is the signal because the joint angles are not: three recorded seats with little in common
+joint by joint all read 15–39 % of standing height.
+
 Policy files come from paths in the params file, defaulting into the release directory — so a
 normal update carries the policy trained against the binary, and a dev points a path at their
 own `.onnx` and iterates without cutting a release.
@@ -550,9 +580,8 @@ a robot lying on its side, and the wrong one for softening a landing: gravity pa
 `fall_gravity_z` held for 200 ms *is* the robot on the floor, and the window worth acting in
 has closed by then.
 
-So `limp_fall` (off by default: the default velstand gait loads no standing network to hand
-back to) runs a second, separate
-detector — `duck_control::fall` — on the rate rather than the position. Projected gravity
+So `limp_fall` (on by default; with the default velstand gait and no standing network, the
+hand-back is to velstand at zero command) runs a second, separate detector — `duck_control::fall` — on the rate rather than the position. Projected gravity
 rotates with the trunk, so `ġ = −ω × g` is exact and comes straight from the gyro in the same
 12-byte IMU block; extrapolating it over ~0.3 s says where gravity is heading. It fires when
 the robot is already tilted (≈26°), still tipping over rather than recovering, and predicted
@@ -1126,7 +1155,7 @@ projected gravity, and where the camera and the ToF sensor are. All three are ad
 
 Cost: three small structs per published tick, only while someone is subscribed; the FK is ~50 ns.
 
-### Head-IMU acquisition timing (API v38)
+### Head-IMU acquisition timing (API v42)
 
 `head_imu.frame` keeps its existing fields, units, sensor axes and Madgwick filter (beta 0.1).
 `t_ns` remains host read/fusion completion, including occasional temperature reads. Polling

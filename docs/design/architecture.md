@@ -85,7 +85,7 @@ counter ([`updater-design.md`](updater-design.md)).
 | `btd` | nothing — BLE transport for a subset of the API | a BLE GATT service | `robotd`, `configd`, `updaterd` — not `padd` or `tofd`, whose streams a radio this narrow cannot carry |
 | `padd` | nothing — gamepad transport; serves a raw input tap | `/run/padd/pad.sock` (`pad.input` only) | `/run/robotd.sock` |
 | `mediad` | the camera and audio pipeline; nothing of the robot — WebRTC transport and the remote front door (§5.2) | TCP: the console and PNG `GET /frame` on `:8080`, signalling on `:8443`; and one unix socket of its own, `/run/mediad/media.sock`, serving `media.frame` to a local recorder or perception process — and to `robotctl monitor`'s camera block, which asks for one twice a second while it is open and not at all while it is shut. A raw frame is ~1.8 MiB, so it is deliberately not carried on the WebRTC control channel | `robotd`, `configd`, `updaterd` |
-| `tofd` | the head's ToF sensor: an 8×8 depth matrix it publishes and nobody else reads | `/run/tofd/tof.sock` (`tof.stream`) | the HAT's I²C bus |
+| `tofd` | the head's ToF sensor: an 8×8 depth matrix it publishes and nobody else reads | `/run/tofd/tof.sock` (`tof.stream`) | the HAT's I²C bus, or SPI on the beta board (`tof::link`) |
 | `robotctl` | nothing — the CLI, and the tool that must work on a broken robot | — | every socket above |
 
 Where the state lives, and what survives an update:
@@ -341,6 +341,32 @@ what a client needs when things are broken — which is why it cannot live in
 **Config is state, not actions.** "Connect to this wifi", "restart", "apply
 update", "select model" are actions, dispatched as RPC to the owning service.
 
+### 3.2 The face LEDs
+
+The beta board's face carries twelve LEDs on a GPIO expander, which its device tree names
+`face:<place>:<colour>` under `/sys/class/leds`. An LED shows a piece of state, so it follows
+invariant 4: **each LED has one writer, the daemon that owns what it shows.** A Zero 3W has none of
+them, and every owner does nothing on a board without its LED.
+
+| LED | sysfs | Owner | Shows |
+|---|---|---|---|
+| Flashlight | `rgb:{red,green,blue}` | `robotd` | What `robot.flashlight` last asked for, in one of seven colours. The pad's Home button toggles it. |
+| Camera | `cam:red` | `mediad` | On while the picture leaves the robot: a WebRTC peer being encoded for, or a `media.stream` running (§7). Not a `media.frame` snapshot, which stays on the robot. |
+| Status | `gr2:{green,red}` | `robotd` | `robot.health`: green healthy; blinking green before the first tick; blinking red degraded (no servo power, a servo unplugged — the board's fault, not the release's); red unhealthy. |
+| Network | `gb:{green,blue}` | `configd` | Blue when reachable from outside the LAN (the relay is registered with a live heartbeat); otherwise green on wifi, blinking green while joining, off without. |
+| Battery | `gr1:{green,red}`, `green2`, `green1` (bottom to top) | `robotd` | A three-step gauge filling up from `gr1`: three green above 70%, two above 40%, one above 15%; then `gr1` red, blinking at 5% and below. 3% hysteresis on each step. Off until the first reading. |
+
+The network LED reads one fact it does not own: whether `mediad`'s relay is registered, from the
+file `mediad` publishes for readers (`/run/mediad/remote.json`). It still has one writer, because
+green and blue from two daemons would show both at once.
+
+Every owner writes only on a change, which leaves `robotctl led` usable as a bench override until
+the owner next has something new to say; switches its LEDs off when it stops; and has an
+`ExecStopPost` in its unit that does the same when it crashes. The units hand
+`/sys/devices/platform/face-leds` back to the daemon, because `ProtectKernelTunables` makes `/sys`
+read-only. [`duck_ipc_proto::led`](../../duck-ipc-proto/src/led.rs) is the shared writer and the
+names.
+
 ## 4. The robot API
 
 ### 4.1 One definition, many transports
@@ -478,7 +504,8 @@ It is a camera and microphone in someone's home.
 
 - **Explicit consent** to start a remote session (per-session, or a clear
   persistent opt-in the user can revoke).
-- **Visible on-robot indicator** whenever streaming is active.
+- **Visible on-robot indicator** whenever streaming is active. On the beta board, the camera
+  LED (§3.2).
 - DTLS-SRTP keeps media encrypted end-to-end **even through a TURN relay** —
   worth stating plainly to clients.
 - BLE provisioning writes carry wifi credentials: that characteristic must be

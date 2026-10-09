@@ -221,13 +221,29 @@ pub enum Source {
 /// these are for. From there [`crate::exposure`] meters the picture and takes over, because
 /// Rockchip's 3A engine converges once at stream start and then stops — and does not manage even
 /// that if it missed the stream-start event. With `--no-auto-exposure` these are all there is and
-/// the picture stays at one brightness. Values are in the sensor's own units: exposure in lines (~19 µs each)
-/// and analogue gain where 256 is 1x, up to 2816 for 11x.
+/// the picture stays at one brightness. Values are in the sensor's own units — exposure in lines,
+/// and analogue gain where [`Exposure::unity_gain`](crate::sensor::Exposure::unity_gain) is 1x — so
+/// `None` takes the found sensor's own starting point, which is the only default that means the
+/// same picture on every sensor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Camera {
     pub device: String,
-    pub exposure: u32,
-    pub analogue_gain: u32,
+    pub exposure: Option<u32>,
+    pub analogue_gain: Option<u32>,
+    /// The sensor this camera must be — the board's, unless `[media] sensor` forces one. A media
+    /// graph holding another is refused; [`crate::sensor`] says why.
+    pub expected: crate::sensor::Expected,
+}
+
+impl Camera {
+    /// The exposure and analogue gain the capture starts at, on this sensor.
+    pub fn starting(&self, sensor: &crate::sensor::Sensor) -> (u32, u32) {
+        (
+            self.exposure.unwrap_or(sensor.exposure.start_lines),
+            self.analogue_gain
+                .unwrap_or_else(|| sensor.exposure.start_gain()),
+        )
+    }
 }
 
 /// One raw frame off the tee, as the last one seen.
@@ -377,7 +393,17 @@ pub struct Channel {
     pub outbound: mpsc::Sender<String>,
 }
 
-/// Build and start the pipeline. Returns it, plus a stream of control channels — one per peer.
+/// What [`start`] hands back, in the order it describes them.
+pub type Started = (
+    gst::Pipeline,
+    mpsc::Receiver<Channel>,
+    Frames,
+    Option<StreamBranch>,
+    Consumers,
+);
+
+/// Build and start the pipeline. Returns it, plus a stream of control channels — one per peer —
+/// and the live count of peers being encoded for.
 ///
 /// The pipeline is returned rather than kept here so the caller owns its lifetime: dropping it
 /// stops the session, which is what a shutdown should do.
@@ -386,12 +412,7 @@ pub fn start(
     producer: &crate::producer::Producer,
     settings: &Settings,
     relays: Arc<crate::turn::Relays>,
-) -> Result<(
-    gst::Pipeline,
-    mpsc::Receiver<Channel>,
-    Frames,
-    Option<StreamBranch>,
-)> {
+) -> Result<Started> {
     let &Settings {
         port,
         bitrate,
@@ -742,7 +763,7 @@ pub fn start(
         fps,
         "signalling server listening"
     );
-    Ok((pipeline, channels_rx, frames, stream_branch))
+    Ok((pipeline, channels_rx, frames, stream_branch, consumers))
 }
 
 /// Build the valved H.264 branch: `queue ! valve ! videorate ! videoscale ! videoconvert ! enc !
@@ -1308,13 +1329,14 @@ fn make(name: &str) -> Result<gst::Element> {
 /// layout, and the frame loss has a cause with a small fix — see [`raise_capture_buffers`].
 #[cfg(target_os = "linux")]
 fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
-    pin_sensor_mode(fps)?;
+    let sensor = pin_sensor_mode(camera.expected, fps)?;
+    let (exposure, analogue_gain) = camera.starting(sensor);
 
     // Exposure and gain go through `extra-controls` rather than a `v4l2-ctl` call, so they are
     // applied by whoever opens the device — including after a re-open we did not initiate.
     let controls = gst::Structure::builder("c")
-        .field("exposure", camera.exposure as i32)
-        .field("analogue_gain", camera.analogue_gain as i32)
+        .field("exposure", exposure as i32)
+        .field("analogue_gain", analogue_gain as i32)
         .build();
 
     let src = gst::ElementFactory::make("v4l2src")
@@ -1332,8 +1354,9 @@ fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
 
     tracing::info!(
         device = %camera.device,
-        exposure = camera.exposure,
-        analogue_gain = camera.analogue_gain,
+        sensor = sensor.name(),
+        exposure,
+        analogue_gain,
         "head camera"
     );
     Ok(src)
@@ -1563,72 +1586,115 @@ fn raise_capture_buffers(src: &gst::Element) -> Result<()> {
     Ok(())
 }
 
-/// Which sensor mode this process managed to put the camera in, once it has tried.
+/// The camera sensor this process found, and whether it took the pinned mode.
+#[derive(Debug, Clone, Copy)]
+pub struct Found {
+    pub sensor: &'static crate::sensor::Sensor,
+    /// Whether `media-ctl` put it in [`Sensor::mode`](crate::sensor::Sensor::mode). Without that,
+    /// how much of the sensor a frame covers is unknown, and so is the geometry.
+    pub pinned: bool,
+}
+
+/// Which sensor this process found and what mode it managed to put it in, once it has tried.
 ///
 /// A `OnceLock` rather than a value threaded up through the pipeline builder, because that is what
 /// it is: one fact about this process's camera, established while the pipeline is built and read
-/// afterwards by whatever answers `media.video`. `None` — never set, or set after a failed switch
-/// — means the geometry is unknown, and `crate::camera` publishes no intrinsics for it.
-static SENSOR_MODE: std::sync::OnceLock<Option<crate::camera::SensorMode>> =
-    std::sync::OnceLock::new();
+/// afterwards by the auto-exposure loop and by whatever answers `media.video`. `None` — never set —
+/// means there is no camera.
+static SENSOR: std::sync::OnceLock<Found> = std::sync::OnceLock::new();
 
-/// The sensor mode in force, or `None` when there is no camera or the switch did not take.
-pub fn sensor_mode() -> Option<crate::camera::SensorMode> {
-    *SENSOR_MODE.get().unwrap_or(&None)
+/// The sensor found, or `None` when there is no camera.
+pub fn sensor() -> Option<Found> {
+    SENSOR.get().copied()
 }
 
-/// Switch the IMX219 out of its boot mode, which caps capture at 21 fps.
+/// The sensor, when it is confirmed in its pinned mode — the only case a geometry is known for.
+pub fn pinned_sensor() -> Option<&'static crate::sensor::Sensor> {
+    sensor()
+        .filter(|found| found.pinned)
+        .map(|found| found.sensor)
+}
+
+/// Switch the sensor into the mode this daemon streams from.
 ///
-/// The sensor boots in 3280x2464 and the rkisp scaler will happily give us 1280x720 from it — at
+/// The IMX219 boots in 3280x2464 and the rkisp scaler will happily give us 1280x720 from it — at
 /// the full-res frame rate. 1920x1080 is the mode that runs at 30, and the ISP scales down from
-/// there, so nothing else in the pipeline changes with it.
+/// there, so nothing else in the pipeline changes with it. The GC2093 has only that mode, so the
+/// switch is a no-op there and harmless.
 ///
 /// This shells out to `media-ctl` once at startup, because the switch is a subdev ioctl on an
 /// entity whose name embeds its I2C bus and address (`m00_b_imx219 2-0010`) and therefore has to
 /// be discovered from the topology rather than named. Doing it here rather than in the unit means
 /// a run with `[media] camera` off needs no camera at all.
 #[cfg(target_os = "linux")]
-fn pin_sensor_mode(fps: u32) -> Result<()> {
-    let (media, entity) = find_sensor()?;
+fn pin_sensor_mode(
+    expected: crate::sensor::Expected,
+    fps: u32,
+) -> Result<&'static crate::sensor::Sensor> {
+    let (media, entity, sensor) = find_sensor(expected)?;
+    let mode = sensor.mode;
 
-    let format = format!("\"{entity}\":0[fmt:SRGGB10_1X10/1920x1080]");
+    if expected.why == crate::sensor::Why::Forced {
+        // Said at warn because it is the exception: whatever the board is, this sensor is what
+        // somebody asked for, and a robot running on a forced camera should say so in every log.
+        tracing::warn!(
+            sensor = sensor.name(),
+            "`[media] sensor` forces this camera rather than the board's"
+        );
+    }
+
+    let format = format!(
+        "\"{entity}\":0[fmt:{}/{}x{}]",
+        sensor.bus_format, mode.width, mode.height
+    );
     let output = std::process::Command::new("media-ctl")
         .args(["-d", &media, "--set-v4l2", &format])
         .output()
         .context("could not run media-ctl; it comes from v4l-utils")?;
 
-    if !output.status.success() {
+    let pinned = output.status.success();
+    if !pinned {
         // Not fatal: capture still works, just slower. Said loudly because a third of the frames
         // going missing looks like a network problem from the far end.
         tracing::warn!(
-            %media, %entity,
+            %media, %entity, sensor = sensor.name(),
             why = %String::from_utf8_lossy(&output.stderr).trim(),
-            "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
-             mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
-             because the exact framing is then the boot mode's (same ~62 deg field, different \
-             4:3->16:9 crop) rather than the pinned mode the calibration is for"
+            "media-ctl would not set the {}x{} sensor mode — capture stays in the boot mode, \
+             which on the IMX219 caps it at 21 fps, and `media.video` publishes no camera \
+             intrinsics because the exact framing is then the boot mode's rather than the pinned \
+             mode the calibration is for",
+            mode.width, mode.height
         );
-        let _ = SENSOR_MODE.set(None);
     } else {
-        let _ = SENSOR_MODE.set(Some(crate::camera::SensorMode::PINNED));
-        tracing::info!(%media, %entity, target_fps = fps, "sensor mode 1920x1080");
+        tracing::info!(
+            %media, %entity, sensor = sensor.name(), target_fps = fps,
+            "sensor mode {}x{}", mode.width, mode.height
+        );
     }
-    Ok(())
+    let _ = SENSOR.set(Found { sensor, pinned });
+    Ok(sensor)
 }
 
-/// The media device and entity name of the IMX219, from the topology.
+/// The media device, entity name and profile of the camera sensor, from the topology.
 ///
 /// Matched on a substring rather than a fixed name: the entity is `m00_b_imx219 2-0010`, which
-/// embeds the I2C bus and address, and those move with the overlay.
+/// embeds the I2C bus and address, and those move with the overlay. Which substrings count is
+/// [`crate::sensor::SENSORS`], and which one is accepted is `expected`: every graph is read
+/// before choosing, so a board with two cameras picks its own rather than the first it meets.
 ///
 /// **Every way this fails says which one it was.** An earlier version returned `Option` and
 /// reported "no imx219 entity" for all of them, which sent the first real run chasing the
-/// overlay when the actual cause was `media-ctl` being denied `/dev/media0`. The three cases want
-/// three different fixes and look identical from the outside.
+/// overlay when the actual cause was `media-ctl` being denied `/dev/media0`. The cases want
+/// different fixes and look identical from the outside.
 #[cfg(target_os = "linux")]
-fn find_sensor() -> Result<(String, String)> {
+fn find_sensor(
+    expected: crate::sensor::Expected,
+) -> Result<(String, String, &'static crate::sensor::Sensor)> {
     let mut nodes = 0;
     let mut failures = Vec::new();
+    // Every sensor found, with the media device it is on.
+    let mut ours: Vec<(String, String, &'static crate::sensor::Sensor)> = Vec::new();
+    let mut others = Vec::new();
 
     for index in 0..8 {
         let media = format!("/dev/media{index}");
@@ -1653,20 +1719,39 @@ fn find_sensor() -> Result<(String, String)> {
             continue;
         }
 
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            // "- entity 76: m00_b_imx219 2-0010 (1 pad, 1 link, 0 routes)"
-            let line = line.trim_start();
-            if !line.starts_with("- entity") || !line.contains("imx219") {
-                continue;
+        let topology = crate::sensor::Topology::read(&String::from_utf8_lossy(&output.stdout));
+        ours.extend(
+            topology
+                .ours
+                .into_iter()
+                .map(|(entity, sensor)| (media.clone(), entity, sensor)),
+        );
+        others.extend(topology.others);
+    }
+
+    // A sensor in the graph, right or wrong, is the answer: the refusal for the wrong one names
+    // what is there and what was expected, which is more use than a complaint about the nodes.
+    if !ours.is_empty() || !others.is_empty() {
+        let found: Vec<_> = ours
+            .iter()
+            .map(|(_, entity, sensor)| (entity.clone(), *sensor))
+            .collect();
+        return match expected.pick(&found, &others) {
+            Ok((entity, sensor)) => {
+                let media = ours
+                    .into_iter()
+                    .find(|(_, e, _)| *e == entity)
+                    .map(|(media, _, _)| media)
+                    .expect("picked from this list");
+                Ok((media, entity, sensor))
             }
-            let Some((_, rest)) = line.split_once(": ") else {
-                continue;
-            };
-            let name = rest.split(" (").next().unwrap_or(rest).trim();
-            if !name.is_empty() {
-                return Ok((media, name.to_string()));
-            }
-        }
+            Err(why) if found.is_empty() => bail!(
+                "{why}. This daemon has a profile for {}; another sensor needs an entry in \
+                 mediad::sensor, with its control units and caps.",
+                crate::sensor::known()
+            ),
+            Err(why) => bail!("{why}"),
+        };
     }
 
     if nodes == 0 {
@@ -1687,8 +1772,10 @@ fn find_sensor() -> Result<(String, String)> {
         );
     }
     bail!(
-        "read {nodes} media device(s) and none has an imx219 entity. The overlay loaded something, \
-         so DUCK_CAMERA_OVERLAY may name the wrong module for this camera."
+        "read {nodes} media device(s) and none has a sensor in it — this daemon drives {}. The \
+         overlay loaded something, so DUCK_CAMERA_OVERLAY may name the wrong module for this \
+         camera, or the sensor's driver did not probe (`dmesg` says which).",
+        crate::sensor::known()
     )
 }
 
@@ -1801,11 +1888,12 @@ fn wire_encoder_setup(sink: &gst::Element) -> Result<()> {
     Ok(())
 }
 
-/// Live count of what the consumers see, so [`meter_capture_rate`] can report it.
+/// Live count of what the consumers see, so [`meter_capture_rate`] can report it and the camera
+/// LED can follow it.
 ///
 /// An `AtomicU32` rather than a lock: it is written from `consumer-added`/`consumer-removed` on
 /// GStreamer threads and read from the capture probe on another, and neither may block the other.
-type Consumers = Arc<std::sync::atomic::AtomicU32>;
+pub type Consumers = Arc<std::sync::atomic::AtomicU32>;
 
 /// Count frames where they enter the pipeline, not where they leave it, and publish what we see.
 ///
@@ -1931,13 +2019,21 @@ fn wire_consumers(
     if glib::subclass::signal::SignalId::lookup("consumer-removed", sink.type_()).is_some() {
         let leaving = consumers.clone();
         sink.connect("consumer-removed", false, move |_| {
-            // `try_update` rather than `fetch_sub`, so a spurious removal cannot wrap the count
-            // around to four billion viewers.
-            let _ = leaving.try_update(
+            // A saturating decrement rather than `fetch_sub`, so a spurious removal cannot wrap
+            // the count around to four billion viewers. Spelled as a compare-exchange loop rather
+            // than `try_update`/`fetch_update`: `try_update` needs Rust 1.99, which the Yocto
+            // image's toolchain (1.94) does not have, and 1.99 deprecates `fetch_update`, which
+            // CI's `-D warnings` turns into a failure. The loop is the same thing on every
+            // version.
+            let mut current = leaving.load(std::sync::atomic::Ordering::Relaxed);
+            while let Err(actual) = leaving.compare_exchange_weak(
+                current,
+                current.saturating_sub(1),
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
-                |current| Some(current.saturating_sub(1)),
-            );
+            ) {
+                current = actual;
+            }
             None
         });
     } else {
@@ -2484,7 +2580,7 @@ mod tests {
             fps: 15,
             rotation: Rotation::None,
         };
-        let (pipeline, _channels, frames, _stream) = start(
+        let (pipeline, _channels, frames, _stream, _peers) = start(
             Source::Test,
             &producer,
             &settings,

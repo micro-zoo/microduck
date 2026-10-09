@@ -49,6 +49,23 @@ robot prefers one in pairing mode; both stay paired afterwards and `padd` drives
 The cost is that re-running with nothing new in pairing mode waits out the whole search window
 before reporting the pad you already have — `--timeout 5` if you are only repairing trust.
 
+### With an NFC tag
+
+On a robot with an NFC reader plugged in (a CLRC663 board on USB, `/dev/ttyACM0`), a tag that
+carries the pad's address does the same thing with nothing typed: put the pad in pairing mode, touch
+the tag to the reader. The robot quacks when it has read the tag, and greets — a different sound,
+often a double "wak-wak" — once the pad is paired; a refusal gets no second sound. `nfcd.service` is
+always running and picks a reader up within thirty seconds of it being plugged in.
+
+- **A pad already connected wins.** If one is driving, a touch does nothing, so a tag brushed against
+  the robot never hands the bond to someone else's pad.
+- **One attempt per touch.** If it did not pair, lift the tag and touch again.
+- The tag holds a text or URI record with the address in it — `98:B6:E9:28:06:09`, with `-` or no
+  separator also fine. From a laptop with the reader plugged in, winnie's tool writes one:
+  `ntag write --text 98:B6:E9:28:06:09`.
+
+What it did is in `journalctl -u nfcd -b`.
+
 ## Check it
 
 ```bash
@@ -73,10 +90,10 @@ monitor is not open: `padd` reads the IMU node only while somebody is subscribed
 while it is steering the head from it, below.
 
 The same attitude can drive the robot's head. `sudo robotctl configure`, section *Controller-IMU
-head control*, `enabled`: Y then hands the head to the pad's tilt while the sticks keep driving,
-Y again holds the head, and a third Y re-centres on the pad's current attitude and follows again —
-the [cheat sheet](cheatsheet.md#gamepad-configd) has the full cycle. The picture in the monitor and
-the head use one filter, so where the drawn pad points is where the head goes.
+head control*, `enabled`: head + move mode (D-pad right) then hands the head to the pad's tilt
+while the sticks keep driving, and pressing D-pad right again re-centres on the pad's current
+attitude — the [cheat sheet](cheatsheet.md#gamepad-configd) has the whole mapping. The picture
+in the monitor and the head use one filter, so where the drawn pad points is where the head goes.
 
 `paired but NOT trusted` is the state worth knowing. It works now and does not reconnect after a
 reboot, because approving a reconnection needs an agent and at boot there is none. Re-run `pad pair`

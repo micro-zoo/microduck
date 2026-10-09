@@ -15,6 +15,14 @@
 # unprovisioned board comes up on these same numbers rather than refusing to start, which
 # is far easier to diagnose remotely than a daemon that will not run.
 
+[board]
+# Which electronic board this robot is built on: "zero3" (the Radxa Zero 3W with the prototype's
+# HAT) or "beta" (the custom board). Set when the robot is provisioned — `provision-board.sh
+# --board` — and not something to change on a robot that works. The updater reads it for the
+# hardware revision a release is checked against, so declaring the wrong board can cost a robot
+# its updates; `robotctl health` says when this and the device tree disagree.
+# version = "zero3"
+
 [bus]
 # Serial port the 15 servos and the imu_to_dxl board share. /dev/ttyS2 is the Radxa
 # Zero 3W's wiring; a board wired differently can also be overridden per-invocation with
@@ -233,10 +241,9 @@ mode = "walk"
 #
 # The only thing the daemon does about a fall. With it off, a fall changes nothing: the
 # policy keeps driving and the humans stay in charge, which is the prototype's behaviour.
-# OFF by default: the hand-back at the end is to the standing network, and the default
-# configuration (velstand as `walk`, `stand` unset) loads none. Set it to true on a robot
-# that runs a standing policy.
-# limp_fall = false
+# ON by default. With the default configuration (velstand as `walk`, `stand` unset) there is
+# no standing network, and the hand-back is to velstand at zero command, which stands still.
+# limp_fall = true
 
 # When a fall counts as started. This is the whole feature, and both ways of getting it
 # wrong are real: too early and the robot limps out of leans it would have walked off —
@@ -414,22 +421,20 @@ mode = "walk"
 # threshold = 0.35
 
 [head_imu]
-# The BMI088 on the head module, read by tofd and served as `head_imu.stream` — gyro,
-# acceleration and a Madgwick orientation, for the mapping work.
+# The IMU in the robot's head, served as `head_imu.stream`: gyro, acceleration and an
+# orientation. Unset, the board decides:
 #
-# **Off by default, and this is the whole section.** Reading it at 100 Hz costs ~3.5-4.5% of a
-# core on this SoC, and a bench that takes the loop apart says none of that is fixable: the
-# wakeups are 0.7 points of it, the fusion 0.3, and the rest is the two I²C transactions a
-# sample takes — which is what a gyro and an accelerometer sample *is*. Nothing subscribes to
-# the stream yet, so every duck was paying it from boot for nobody.
+# - zero3: the BMI088 on the HAT, read by tofd with a Madgwick fusion on the CPU. **Off.**
+#   Reading it at 100 Hz costs ~3.5-4.5% of a core, almost all of it the two I²C transactions a
+#   sample takes (docs/project/tof-on-demand.md). `tofd --imu-hz 50` halves that.
+# - beta: the face board's LSM6DSV16X, read by robotd. **On.** The chip fuses the orientation
+#   itself and batches gyro, accel and quaternion in its FIFO, so 60 samples a second cost
+#   15 burst reads and no fusion.
 #
-# Turn it on when something reads it. `tofd --imu-hz 50` is the other lever: the cost is linear
-# in the rate. Depth is unaffected either way — tofd ranges the ToF regardless, so
-# `robotctl monitor`'s grid does not depend on this.
-#
-# A subscriber to `head_imu.stream` while this is off gets the reason, naming this key, rather
-# than the silence a board with no sensor fitted gives.
-# enabled = false
+# Ask the daemon that does not read it on this board and the answer names the one that does.
+# While it is off, the answer names this key rather than giving the silence of a board with no
+# sensor fitted. Depth is unaffected either way.
+# enabled = true
 
 [chorale]
 # Several ducks singing one piece in four parts, found over Bluetooth with no shared clock: the
@@ -501,6 +506,14 @@ mode = "walk"
 #
 # gcc is webrtcsink's own default, so this line changes nothing; it is here to be found.
 # congestion_control = "gcc"
+
+# Which sensor the head camera must be: board, imx219 or gc2093.
+#
+# `board` follows the declared board — imx219 on a zero3, gc2093 on a beta — and mediad refuses a
+# camera that is not that one, because a camera and its board go together: a mismatch is a robot
+# assembled with the wrong module, or one declaring the wrong board. Naming a sensor forces it,
+# for a board fitted with another camera on purpose. Not something a normal robot sets.
+# sensor = "board"
 
 # ── Controller-IMU head control ─────────────────────────────────────────────────────────────
 #

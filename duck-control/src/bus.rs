@@ -143,6 +143,13 @@ impl DynamixelIo {
         })
     }
 
+    /// The body IMU's sensor→trunk mount, which is the robot's ([`SflpDecoder::DEFAULT_MOUNT`]
+    /// for a `zero3`, [`SflpDecoder::BETA_MOUNT`] for a `beta`). Starts the decoder afresh, so
+    /// call it right after [`Self::open`], before the first read.
+    pub fn set_imu_mount(&mut self, mount: [f64; 4]) {
+        self.imu = SflpDecoder::new(mount);
+    }
+
     /// Assert — and correct — the EEPROM registers the control loop depends on.
     ///
     /// Returns how many needed fixing. A servo that has been factory-reset or swapped in
@@ -242,6 +249,17 @@ impl DynamixelIo {
             }
         }
         Ok(missing)
+    }
+
+    /// Does the IMU board answer a ping?
+    ///
+    /// Asked apart from [`Self::missing_servos`] because the census covers servos only, and a
+    /// silent IMU board otherwise surfaces as the first [`RobotIo::read`] failing — which, from
+    /// outside, looks exactly like no robot at all.
+    pub fn imu_answers(&mut self) -> Result<bool> {
+        self.controller
+            .ping(IMU_DXL_ID)
+            .map_err(|e| IoError::Bus(format!("ping imu {IMU_DXL_ID}: {e}")))
     }
 
     /// Flash a factory-fresh servo so it takes the place of the one that is missing.

@@ -155,6 +155,8 @@ jobs:
           # The head ToF daemon. Its unit is packaged below; a board with no sensor
           # fitted runs it anyway and says so, which is cheaper than a special case.
           cp target/aarch64-unknown-linux-gnu/release/tofd staged/
+          # The NFC reader daemon, the same way: a board with no reader runs it, and it says so.
+          cp target/aarch64-unknown-linux-gnu/release/nfcd staged/
 
           cargo run -p xtask -- package \
             --version "${{ inputs.version }}" \
@@ -189,6 +191,8 @@ jobs:
             --include "mediad/systemd/sysusers.d/mediad.conf=systemd/sysusers.d/mediad.conf" \
             --include "tof/systemd/tofd.service=systemd/tofd.service" \
             --include "tof/systemd/sysusers.d/tofd.conf=systemd/sysusers.d/tofd.conf" \
+            --include "nfc/systemd/nfcd.service=systemd/nfcd.service" \
+            --include "nfc/systemd/sysusers.d/nfcd.conf=systemd/sysusers.d/nfcd.conf" \
             --include "deploy/journald.conf.d/10-robot.conf=deploy/journald.conf.d/10-robot.conf" \
             --include "docs/design/architecture.md=docs/architecture.md" \
             --include "docs/design/updater-design.md=docs/updater-design.md" \

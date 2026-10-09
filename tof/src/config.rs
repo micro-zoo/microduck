@@ -47,11 +47,12 @@ mod tests {
     /// makes "no head IMU samples" the normal state rather than a fault to chase.
     #[test]
     fn the_head_imu_is_off_by_default_and_on_an_unprovisioned_board() {
-        assert!(!Params::default().head_imu.enabled);
+        let zero3 = robotd_params::board::Board::Zero3;
+        assert!(!Params::default().head_imu.enabled_on(zero3));
 
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("robotd.toml");
-        assert!(!load(&missing, false).head_imu.enabled);
+        assert!(!load(&missing, false).head_imu.enabled_on(zero3));
     }
 
     /// And on it when somebody has said so. The point of reading `robotd`'s file at all: this is
@@ -61,6 +62,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("robotd.toml");
         std::fs::write(&path, "[head_imu]\nenabled = true\n").expect("write");
-        assert!(load(&path, true).head_imu.enabled);
+        assert!(
+            load(&path, true)
+                .head_imu
+                .enabled_on(robotd_params::board::Board::Zero3)
+        );
     }
 }

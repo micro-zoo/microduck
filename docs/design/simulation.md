@@ -3,9 +3,7 @@
 **Status:** built and in use. `robotd --sim`, `tofd --sim` and `mediad --sim-camera` are here, with
 `microduck_rl`'s `duck-body` serving the other half; the containers (§8), the ether (§5) and the
 per-duck cameras all run from `scripts/duck-sim`. Measured: the daemon holds `50.0 of 50.0 Hz · 0
-missed` against a MuJoCo body, detects a seated boot from the simulator's own joint angles, and
-`robotctl robot init` runs the sitstand policy until the duck is upright and stays there; four ducks
-in containers sing a full chorale over the ether. How to use it is
+missed` against a MuJoCo body, and four ducks in containers sing a full chorale over the ether. How to use it is
 [`docs/robot/simulation.md`](../robot/simulation.md); this page is the design.
 
 The goal is a duck you develop against exactly as you develop against a robot: the same binaries,

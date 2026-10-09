@@ -67,6 +67,7 @@ ENV_TOKEN="${DUCK_TOKEN:-}"
 ENV_DEV_KEY="${DUCK_DEV_KEY:-}"
 ENV_FORCE="${DUCK_FORCE_REINSTALL:-}"
 ENV_WEIRD_BLE="${DUCK_WEIRD_BLE:-}"
+ENV_BOARD="${DUCK_BOARD:-}"
 ENV_GSTREAMER="${DUCK_GSTREAMER:-}"
 ENV_RKAIQ="${DUCK_RKAIQ:-}"
 
@@ -113,6 +114,10 @@ FORCE_REINSTALL="$ENV_FORCE"
 # `robotctl pad pair` has to pause `btd` on a board that has it. See `configure_bluetooth` in
 # `setup-board.sh` for the split this exists for.
 WEIRD_BLE="$ENV_WEIRD_BLE"
+
+# Which electronic board this is. Passed to `install.sh`, which writes it to robotd.toml's
+# `[board] version`; empty leaves that to the file, which is a zero3.
+BOARD="$ENV_BOARD"
 
 # Install the GStreamer stack for `mediad`? Passed to `setup-gstreamer.sh`.
 #
@@ -272,6 +277,7 @@ save_state() {
         kv DUCK_DEV_KEY "$1"
         kv DUCK_FORCE_REINSTALL "$FORCE_REINSTALL"
         kv DUCK_WEIRD_BLE "$WEIRD_BLE"
+        kv DUCK_BOARD "$BOARD"
         kv DUCK_GSTREAMER "$GSTREAMER"
         kv DUCK_ASKED_REF "$ASKED_REF"
         # `PROVISION_*` for the two that are not environment knobs, so sourcing this file cannot
@@ -296,6 +302,7 @@ load_state() {
     DEV_KEY="${ENV_DEV_KEY:-${DUCK_DEV_KEY:-}}"
     FORCE_REINSTALL="${ENV_FORCE:-${DUCK_FORCE_REINSTALL:-}}"
     WEIRD_BLE="${ENV_WEIRD_BLE:-${DUCK_WEIRD_BLE:-}}"
+    BOARD="${ENV_BOARD:-${DUCK_BOARD:-}}"
     GSTREAMER="${ENV_GSTREAMER:-${DUCK_GSTREAMER:-1}}"
     ASKED_REF="${ENV_REF:-${DUCK_ASKED_REF:-}}"
     # No `ENV_` mirror for the name, unlike its neighbours. Theirs exist because sourcing this file
@@ -610,7 +617,8 @@ phase_two() {
     DUCK_REF="$REF"
     DUCK_TOKEN="$TOKEN"
     DUCK_FORCE_REINSTALL="$FORCE_REINSTALL"
-    export DUCK_REPO DUCK_REF DUCK_TOKEN DUCK_FORCE_REINSTALL
+    DUCK_BOARD="$BOARD"
+    export DUCK_REPO DUCK_REF DUCK_TOKEN DUCK_FORCE_REINSTALL DUCK_BOARD
     if [ -n "$DEV_KEY" ]; then
         DUCK_DEV_KEY="$DEV_KEY"
         export DUCK_DEV_KEY

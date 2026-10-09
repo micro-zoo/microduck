@@ -100,6 +100,12 @@ const fn feature(key: &'static str, kind: Kind, doc: &'static str) -> Entry {
 
 /// Every key, grouped by section, sections in the shipped file's order.
 pub const REGISTRY: &[Entry] = &[
+    // ── [board] ──────────────────────────────────────────────────────────────
+    entry(
+        "board.version",
+        Kind::Choice(crate::board::BOARD_LABELS),
+        "Which electronic board this robot is built on — set when it is provisioned",
+    ),
     // ── [bus] ────────────────────────────────────────────────────────────────
     entry("bus.port", Kind::Text, "Dynamixel serial port device"),
     // Not a feature switch, though it is a `Bool`: the front page is "what does this robot
@@ -152,8 +158,8 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "policy.mode",
         Kind::Choice(&["walk", "roller"]),
-        "Legs or the roller: picks policies and tuning. Held DPad-Up switches it live; this is \
-         the mode a reboot comes back in",
+        "Legs or the roller: picks policies and tuning. `robot.setMode` switches it live; this \
+         is the mode a reboot comes back in",
     ),
     entry(
         "policy.skill",
@@ -398,7 +404,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "head_imu.enabled",
         Kind::Bool,
-        "Read the head IMU (BMI088) at all — off by default; ~4% of a core when on",
+        "Read the head IMU at all — default off on zero3 (BMI088, ~4% of a core), on on beta (LSM6DSV16X, fused on the chip)",
     ),
     // ── [audio] ──────────────────────────────────────────────────────────────
     feature(
@@ -461,6 +467,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Choice(crate::CONGESTION_LABELS),
         "Adapt the send rate to the link — disabled costs adaptivity and saves a core's worth",
     ),
+    entry(
+        "media.sensor",
+        Kind::Choice(crate::MEDIA_SENSOR_LABELS),
+        "Head camera sensor — board follows the declared board; naming one forces it",
+    ),
     // ── [pad] ────────────────────────────────────────────────────────────────
     //
     // Which button runs which skill. Read by `padd`, not by `robotd` — but it lives in the same
@@ -471,10 +482,15 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Text,
         "Skill on the A button — `robotctl policy list` names what this robot has",
     ),
-    feature("pad.x", Kind::Text, "Skill on the X button"),
+    feature("pad.b", Kind::Text, "Skill on the B button"),
+    feature(
+        "pad.x",
+        Kind::Text,
+        "Skill on the X button — re-sent while held",
+    ),
+    feature("pad.y", Kind::Text, "Skill on the Y button"),
     feature("pad.lb", Kind::Text, "Skill on the left bumper"),
     feature("pad.rb", Kind::Text, "Skill on the right bumper"),
-    feature("pad.dpad_down", Kind::Text, "Skill on D-pad down"),
     // ── [pad_imu_head_control] ───────────────────────────────────────────────
     //
     // Controller-IMU head control. Read by `padd`, like `[pad]`. Not `[head_imu]`, which is
@@ -482,7 +498,7 @@ pub const REGISTRY: &[Entry] = &[
     feature(
         "pad_imu_head_control.enabled",
         Kind::Bool,
-        "Y poses the head from the pad's own IMU (Pro Controller) — sticks keep driving; Y again holds, again re-centres",
+        "In head + move mode (D-pad right), the pad's own IMU (Pro Controller) poses the head while the sticks drive; D-pad right again re-centres",
     ),
     entry(
         "pad_imu_head_control.gain",
@@ -722,13 +738,14 @@ mod tests {
                 "audio.pet_detect",
                 "media.source",
                 "media.quality",
-                // The five one-shot buttons. Front-page keys because "what does this button do"
+                // The six one-shot buttons. Front-page keys because "what does this button do"
                 // is a question somebody asks holding the pad, not while reading tuning docs.
                 "pad.a",
+                "pad.b",
                 "pad.x",
+                "pad.y",
                 "pad.lb",
                 "pad.rb",
-                "pad.dpad_down",
                 "pad_imu_head_control.enabled",
             ]
         );

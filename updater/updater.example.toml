@@ -14,9 +14,11 @@
 # allow-list.
 trusted_keys_dir = "/etc/robot/trusted_keys"
 
-# Single forward-compatibility guard. v1 targets one hardware configuration, so
-# this is one integer and not a capability matrix (§5.6).
-hw_rev = 1
+# The hardware revision a release's `min_hw_rev` is checked against. Unset, it is
+# the board `/etc/robot/robotd.toml` declares (`[board] version`: zero3 is 1, beta
+# is 2), which is how a shipped robot should have it. One integer and not a
+# capability matrix (§5.6).
+# hw_rev = 1
 
 # Engine-owned state: lock, update log, boot counter.
 # MUST NOT live inside any component's install_dir — a swap or rollback would

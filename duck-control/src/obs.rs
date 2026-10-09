@@ -243,12 +243,28 @@ impl Observation {
         }
         out
     }
+
+    /// The inverse of [`Self::scatter_action`]: the 14 policy slots of a 15-joint vector, the
+    /// mouth left out. For seeding a policy's previous action from a pose it did not command.
+    pub fn gather_action(values: &[f64; NUM_JOINTS]) -> [f32; ACTION_LEN] {
+        const { assert!(ACTION_LEN == OBS_JOINTS) };
+        policy_joints(values).map(|v| v as f32)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::DEFAULT_POSITION;
+
+    /// Gathering undoes scattering, slot for slot, and the mouth is the one joint left out.
+    #[test]
+    fn gather_is_the_inverse_of_scatter() {
+        let action: [f32; ACTION_LEN] = std::array::from_fn(|i| i as f32 + 1.0);
+        let joints = Observation::scatter_action(&action);
+        assert_eq!(joints[crate::model::MOUTH_INDEX], 0.0);
+        assert_eq!(Observation::gather_action(&joints), action);
+    }
 
     fn imu() -> ImuData {
         ImuData {

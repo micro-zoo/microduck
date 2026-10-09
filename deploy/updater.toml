@@ -15,7 +15,9 @@
 # without physically re-flashing (docs/project/ci-setup.md).
 trusted_keys_dir = "/etc/robot/trusted_keys"
 
-hw_rev = 1
+# No `hw_rev`: the robot's hardware revision is the board /etc/robot/robotd.toml declares
+# (`[board] version`), so a board is declared in one place. Robots installed before that
+# carry `hw_rev = 1` here, which is the same answer for the board they are.
 
 # Outside every `install_dir`, so the record of what happened survives the swap or
 # rollback it is recording (§5.7).
@@ -89,7 +91,7 @@ keep_previous = 1
 required_files = [
     "bin/updaterd", "bin/robotctl", "bin/robotd", "bin/configd", "bin/btd",
     "bin/padd", "bin/mediad", "bin/sounds", "bin/pet-detect", "bin/pet-features",
-    "bin/tofd",
+    "bin/tofd", "bin/nfcd",
 ]
 
 # `golden` is deliberately unset until 1.0.0 exists.
